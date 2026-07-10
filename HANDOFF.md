@@ -23,18 +23,18 @@ Target: <50 ms glass-to-glass at 1080p60.
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
 
-## Current state (v0.3.6 release candidate)
+## Current state (v0.3.6 released)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.5` is the latest published
-  release (tag `v0.3.5`, APK + win-x64 server zip attached); `main` matches it. The local
-  v0.3.6 candidate fixes the real-device crash on first mouse motion: Android had called
+- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.6` is the latest published
+  release (tag `v0.3.6`, APK + win-x64 server zip attached). It fixes the real-device crash
+  on first mouse motion: Android had called
   `DatagramSocket.send()` directly from the UI-thread touch callback. Mouse and gamepad UDP
   now pass through one bounded IO sender. It also makes single-tap movement-only, double-tap
   left-click, double-tap-drag intentional drag, and requires Back twice to exit the stream.
 - **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
-  `assembleRelease lintRelease`: successful with JDK 17. Publishing v0.3.6 is blocked only
-  by the expired local GitHub CLI login; run `gh auth login -h github.com` and resume.
+  `assembleRelease lintRelease`: successful with JDK 17. The verified v0.3.6 artifacts are
+  attached to the GitHub release.
 - **Real hardware testing is in progress** on Windows plus a Samsung SM-S911B. The supplied
   server logs proved the UDP endpoint and media sender were active, then the TCP control
   socket vanished as soon as touch input began. Static analysis found the matching uncaught
