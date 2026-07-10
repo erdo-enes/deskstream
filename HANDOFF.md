@@ -23,11 +23,11 @@ Target: <50 ms glass-to-glass at 1080p60.
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
 
-## Current state (v0.3.0 working tree)
+## Current state (v0.3.0 released)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.2.0` is the latest published
-  release at the time this section was updated. The current branch contains the v0.3.0
-  latency/input work and still needs commit/publish/release after final packaging.
+- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.0` is the latest published
+  release (tag `v0.3.0`, APK + win-x64 server zip attached); `main` matches it. The
+  latency/input work described below shipped in that release.
 - **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
   `compileReleaseKotlin`: successful with JDK 17. Full release artifacts are the final step.
