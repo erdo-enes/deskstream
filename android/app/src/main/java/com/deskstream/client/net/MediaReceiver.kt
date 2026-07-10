@@ -235,6 +235,10 @@ class MediaReceiver(
         var receivedAny = false
         var lastHolePunchAt = SystemClock.elapsedRealtime()
         sendHolePunch(sock, serverAddress)
+        // The server may have produced its startup IDR before it learned this UDP endpoint.
+        // Requesting another one immediately guarantees that the first frame the decoder sees
+        // is independently decodable, even when UDP and TCP arrive in the opposite order.
+        ControlClient.requestIdr()
 
         while (running) {
             packet.setLength(buf.size) // receive() shrinks this; must reset every iteration

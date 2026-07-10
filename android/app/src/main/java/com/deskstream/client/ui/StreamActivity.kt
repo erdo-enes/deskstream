@@ -68,6 +68,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var audioNegotiationJob: Job? = null
     private var inputNegotiationJob: Job? = null
     private var stallRecoveryInProgress = false
+    private var streamStartFailed = false
     private var audioStatus = "starting"
     private var audioDetail = "Waiting for the server"
     private var lastVideoStats: StreamStats? = null
@@ -223,18 +224,22 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             ControlClient.State.READY -> {
                 // Either a fresh session, or we just silently reconnected while this Activity
                 // was in the foreground -- either way, (re)start the stream.
-                streamRequested = false
-                maybeStartStream()
+                if (!streamStartFailed) {
+                    streamRequested = false
+                    maybeStartStream()
+                }
             }
             ControlClient.State.CONNECTING -> {
                 showCenterStatus("Connecting to ${ControlClient.serverIp}…")
             }
             ControlClient.State.RECONNECTING -> {
+                streamStartFailed = false
                 streamRequested = false
                 stopReceivers()
                 showCenterStatus("Connection lost\nReconnecting to ${ControlClient.serverIp}…")
             }
             ControlClient.State.DISCONNECTED -> {
+                streamStartFailed = false
                 streamRequested = false
                 stopReceivers()
                 showCenterStatus("Disconnected\nCheck that the PC server is still running")
@@ -263,13 +268,23 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             is ServerMessage.InputUnavailable -> onInputUnavailable(msg.message)
             ServerMessage.StreamStopped -> {
                 stopReceivers()
-                if (!stallRecoveryInProgress) showCenterStatus("Stream stopped")
+                if (!stallRecoveryInProgress && !streamStartFailed) {
+                    showCenterStatus("Stream stopped")
+                }
             }
             is ServerMessage.Bitrate -> {
                 negotiatedBitrateKbps = msg.kbps
                 renderDiagnostics()
             }
             is ServerMessage.Error -> {
+                if (msg.code == "STREAM_FAILED" || msg.code == "ENCODER_UNAVAILABLE") {
+                    // Do not immediately spin START_STREAM after a real server-side fault.
+                    // Keep the Activity visible with the actual error instead of looking as
+                    // though it crashed or disappeared.
+                    streamStartFailed = true
+                    streamRequested = true
+                    stopReceivers()
+                }
                 val description = describeStreamError(msg)
                 showCenterStatus(description)
                 Snackbar.make(binding.streamRoot, description, Snackbar.LENGTH_LONG).show()
@@ -288,6 +303,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     private fun onStreamStarted(msg: ServerMessage.StreamStarted) {
         stallRecoveryInProgress = false
+        streamStartFailed = false
         binding.tvConnecting.visibility = View.GONE
         lastStreamWidth = msg.width
         lastStreamHeight = msg.height

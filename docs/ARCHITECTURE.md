@@ -11,7 +11,7 @@ modes of Sunshine/Moonlight, Parsec, spacedesk, Steam Link, Miracast, and Chrome
 | Parsec needs an account + cloud even on LAN | **Zero cloud, zero account, fully offline.** LAN only. |
 | Sunshine/Moonlight pairing hell (PIN desync, cert files) | **TOFU pairing**: server displays a 6-digit PIN once, client enters it, keys pinned. Auto-connect afterwards. |
 | spacedesk resolution/ghost-display bugs | **Mirror the primary display only.** No virtual display driver, ever (v1). |
-| NVIDIA-only encoder coupling (GameStream/Sunshine quirks) | **NVIDIA-first, vendor-neutral fallback** — direct NVENC for its best latency controls, Media Foundation hardware encode for NVENC/AMF/QuickSync. |
+| NVIDIA-only encoder coupling (GameStream/Sunshine quirks) | **Vendor-neutral stable default** — Media Foundation hardware encode for NVENC/AMF/QuickSync; direct NVENC remains an explicit experimental opt-in. |
 | Steam Link/Miracast stutter-then-collapse | **Closed-loop adaptation**: client stats drive a bitrate-first ladder; frames are dropped, never queued. |
 | Sessions die on sleep/background | **Session tokens independent of sockets** + reconnect state machine. |
 
@@ -20,7 +20,7 @@ modes of Sunshine/Moonlight, Parsec, spacedesk, Steam Link, Miracast, and Chrome
 ```
 DXGI Desktop Duplication (present-driven, GPU texture)     1–3 ms
   → GPU BGRA→NV12 convert (D3D11 video processor)
-  → native NVENC ULL or MF hardware H.264 fallback         3–8 ms
+  → Media Foundation hardware H.264 (or opt-in NVENC ULL)  3–8 ms
     (CBR, no B-frames/lookahead, IDR on demand,
     zero reorder delay, VBV ≈ 1 frame)
   → Packetize ≤1200 B + XOR FEC → UDP                      <1 ms

@@ -2,15 +2,16 @@
 
 The Windows half of **DeskStream**, a low-latency LAN screen streamer. It captures the
 primary display with DXGI Desktop Duplication, converts BGRA→NV12 on the GPU, hardware-
-encodes H.264 through native NVIDIA NVENC or a Media Foundation fallback, and streams per
+encodes H.264 through the Windows Media Foundation hardware path (with an optional native
+NVIDIA NVENC experimental backend), and streams per
 [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md). It also captures the default Windows playback
 device through WASAPI loopback and streams normalized 48 kHz stereo PCM in fixed 5 ms blocks.
 
 ## Requirements
 
 - Windows 10/11 (x64) with NVIDIA NVENC, AMD AMF, or Intel QuickSync hardware H.264.
-  NVIDIA is attempted through the native NVENC API first; Media Foundation is the automatic
-  fallback. There is **no CPU encoder** — the server exits clearly if both paths fail.
+  Media Foundation is the stable default. There is **no CPU encoder**; if hardware setup
+  fails, the server keeps the client connection open and reports the stream error.
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - Optional for controller forwarding: the
   [ViGEmBus 1.22 driver](https://github.com/nefarius/ViGEmBus/releases/latest). Without it,
@@ -30,6 +31,13 @@ frames, IDR requests per second, and the active audio payload rate.
 
 Paired devices are remembered in `paired_clients.json` next to the built executable, so
 subsequent connections auto-authenticate (TOFU). Delete that file to force re-pairing.
+
+To explicitly test the experimental native NVIDIA backend, launch from PowerShell with:
+
+```powershell
+$env:DESKSTREAM_ENCODER = "nvenc"
+.\DeskStreamer.Server.exe
+```
 
 ## Firewall
 

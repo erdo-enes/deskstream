@@ -11,29 +11,20 @@ public static class EncoderFactory
         int fps,
         int initialBitrateKbps)
     {
-        try
+        string requested = Environment.GetEnvironmentVariable("DESKSTREAM_ENCODER")?
+            .Trim().ToLowerInvariant() ?? "";
+
+        if (requested == "nvenc")
         {
-            var nvenc = new NvencH264Encoder(
-                device, width, height, fps, initialBitrateKbps);
-            Console.WriteLine("[encoder] using native NVIDIA NVENC ultra-low-latency backend.");
-            return nvenc;
-        }
-        catch (Exception ex)
-        {
-            // Loading nvEncodeAPI, opening a DirectX session, and initialization are all
-            // capability probes. Any failure here is safe to fall back from because no frame
-            // has entered the stream yet.
-            Console.WriteLine($"[encoder] native NVENC unavailable: {ShortMessage(ex)}");
-            Console.WriteLine("[encoder] trying Media Foundation hardware H.264 fallback.");
+            Console.WriteLine("[encoder] native NVIDIA NVENC explicitly requested.");
+            return new NvencH264Encoder(device, width, height, fps, initialBitrateKbps);
         }
 
+        // The Media Foundation MFT is the Windows hardware path that was exercised by the
+        // original releases. Direct NVENC initialization is not sufficient proof that its
+        // first D3D11 texture can be registered/mapped on every NVIDIA driver, so it must be
+        // explicitly opted into instead of silently tearing down an otherwise healthy client.
+        Console.WriteLine("[encoder] using Media Foundation hardware H.264 backend.");
         return new H264Encoder(device, width, height, fps, initialBitrateKbps);
-    }
-
-    private static string ShortMessage(Exception ex)
-    {
-        string message = ex.Message;
-        int newline = message.IndexOfAny(new[] { '\r', '\n' });
-        return newline >= 0 ? message[..newline] : message;
     }
 }

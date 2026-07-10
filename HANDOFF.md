@@ -11,8 +11,8 @@ Low-latency Windows → Android screen streamer over LAN WiFi. No cloud, no acco
 Target: <50 ms glass-to-glass at 1080p60.
 
 - `server/` — C#/.NET 8 (`net8.0-windows`) console app. DXGI Desktop Duplication →
-  GPU BGRA→NV12 (D3D11 VideoProcessor) → native NVIDIA NVENC ULL or Media Foundation
-  hardware H.264 fallback (CBR, no B-frames, one-frame VBV, IDR on demand) → UDP packetizer
+  GPU BGRA→NV12 (D3D11 VideoProcessor) → Media Foundation hardware H.264 by default
+  (native NVIDIA NVENC ULL is opt-in; CBR, no B-frames, one-frame VBV, IDR on demand) → UDP packetizer
   (≤1200 B chunks, XOR FEC groups of 8) + WASAPI system-audio loopback → dedicated
   5 ms PCM UDP packets + TCP control channel + UDP discovery responder.
 - `android/` — Kotlin app (minSdk 26, AGP 8.5.2, Kotlin 2.0.21). UDP broadcast
@@ -23,11 +23,12 @@ Target: <50 ms glass-to-glass at 1080p60.
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
 
-## Current state (v0.3.1 released)
+## Current state (v0.3.2 released)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.1` is the latest published
-  release (tag `v0.3.1`, APK + win-x64 server zip attached); `main` matches it. It fixes the
-  v0.3 Android connection crash/decoder startup stall and UDP frame-delivery regressions.
+- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.2` is the latest published
+  release (tag `v0.3.2`, APK + win-x64 server zip attached); `main` matches it. It starts
+  capture only after the Android media endpoint is learned, forces an initial deliverable IDR,
+  keeps encoder faults from closing TCP, and uses Media Foundation by default.
 - **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
   `compileReleaseKotlin`: successful with JDK 17. Full release artifacts are the final step.
@@ -35,7 +36,8 @@ Target: <50 ms glass-to-glass at 1080p60.
   macOS. No end-to-end test on a physical Windows PC + Android device has happened yet.
   The riskiest first-run areas (in order):
   1. Native NVENC D3D11 texture registration/mapping and dynamic bitrate reconfiguration on
-     NVIDIA hardware (`server/Encode/NvencH264Encoder.cs`). Startup failure falls back to MF.
+     NVIDIA hardware (`server/Encode/NvencH264Encoder.cs`). It is now explicit opt-in via
+     `DESKSTREAM_ENCODER=nvenc` rather than the default path.
   2. MF async-MFT event loop and D3D device-manager binding on real GPUs
      (`server/Encode/H264Encoder.cs`) — MFT quirks differ per vendor.
   3. VideoProcessor color range/space left at driver default
@@ -91,7 +93,8 @@ Target: <50 ms glass-to-glass at 1080p60.
 ## Latency and long-session work added for v0.3.0
 
 - Direct NVENC uses ULL tuning, P3, single-pass CBR, no B-frames/lookahead, zero reorder,
-  repeated SPS/PPS, and one-frame VBV. `EncoderFactory` falls back to the existing MF MFT.
+  repeated SPS/PPS, and one-frame VBV. It is opt-in; `EncoderFactory` selects the established
+  Media Foundation hardware MFT by default.
 - Android requests Wi-Fi low-latency mode and display frame-rate matching while foreground;
   receive/assembly/decoder/buffer-pool queues are smaller and hard bounded.
 - NTP-like `PING`/`PONG` timestamps plus stream clock origin produce capture→receive p95;

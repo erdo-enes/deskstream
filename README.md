@@ -12,8 +12,8 @@ Miracast, and Chromecast, and designing those failure modes out. See
 ## Layout
 
 - `server/` — Windows server, C#/.NET 8. DXGI Desktop Duplication → GPU NV12 convert
-  → native NVIDIA NVENC ultra-low-latency H.264, with Media Foundation hardware H.264
-  fallback for NVIDIA/AMD/Intel → UDP with XOR FEC, plus WASAPI system-audio loopback.
+  → Media Foundation hardware H.264 for NVIDIA/AMD/Intel → UDP with XOR FEC, plus WASAPI
+  system-audio loopback. The experimental direct-NVENC path is opt-in.
 - `android/` — Android client (Kotlin, minSdk 26). UDP receive + FEC → MediaCodec
   async low-latency decode → SurfaceView; PCM audio → low-latency AudioTrack. No network
   jitter buffer. Touch controls the PC mouse, while Bluetooth/USB gamepads forward as
@@ -40,8 +40,9 @@ Miracast, and Chromecast, and designing those failure modes out. See
 
 - Present-driven GPU capture; the frame never touches the CPU before the encoder.
 - Hardware H.264 tuned for latency: CBR, no B-frames, ~1-frame VBV, IDR only on demand.
-- NVIDIA hosts use the native NVENC ultra-low-latency preset; other supported GPUs and
-  incompatible NVIDIA drivers automatically fall back to Media Foundation hardware encode.
+- Media Foundation hardware encoding is the stable default for NVIDIA, AMD, and Intel GPUs.
+  The direct NVIDIA NVENC ultra-low-latency path is available only with
+  `DESKSTREAM_ENCODER=nvenc` while it receives broader hardware validation.
 - Custom UDP transport: ≤1200-byte packets, forward error correction instead of
   retransmission, stale frames dropped rather than queued.
 - Android decodes straight to the screen surface in async low-latency mode; frames

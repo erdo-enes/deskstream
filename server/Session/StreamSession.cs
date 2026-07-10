@@ -57,6 +57,7 @@ public sealed class StreamSession : IDisposable
     private IVideoEncoder? _encoder;
     private Thread? _captureThread;
     private CancellationTokenSource? _captureCts;
+    private readonly object _captureStartGate = new();
     private Stopwatch? _clock;
     private long _clockBaseUs;
     private uint _frameId;
@@ -77,6 +78,7 @@ public sealed class StreamSession : IDisposable
     private long _encodedFrames;
     private int _capturedSinceEncode;
     private long _idrRequestTotal;
+    private int _pipelineFaultHandling;
     public SessionState State => _state;
     public bool Streaming => _streaming;
     public bool AudioStreaming => _audioStreaming;
@@ -245,18 +247,20 @@ public sealed class StreamSession : IDisposable
         }
         catch (EncoderUnavailableException ex)
         {
-            // Hard capability failure — do not fall back to a black screen (per spec).
+            // A capability failure belongs to this stream attempt, not the authenticated TCP
+            // session. Keeping control alive lets Android display the real error instead of
+            // treating a server process exit as a client-side crash/disconnect.
             StopPipeline();
             _send(OutgoingMessages.Error("ENCODER_UNAVAILABLE", ex.Message));
-            Console.Error.WriteLine();
-            Console.Error.WriteLine("FATAL: " + ex.Message);
-            Console.Error.WriteLine("DeskStream requires a hardware H.264 encoder. Exiting.");
-            Environment.Exit(2);
+            _send(OutgoingMessages.StreamStopped());
+            Console.Error.WriteLine($"[session] encoder unavailable: {ex.Message}");
+            _state = SessionState.Ready;
         }
         catch (Exception ex)
         {
             StopPipeline();
             _send(OutgoingMessages.Error("STREAM_FAILED", ex.Message));
+            _send(OutgoingMessages.StreamStopped());
             Console.Error.WriteLine($"[session] failed to start stream: {ex}");
             _state = SessionState.Ready;
         }
@@ -394,6 +398,7 @@ public sealed class StreamSession : IDisposable
         _sender = new MediaSender(Ports.PreferredMedia, _clientAddress);
         _sender.OnGamepadState = OnGamepadState;
         _sender.OnMouseMotion = OnMouseMotion;
+        _sender.OnClientConnected = OnMediaClientConnected;
         _sender.Start();
 
         _duplicator = new DesktopDuplicator();
@@ -409,6 +414,7 @@ public sealed class StreamSession : IDisposable
         _encoder.OnEncodedFrame = OnEncoded;
 
         _frameId = 0;
+        Interlocked.Exchange(ref _pipelineFaultHandling, 0);
         _capturedSinceEncode = 0;
         _cleanStreak = 0;
         _idrSinceLastStats = 0;
@@ -419,13 +425,10 @@ public sealed class StreamSession : IDisposable
         _clock = Stopwatch.StartNew();
 
         _captureCts = new CancellationTokenSource();
-        _captureThread = new Thread(() => CaptureLoop(_captureCts.Token))
-        {
-            IsBackground = true,
-            Name = "capture",
-        };
         _streaming = true;
-        _captureThread.Start();
+        // Do not start capture yet. The client cannot receive the startup IDR until it has
+        // received STREAM_STARTED and punched DSMH through from its media socket. Starting
+        // sooner loses that keyframe and leaves Android with undecodable P-frames.
     }
 
     private void CaptureLoop(CancellationToken ct)
@@ -447,12 +450,28 @@ public sealed class StreamSession : IDisposable
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[capture] loop terminated: {ex.Message}");
-            if (!ct.IsCancellationRequested)
+            if (!ct.IsCancellationRequested &&
+                Interlocked.CompareExchange(ref _pipelineFaultHandling, 1, 0) == 0)
             {
-                _send(OutgoingMessages.Error("STREAM_FAILED", ex.Message));
-                _requestClose();
+                // This cannot run on the capture thread: StopPipeline joins that thread and
+                // tears down the encoder. Move it off-thread, but keep the TCP session alive.
+                _ = Task.Run(() => StopFaultedPipeline(ex));
             }
         }
+    }
+
+    private void StopFaultedPipeline(Exception ex)
+    {
+        // The capture thread returns immediately after scheduling us. If a user-initiated
+        // STOP_STREAM won the race, its cleanup is already sufficient.
+        if (!_streaming)
+            return;
+
+        StopPipeline();
+        _state = SessionState.Ready;
+        _send(OutgoingMessages.Error("STREAM_FAILED", ex.Message));
+        _send(OutgoingMessages.StreamStopped());
+        Console.Error.WriteLine("[session] stream stopped after capture/encoder fault; control session remains connected.");
     }
 
     private void OnEncoded(byte[] data, int length, bool keyframe, uint ptsMs)
@@ -514,6 +533,41 @@ public sealed class StreamSession : IDisposable
         }
     }
 
+    private void OnMediaClientConnected()
+    {
+        // The UDP endpoint now exists, so the first captured frame can be delivered instead
+        // of being encoded and discarded before Android has a socket to receive it.
+        try
+        {
+            StartCaptureAfterMediaEndpoint();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[media] could not start capture after endpoint learn: {ex.Message}");
+        }
+    }
+
+    private void StartCaptureAfterMediaEndpoint()
+    {
+        lock (_captureStartGate)
+        {
+            if (!_streaming || _captureThread != null || _captureCts == null)
+                return;
+
+            // Every pipeline begins with an independently decodable frame. This call is made
+            // before the capture thread exists, so it cannot race a Submit call.
+            _encoder?.RequestIdr();
+            CancellationToken token = _captureCts.Token;
+            _captureThread = new Thread(() => CaptureLoop(token))
+            {
+                IsBackground = true,
+                Name = "capture",
+            };
+            _captureThread.Start();
+            Console.WriteLine("[media] client endpoint learned; capture started with an IDR.");
+        }
+    }
+
     private void StopPipeline()
     {
         _streaming = false;
@@ -531,6 +585,7 @@ public sealed class StreamSession : IDisposable
         {
             _sender.OnGamepadState = null;
             _sender.OnMouseMotion = null;
+            _sender.OnClientConnected = null;
         }
         try { _sender?.Dispose(); } catch { }
         _encoder = null; _converter = null; _duplicator = null; _sender = null;
