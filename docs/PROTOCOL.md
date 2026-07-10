@@ -92,7 +92,9 @@ Client → server:
 
 ```json
 {"type":"START_STREAM","maxBitrateKbps":20000,"fps":60}
+{"type":"MEDIA_READY","port":53124}
 {"type":"AUDIO_START"}
+{"type":"AUDIO_READY","port":53125}
 {"type":"GAMEPAD_START","controllers":1}
 {"type":"GAMEPAD_STOP"}
 {"type":"INPUT_START","mouse":true}
@@ -119,11 +121,12 @@ Server → client:
 {"type":"BITRATE","kbps":14000}
 ```
 
-After `STREAM_STARTED` the client sends one UDP datagram containing the 4 ASCII bytes
-`DSMH` from its media socket to `serverIp:mediaPort` every second until video packets
-arrive (and stops after). This is a **hole punch / address learn**: the server sends all
-media packets to the source address of the most recent `DSMH`. The stream always starts
-with an IDR frame carrying SPS/PPS.
+After binding its media socket, the client sends `MEDIA_READY` over the authenticated TCP
+connection with that socket's local UDP port. The server combines this port with the TCP peer
+IP and sends media there. The client also sends one UDP datagram containing the 4 ASCII bytes
+`DSMH` to `serverIp:mediaPort` every second until video packets arrive; this is a NAT/firewall
+fallback and updates the learned endpoint. The stream always starts with an IDR frame carrying
+SPS/PPS.
 
 While the desktop is static the server sends the 4 ASCII bytes `DSHB` once per second on
 the media socket. It is a liveness heartbeat, not a video packet; the client ignores its
@@ -136,10 +139,11 @@ unless the session is streaming. This opt-in makes old clients and servers inter
 an old server ignores the unknown request, and a new server does not open an audio device
 for a client that never asks for it.
 
-After `AUDIO_STARTED`, the client sends the 4 ASCII bytes `DSAH` from its audio socket to
-`serverIp:audioPort` every second until an audio packet arrives. The server sends audio to
-the source address of the most recent `DSAH`. `STOP_STREAM`, socket death, or session
-disposal stops both video and audio.
+After binding its audio socket, the client sends `AUDIO_READY` over TCP with its local UDP
+port. It also sends the 4 ASCII bytes `DSAH` from that socket to `serverIp:audioPort` every
+second until an audio packet arrives as a fallback. The server sends audio to the most recent
+authenticated endpoint. `STOP_STREAM`, socket death, or session disposal stops both video and
+audio.
 
 An Android client with one or more physical gamepad/joystick input devices sends
 `GAMEPAD_START` with `controllers` clamped to 1..4. The server creates that many virtual

@@ -157,6 +157,8 @@ class MediaReceiver(
         }
         gamepadDatagram = DatagramPacket(ByteArray(GamepadPacket.SIZE), GamepadPacket.SIZE, address, mediaPort)
         mouseDatagram = DatagramPacket(ByteArray(MousePacket.SIZE), MousePacket.SIZE, address, mediaPort)
+        // TCP announces the bound port reliably; DSMH remains a NAT/firewall fallback.
+        ControlClient.mediaReady(sock.localPort)
 
         thread = Thread({ receiveLoop(sock, address) }, "MediaReceiver").apply { start() }
         statsJob = scope.launch { statsLoop() }

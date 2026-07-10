@@ -56,6 +56,15 @@ public sealed class AudioSender : IDisposable
         _learnLoop = Task.Run(() => LearnLoopAsync(_cts.Token));
     }
 
+    /// <summary>Authenticated TCP fallback for networks that block DSAH UDP punches.</summary>
+    public bool SetClientPort(int port)
+    {
+        if (_expectedClientAddress == null || port is < 1 or > 65535)
+            return false;
+        _clientEndpoint = new IPEndPoint(_expectedClientAddress, port);
+        return true;
+    }
+
     private async Task LearnLoopAsync(CancellationToken ct)
     {
         var buf = new byte[64];

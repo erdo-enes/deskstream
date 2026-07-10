@@ -6,6 +6,7 @@ using DeskStreamer.Server.Encode;
 using DeskStreamer.Server.Input;
 using DeskStreamer.Server.Net;
 using DeskStreamer.Server.Protocol;
+using Vortice.Direct3D11;
 
 namespace DeskStreamer.Server.Session;
 
@@ -57,7 +58,8 @@ public sealed class StreamSession : IDisposable
     private IVideoEncoder? _encoder;
     private Thread? _captureThread;
     private CancellationTokenSource? _captureCts;
-    private readonly object _captureStartGate = new();
+    private ID3D11Texture2D? _lastNv12;
+    private int _endpointIdrPending;
     private Stopwatch? _clock;
     private long _clockBaseUs;
     private uint _frameId;
@@ -119,7 +121,9 @@ public sealed class StreamSession : IDisposable
             case "PAIR_REQUEST": OnPairRequest(); break;
             case "PAIR_CODE": OnPairCode(payload); break;
             case "START_STREAM": OnStartStream(payload); break;
+            case "MEDIA_READY": OnMediaReady(payload); break;
             case "AUDIO_START": OnAudioStart(); break;
+            case "AUDIO_READY": OnAudioReady(payload); break;
             case "GAMEPAD_START": OnGamepadStart(payload); break;
             case "GAMEPAD_STOP": StopGamepads(); break;
             case "INPUT_START": OnInputStart(payload); break;
@@ -319,6 +323,24 @@ public sealed class StreamSession : IDisposable
         }
     }
 
+    private void OnMediaReady(ReadOnlySpan<byte> payload)
+    {
+        if (_state != SessionState.Streaming || !_streaming)
+            return;
+        var ready = Json.Deserialize<EndpointReadyMessage>(payload);
+        if (ready == null || !(_sender?.SetClientPort(ready.Port) ?? false))
+            Console.Error.WriteLine("[media] ignored invalid MEDIA_READY endpoint.");
+    }
+
+    private void OnAudioReady(ReadOnlySpan<byte> payload)
+    {
+        if (_state != SessionState.Streaming || !_audioStreaming)
+            return;
+        var ready = Json.Deserialize<EndpointReadyMessage>(payload);
+        if (ready == null || !(_audioSender?.SetClientPort(ready.Port) ?? false))
+            Console.Error.WriteLine("[audio] ignored invalid AUDIO_READY endpoint.");
+    }
+
     private void OnGamepadStart(ReadOnlySpan<byte> payload)
     {
         if (_state != SessionState.Streaming || !_streaming)
@@ -415,6 +437,8 @@ public sealed class StreamSession : IDisposable
 
         _frameId = 0;
         Interlocked.Exchange(ref _pipelineFaultHandling, 0);
+        Interlocked.Exchange(ref _endpointIdrPending, 1);
+        _lastNv12 = null;
         _capturedSinceEncode = 0;
         _cleanStreak = 0;
         _idrSinceLastStats = 0;
@@ -425,10 +449,13 @@ public sealed class StreamSession : IDisposable
         _clock = Stopwatch.StartNew();
 
         _captureCts = new CancellationTokenSource();
+        _captureThread = new Thread(() => CaptureLoop(_captureCts.Token))
+        {
+            IsBackground = true,
+            Name = "capture",
+        };
         _streaming = true;
-        // Do not start capture yet. The client cannot receive the startup IDR until it has
-        // received STREAM_STARTED and punched DSMH through from its media socket. Starting
-        // sooner loses that keyframe and leaves Android with undecodable P-frames.
+        _captureThread.Start();
     }
 
     private void CaptureLoop(CancellationToken ct)
@@ -442,8 +469,19 @@ public sealed class StreamSession : IDisposable
                     if (Interlocked.Increment(ref _capturedSinceEncode) > Fps * 3)
                         throw new InvalidOperationException("The hardware encoder stopped producing frames");
                     var nv12 = _converter!.Convert(bgra);
-                    uint pts = (uint)(_clock!.ElapsedMilliseconds & 0xFFFFFFFF);
-                    _encoder!.Submit(nv12, pts);
+                    Volatile.Write(ref _lastNv12, nv12);
+                    SubmitCapture(nv12);
+                }
+                else if (Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
+                {
+                    // On a static desktop Desktop Duplication has no new frame after the
+                    // endpoint is learned. Re-submit the latest NV12 surface as an IDR so the
+                    // newly connected Android decoder still receives an initial picture.
+                    var latest = Volatile.Read(ref _lastNv12);
+                    if (latest != null)
+                        SubmitCapture(latest, forceIdr: true);
+                    else
+                        Interlocked.Exchange(ref _endpointIdrPending, 1);
                 }
             }
         }
@@ -458,6 +496,14 @@ public sealed class StreamSession : IDisposable
                 _ = Task.Run(() => StopFaultedPipeline(ex));
             }
         }
+    }
+
+    private void SubmitCapture(ID3D11Texture2D nv12, bool forceIdr = false)
+    {
+        if (forceIdr || Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
+            _encoder!.RequestIdr();
+        uint pts = (uint)(_clock!.ElapsedMilliseconds & 0xFFFFFFFF);
+        _encoder!.Submit(nv12, pts);
     }
 
     private void StopFaultedPipeline(Exception ex)
@@ -535,37 +581,9 @@ public sealed class StreamSession : IDisposable
 
     private void OnMediaClientConnected()
     {
-        // The UDP endpoint now exists, so the first captured frame can be delivered instead
-        // of being encoded and discarded before Android has a socket to receive it.
-        try
-        {
-            StartCaptureAfterMediaEndpoint();
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[media] could not start capture after endpoint learn: {ex.Message}");
-        }
-    }
-
-    private void StartCaptureAfterMediaEndpoint()
-    {
-        lock (_captureStartGate)
-        {
-            if (!_streaming || _captureThread != null || _captureCts == null)
-                return;
-
-            // Every pipeline begins with an independently decodable frame. This call is made
-            // before the capture thread exists, so it cannot race a Submit call.
-            _encoder?.RequestIdr();
-            CancellationToken token = _captureCts.Token;
-            _captureThread = new Thread(() => CaptureLoop(token))
-            {
-                IsBackground = true,
-                Name = "capture",
-            };
-            _captureThread.Start();
-            Console.WriteLine("[media] client endpoint learned; capture started with an IDR.");
-        }
+        if (!_streaming) return;
+        Interlocked.Exchange(ref _endpointIdrPending, 1);
+        Console.WriteLine("[media] client endpoint learned; scheduling an IDR.");
     }
 
     private void StopPipeline()
@@ -589,6 +607,8 @@ public sealed class StreamSession : IDisposable
         }
         try { _sender?.Dispose(); } catch { }
         _encoder = null; _converter = null; _duplicator = null; _sender = null;
+        _lastNv12 = null;
+        Interlocked.Exchange(ref _endpointIdrPending, 0);
         _captureCts?.Dispose(); _captureCts = null;
         _clock = null;
         _clockBaseUs = 0;

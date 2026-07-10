@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import com.deskstream.client.proto.AudioPacketHeader
+import com.deskstream.client.net.ControlClient
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -79,6 +80,9 @@ class AudioReceiver(
 
         running = true
         socket = sock
+        // Audio uses the same authenticated TCP fallback as video when outbound UDP punches
+        // are filtered by a Wi-Fi AP or host firewall.
+        ControlClient.audioReady(sock.localPort)
         onState(AudioPlaybackState.STARTING, "Starting PC audio…")
         thread = Thread(
             {

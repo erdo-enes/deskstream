@@ -145,6 +145,14 @@ object ControlClient {
         scope.launch { writeFrame(ClientMessages.startAudio()) }
     }
 
+    fun mediaReady(port: Int) {
+        scope.launch { writeFrame(ClientMessages.mediaReady(port)) }
+    }
+
+    fun audioReady(port: Int) {
+        scope.launch { writeFrame(ClientMessages.audioReady(port)) }
+    }
+
     fun startGamepads(controllers: Int) {
         scope.launch { writeFrame(ClientMessages.startGamepads(controllers)) }
     }

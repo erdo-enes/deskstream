@@ -43,6 +43,18 @@ object ClientMessages {
             put("fps", fps)
         }.toString()
 
+    fun mediaReady(port: Int): String =
+        JSONObject().apply {
+            put("type", "MEDIA_READY")
+            put("port", port.coerceIn(1, 65535))
+        }.toString()
+
+    fun audioReady(port: Int): String =
+        JSONObject().apply {
+            put("type", "AUDIO_READY")
+            put("port", port.coerceIn(1, 65535))
+        }.toString()
+
     fun stopStream(): String =
         JSONObject().apply {
             put("type", "STOP_STREAM")

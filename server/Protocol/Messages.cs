@@ -83,6 +83,11 @@ public sealed class StartStreamMessage
     [JsonPropertyName("fps")] public int Fps { get; set; }
 }
 
+public sealed class EndpointReadyMessage
+{
+    [JsonPropertyName("port")] public int Port { get; set; }
+}
+
 public sealed class GamepadStartMessage
 {
     [JsonPropertyName("controllers")] public int Controllers { get; set; }

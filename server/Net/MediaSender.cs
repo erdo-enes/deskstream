@@ -75,6 +75,19 @@ public sealed class MediaSender : IDisposable
         _heartbeatLoop = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
     }
 
+    /// <summary>
+    /// Learns the Android media port over the already-authenticated TCP channel. UDP DSMH
+    /// remains a fallback, but some Wi-Fi/router combinations drop client-to-server UDP while
+    /// still allowing server-to-client media.
+    /// </summary>
+    public bool SetClientPort(int port)
+    {
+        if (_expectedClientAddress == null || port is < 1 or > 65535)
+            return false;
+        SetClientEndpoint(new IPEndPoint(_expectedClientAddress, port));
+        return true;
+    }
+
     private async Task HeartbeatLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -110,10 +123,7 @@ public sealed class MediaSender : IDisposable
                     buf.AsSpan(0, Dsmh.Length).SequenceEqual(Dsmh))
                 {
                     // The server sends all media to the source of the most recent DSMH.
-                    bool endpointChanged = _clientEndpoint?.Equals(r.RemoteEndPoint) != true;
-                    _clientEndpoint = r.RemoteEndPoint;
-                    if (endpointChanged)
-                        OnClientConnected?.Invoke();
+                    SetClientEndpoint(r.RemoteEndPoint);
                 }
                 else if (_clientEndpoint?.Equals(r.RemoteEndPoint) == true &&
                          GamepadPacket.TryParse(buf.AsSpan(0, r.ReceivedBytes), out var state))
@@ -130,6 +140,14 @@ public sealed class MediaSender : IDisposable
             catch (ObjectDisposedException) { break; }
             catch (SocketException) { /* ignore, keep learning */ }
         }
+    }
+
+    private void SetClientEndpoint(EndPoint endpoint)
+    {
+        bool endpointChanged = _clientEndpoint?.Equals(endpoint) != true;
+        _clientEndpoint = endpoint;
+        if (endpointChanged)
+            OnClientConnected?.Invoke();
     }
 
     /// <summary>
