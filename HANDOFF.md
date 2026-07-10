@@ -27,13 +27,15 @@ Target: <50 ms glass-to-glass at 1080p60.
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.4.0 release candidate; v0.3.6 published)
+## Current state (v0.4.0 published)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.6` is the latest published
-  release (tag `v0.3.6`, APK + win-x64 server zip attached). The local v0.4.0 candidate adds
-  the first native arm64 macOS client, backward-compatible physical-keyboard negotiation and
-  Windows scan-code injection, plus a second Android mouse-UX pass (small vector cursor,
-  density-normalized movement, compact toolbar, explicit Leave action, final-motion flush).
+- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.4.0` is the latest published
+  release (tag `v0.4.0`, July 11 2026) with three assets: the debug-signed APK, the
+  self-contained win-x64 server zip, and — new in this release — the ad-hoc-signed arm64
+  `DeskStream-0.4.0-macos-arm64.zip`. v0.4.0 adds the first native arm64 macOS client,
+  backward-compatible physical-keyboard negotiation and Windows scan-code injection, plus a
+  second Android mouse-UX pass (small vector cursor, density-normalized movement, compact
+  toolbar, explicit Leave action, final-motion flush).
 - **All three targets compile clean with audio, gamepad, mouse, telemetry, and recovery.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
   `assembleRelease lintRelease`: successful with JDK 17. macOS `make test` passes protocol,
