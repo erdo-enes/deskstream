@@ -83,6 +83,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var lastStreamCodec = "h264"
     private var lastEncoderBackend = "media-foundation"
     private var mouseStatus = "negotiating"
+    private var mouseEnabledByUser = true
     private var gamepadInventory = GamepadInventory(0, 0, emptyList())
     private var gamepadStatus = "none detected"
     private var gamepadDetail = "Connect a Bluetooth or USB controller to Android"
@@ -114,6 +115,15 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
         binding.btnPointerMode.setOnClickListener {
             updatePointerButton(remoteMouse.toggleMode())
+        }
+        binding.btnMouseToggle.setOnClickListener {
+            mouseEnabledByUser = !mouseEnabledByUser
+            applyMouseControls()
+        }
+        binding.btnMouseClick.setOnClickListener { remoteMouse.clickLeft() }
+        binding.btnMouseClick.setOnLongClickListener {
+            remoteMouse.clickRight()
+            true
         }
         binding.streamRoot.addOnLayoutChangeListener { _, l, t, r, b, oldL, oldT, oldR, oldB ->
             if ((r - l) != (oldR - oldL) || (b - t) != (oldB - oldT)) {
@@ -352,16 +362,26 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             } catch (_: Exception) { }
         }
 
+        var mediaStartupError = "Media socket could not start"
         val receiver = MediaReceiver(
             onFrame = { data, length, keyframe, frameId, _ ->
                 decoder.submitFrame(data, length, keyframe, frameId)
             },
             onStats = { stats -> runOnUiThread { updateStatsOverlay(stats) } },
             onStalled = { runOnUiThread { restartStalledStream() } },
-            onCursorPosition = { position -> runOnUiThread { updateRemoteCursor(position) } }
+            onCursorPosition = { position -> runOnUiThread { updateRemoteCursor(position) } },
+            onStartupError = { detail -> mediaStartupError = detail }
         )
         mediaReceiver = receiver
-        receiver.start(ControlClient.serverIp, msg.mediaPort, msg.clockBaseUs)
+        if (!receiver.start(ControlClient.serverIp, msg.mediaPort, msg.clockBaseUs)) {
+            mediaReceiver = null
+            streamStartFailed = true
+            streamRequested = true
+            showCenterStatus("Client media setup failed: $mediaStartupError")
+            Snackbar.make(binding.streamRoot, mediaStartupError, Snackbar.LENGTH_LONG).show()
+            ControlClient.stopStream()
+            return
+        }
 
         gamepadForwardingEnabled = false
         negotiateGamepads()
@@ -385,17 +405,15 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun negotiateMouseInput() {
-        remoteMouse.setEnabled(false)
-        binding.btnPointerMode.isEnabled = false
         mouseStatus = "negotiating"
-        updatePointerButton(remoteMouse.currentMode())
+        applyMouseControls()
         ControlClient.startMouseInput()
         inputNegotiationJob?.cancel()
         inputNegotiationJob = lifecycleScope.launch {
             delay(INPUT_NEGOTIATION_TIMEOUT_MS)
             if (!binding.btnPointerMode.isEnabled) {
                 mouseStatus = "unavailable"
-                updatePointerButton(remoteMouse.currentMode())
+                applyMouseControls()
             }
         }
     }
@@ -404,10 +422,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         inputNegotiationJob?.cancel()
         inputNegotiationJob = null
         mouseStatus = "live"
-        remoteMouse.setEnabled(true)
-        binding.btnPointerMode.isEnabled = true
-        binding.tvRemoteCursor.visibility = View.VISIBLE
-        updatePointerButton(remoteMouse.currentMode())
+        applyMouseControls()
         renderDiagnostics()
     }
 
@@ -415,19 +430,28 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         inputNegotiationJob?.cancel()
         inputNegotiationJob = null
         mouseStatus = "unavailable"
-        remoteMouse.setEnabled(false)
-        binding.btnPointerMode.isEnabled = false
-        binding.tvRemoteCursor.visibility = View.GONE
-        updatePointerButton(remoteMouse.currentMode())
+        applyMouseControls()
         Snackbar.make(binding.streamRoot, "Remote mouse unavailable: $message", Snackbar.LENGTH_LONG).show()
     }
 
     private fun updatePointerButton(mode: MouseMode) {
         binding.btnPointerMode.text = when (mouseStatus) {
-            "negotiating" -> "Mouse…"
+            "negotiating" -> "Mode: …"
             "unavailable" -> "No mouse"
-            else -> if (mode == MouseMode.TOUCHPAD) "Mouse: Touchpad" else "Mouse: Direct"
+            else -> if (mode == MouseMode.TOUCHPAD) "Mode: Pad" else "Mode: Direct"
         }
+    }
+
+    private fun applyMouseControls() {
+        val negotiated = mouseStatus == "live"
+        val active = negotiated && mouseEnabledByUser
+        remoteMouse.setEnabled(active)
+        binding.btnMouseToggle.isEnabled = negotiated
+        binding.btnMouseToggle.text = if (mouseEnabledByUser) "Mouse: On" else "Mouse: Off"
+        binding.btnPointerMode.isEnabled = active
+        binding.btnMouseClick.isEnabled = active
+        binding.tvRemoteCursor.visibility = if (active) View.VISIBLE else View.GONE
+        updatePointerButton(remoteMouse.currentMode())
     }
 
     private fun updateRemoteCursor(position: CursorPosition) {
@@ -600,7 +624,9 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         inputNegotiationJob?.cancel()
         inputNegotiationJob = null
         remoteMouse.setEnabled(false)
+        binding.btnMouseToggle.isEnabled = false
         binding.btnPointerMode.isEnabled = false
+        binding.btnMouseClick.isEnabled = false
         binding.tvRemoteCursor.visibility = View.GONE
         mediaReceiver?.stop()
         mediaReceiver = null

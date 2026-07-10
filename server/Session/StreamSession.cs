@@ -92,6 +92,9 @@ public sealed class StreamSession : IDisposable
     public long IdrRequestTotal => Interlocked.Read(ref _idrRequestTotal);
     public long AudioPacketsSent => _audioSender?.PacketsSent ?? 0;
     public long AudioBytesSent => _audioSender?.BytesSent ?? 0;
+    public bool MediaEndpointReady => _sender?.HasClient == true;
+    public long MediaFramesSent => _sender?.FramesSent ?? 0;
+    public long MediaBytesSent => _sender?.BytesSent ?? 0;
 
     public StreamSession(
         Action<object> send,
@@ -462,10 +465,17 @@ public sealed class StreamSession : IDisposable
     {
         try
         {
+            long frameIntervalTicks = Math.Max(1, Stopwatch.Frequency / Math.Max(1, Fps));
+            long nextFrameTicks = Stopwatch.GetTimestamp();
             while (!ct.IsCancellationRequested)
             {
                 if (_duplicator!.TryAcquire(100, out var bgra))
                 {
+                    long nowTicks = Stopwatch.GetTimestamp();
+                    if (nowTicks < nextFrameTicks)
+                        continue; // Desktop may present at 120/144/240 Hz; honor requested FPS.
+                    nextFrameTicks = nowTicks + frameIntervalTicks;
+
                     if (Interlocked.Increment(ref _capturedSinceEncode) > Fps * 3)
                         throw new InvalidOperationException("The hardware encoder stopped producing frames");
                     var nv12 = _converter!.Convert(bgra);

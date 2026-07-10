@@ -53,6 +53,14 @@ class RemoteMouseController(
 
     fun currentMode(): MouseMode = mode
 
+    fun clickLeft() {
+        if (enabled) sendClick("left")
+    }
+
+    fun clickRight() {
+        if (enabled) sendClick("right")
+    }
+
     fun reset() {
         if (leftHeld) sendButton("left", false)
         leftHeld = false

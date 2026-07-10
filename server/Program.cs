@@ -42,6 +42,8 @@ Console.CancelKeyPress += (_, e) =>
 long prevEncoded = 0;
 long prevIdr = 0;
 long prevAudioBytes = 0;
+long prevMediaFrames = 0;
+long prevMediaBytes = 0;
 try
 {
     while (!shutdown.IsCancellationRequested)
@@ -57,9 +59,17 @@ try
             long idrDelta = idr - prevIdr;
             long audioBytes = session.AudioBytesSent;
             long audioKbps = Math.Max(0, (audioBytes - prevAudioBytes) * 8 / 1000);
+            long mediaFrames = session.MediaFramesSent;
+            long mediaBytes = session.MediaBytesSent;
+            long sentFps = mediaFrames >= prevMediaFrames ? mediaFrames - prevMediaFrames : 0;
+            long mediaKbps = mediaBytes >= prevMediaBytes
+                ? (mediaBytes - prevMediaBytes) * 8 / 1000
+                : 0;
             prevEncoded = enc;
             prevIdr = idr;
             prevAudioBytes = audioBytes;
+            prevMediaFrames = mediaFrames;
+            prevMediaBytes = mediaBytes;
 
             string audioStatus = session.AudioStreaming
                 ? $"audio {audioKbps,4} kbps"
@@ -70,6 +80,7 @@ try
 
             Console.WriteLine(
                 $"[stats] {fps,3} fps encoded | {session.CurrentBitrateKbps,6} kbps | " +
+                $"media {(session.MediaEndpointReady ? "ready" : "WAIT"),5} {sentFps,3} fps/{mediaKbps,5} kbps | " +
                 $"client dropped {session.LastClientFramesDropped,3} | IDR req/s {idrDelta} | " +
                 $"{audioStatus} | {gamepadStatus}");
         }
@@ -78,6 +89,8 @@ try
             prevEncoded = 0;
             prevIdr = 0;
             prevAudioBytes = 0;
+            prevMediaFrames = 0;
+            prevMediaBytes = 0;
         }
     }
 }

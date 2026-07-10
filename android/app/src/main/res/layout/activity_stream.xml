@@ -64,18 +64,44 @@
         tools:text="LIVE · 1920×1080 @ 60 · audio on"
         tools:visibility="visible" />
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/btnPointerMode"
-        style="@style/Widget.MaterialComponents.Button.TextButton"
+    <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|end"
         android:layout_margin="12dp"
-        android:backgroundTint="#99000000"
-        android:enabled="false"
-        android:minWidth="120dp"
-        android:text="Mouse: Touchpad"
-        android:textColor="@color/white" />
+        android:background="#99000000"
+        android:orientation="horizontal">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnMouseToggle"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:minWidth="88dp"
+            android:text="Mouse: On"
+            android:textColor="@color/white" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnPointerMode"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:minWidth="92dp"
+            android:text="Mode: Pad"
+            android:textColor="@color/white" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnMouseClick"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:minWidth="72dp"
+            android:text="Click"
+            android:textColor="@color/white" />
+    </LinearLayout>
 
     <TextView
         android:id="@+id/tvGestureHint"

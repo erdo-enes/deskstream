@@ -61,7 +61,8 @@ class MediaReceiver(
      * thread -- the caller must post to the UI thread itself. */
     private val onStats: (StreamStats) -> Unit = {},
     private val onStalled: () -> Unit = {},
-    private val onCursorPosition: (CursorPosition) -> Unit = {}
+    private val onCursorPosition: (CursorPosition) -> Unit = {},
+    private val onStartupError: (String) -> Unit = {}
 ) {
     val bufferPool = BufferPool()
 
@@ -106,7 +107,7 @@ class MediaReceiver(
     private val decoderLatency = LatencyWindow()
     private val encoderLatency = LatencyWindow()
 
-    fun start(serverIp: String, mediaPort: Int, streamClockBaseUs: Long) {
+    fun start(serverIp: String, mediaPort: Int, streamClockBaseUs: Long): Boolean {
         this.serverIp = serverIp
         this.mediaPort = mediaPort
         this.streamClockBaseUs = streamClockBaseUs
@@ -130,8 +131,9 @@ class MediaReceiver(
             }
         } catch (e: Exception) {
             Log.e(TAG, "failed to open media socket", e)
+            onStartupError(e.message ?: "Media socket could not be opened")
             running = false
-            return
+            return false
         }
         socket = sock
 
@@ -139,22 +141,15 @@ class MediaReceiver(
             InetAddress.getByName(serverIp)
         } catch (e: Exception) {
             Log.e(TAG, "failed to resolve media server", e)
+            onStartupError(e.message ?: "Media server address could not be resolved")
             sock.close()
             socket = null
             running = false
-            return
+            return false
         }
-        // Filter inbound datagrams in the kernel to the negotiated server endpoint. This also
-        // prevents unrelated LAN UDP traffic from falsely satisfying the stall watchdog.
-        try {
-            sock.connect(address, mediaPort)
-        } catch (e: Exception) {
-            Log.e(TAG, "failed to connect media socket", e)
-            sock.close()
-            socket = null
-            running = false
-            return
-        }
+        // Keep the UDP socket unconnected, as in the stable v0.2 receiver. Some Samsung/OEM
+        // network stacks reject or later invalidate connected datagram sockets during Wi-Fi
+        // route changes. We validate the source endpoint explicitly in receiveLoop instead.
         gamepadDatagram = DatagramPacket(ByteArray(GamepadPacket.SIZE), GamepadPacket.SIZE, address, mediaPort)
         mouseDatagram = DatagramPacket(ByteArray(MousePacket.SIZE), MousePacket.SIZE, address, mediaPort)
         // TCP announces the bound port reliably; DSMH remains a NAT/firewall fallback.
@@ -163,6 +158,7 @@ class MediaReceiver(
         thread = Thread({ receiveLoop(sock, address) }, "MediaReceiver").apply { start() }
         statsJob = scope.launch { statsLoop() }
         watchdogJob = scope.launch { watchdogLoop(sock, address) }
+        return true
     }
 
     fun stop() {
@@ -257,6 +253,10 @@ class MediaReceiver(
                 continue
             } catch (e: IOException) {
                 break // socket closed by stop()
+            }
+
+            if (packet.address != serverAddress || packet.port != mediaPort) {
+                continue
             }
 
             if (!receivedAny) {

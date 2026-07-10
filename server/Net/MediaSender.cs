@@ -28,6 +28,9 @@ public sealed class MediaSender : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _learnLoop;
     private Task? _heartbeatLoop;
+    private long _framesSent;
+    private long _packetsSent;
+    private long _bytesSent;
 
     /// <summary>Validated gamepad snapshots from the currently learned media endpoint.</summary>
     public Action<GamepadState>? OnGamepadState { get; set; }
@@ -37,6 +40,9 @@ public sealed class MediaSender : IDisposable
 
     public int Port { get; }
     public bool HasClient => _clientEndpoint != null;
+    public long FramesSent => Interlocked.Read(ref _framesSent);
+    public long PacketsSent => Interlocked.Read(ref _packetsSent);
+    public long BytesSent => Interlocked.Read(ref _bytesSent);
 
     public MediaSender(int preferredPort, IPAddress? expectedClientAddress = null)
     {
@@ -171,6 +177,7 @@ public sealed class MediaSender : IDisposable
 
         int fecCount = (packetCount + FecGroup - 1) / FecGroup;
         byte dataFlags = keyframe ? MediaPacket.FlagKeyframe : (byte)0;
+        bool allDataSent = true;
 
         // ---- DATA packets ----
         for (int i = 0; i < packetCount; i++)
@@ -183,7 +190,8 @@ public sealed class MediaSender : IDisposable
                 (ushort)i, (ushort)packetCount, (ushort)fecCount, ptsMs, pipelineDelayMs);
 
             Buffer.BlockCopy(au, offset, _sendBuffer, MediaPacket.HeaderSize, payloadLen);
-            SendDatagram(client, MediaPacket.HeaderSize + payloadLen);
+            if (!SendDatagram(client, MediaPacket.HeaderSize + payloadLen))
+                allDataSent = false;
         }
 
         // ---- FEC packets: one XOR parity per group of up to 8 data packets ----
@@ -215,6 +223,9 @@ public sealed class MediaSender : IDisposable
             Buffer.BlockCopy(_fecBuffer, 0, _sendBuffer, MediaPacket.HeaderSize, maxLen);
             SendDatagram(client, MediaPacket.HeaderSize + maxLen);
         }
+
+        if (allDataSent)
+            Interlocked.Increment(ref _framesSent);
     }
 
     public void SendCursorPosition(uint sequence, CursorPosition position)
@@ -228,14 +239,17 @@ public sealed class MediaSender : IDisposable
         catch (ObjectDisposedException) { }
     }
 
-    private void SendDatagram(EndPoint client, int totalLen)
+    private bool SendDatagram(EndPoint client, int totalLen)
     {
         try
         {
-            _socket.SendTo(_sendBuffer, 0, totalLen, SocketFlags.None, client);
+            int sent = _socket.SendTo(_sendBuffer, 0, totalLen, SocketFlags.None, client);
+            Interlocked.Increment(ref _packetsSent);
+            Interlocked.Add(ref _bytesSent, sent);
+            return sent == totalLen;
         }
-        catch (SocketException) { }
-        catch (ObjectDisposedException) { }
+        catch (SocketException) { return false; }
+        catch (ObjectDisposedException) { return false; }
     }
 
     public void Dispose()

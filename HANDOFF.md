@@ -23,12 +23,12 @@ Target: <50 ms glass-to-glass at 1080p60.
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
 
-## Current state (v0.3.4 released)
+## Current state (v0.3.5 released)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.4` is the latest published
-  release (tag `v0.3.4`, APK + win-x64 server zip attached); `main` matches it. It sends the
-  Android media/audio UDP ports over authenticated TCP, so media startup does not depend on
-  inbound UDP hole-punch delivery; UDP punches remain a fallback.
+- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.5` is the latest published
+  release (tag `v0.3.5`, APK + win-x64 server zip attached); `main` matches it. It caps capture
+  at the requested FPS, reports actual media endpoint/send throughput, exposes Android media
+  socket failures, and adds explicit mouse on/off, mode, and click controls.
 - **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
   `compileReleaseKotlin`: successful with JDK 17. Full release artifacts are the final step.
