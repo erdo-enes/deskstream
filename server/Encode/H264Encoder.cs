@@ -46,9 +46,11 @@ public sealed class H264Encoder : IVideoEncoder
 
     // Output assembly buffers (reused; event-thread only).
     private byte[] _rawBuf = new byte[1 << 20];
+    private byte[] _annexBBuf = new byte[1 << 20];
     private byte[] _emitBuf = new byte[1 << 20];
     private byte[]? _cachedParamSets; // SPS+PPS NALs incl. start codes
     private bool _loggedProcessOutputError;
+    private bool _loggedUnsupportedOutputFraming;
 
     /// <summary>Called on the encoder event thread with a reused buffer. Consume synchronously.</summary>
     public Action<byte[], int, bool, uint>? OnEncodedFrame { get; set; }
@@ -197,7 +199,8 @@ public sealed class H264Encoder : IVideoEncoder
         // 6) Cache the negotiated sequence header (SPS/PPS) if the encoder exposes it.
         using (var negotiated = transform.GetOutputCurrentType(0))
         {
-            _cachedParamSets = TryGetBlob(negotiated, MfGuids.MF_MT_MPEG_SEQUENCE_HEADER);
+            _cachedParamSets = NormalizeParameterSets(
+                TryGetBlob(negotiated, MfGuids.MF_MT_MPEG_SEQUENCE_HEADER));
         }
 
         // 7) Learn whether the MFT allocates output samples for us.
@@ -217,6 +220,14 @@ public sealed class H264Encoder : IVideoEncoder
     {
         try { return type.GetBlob(key); }
         catch { return null; }
+    }
+
+    private static byte[]? NormalizeParameterSets(byte[]? data)
+    {
+        if (data is not { Length: > 0 }) return null;
+        if (NalUtil.IsAnnexB(data, data.Length))
+            return NalUtil.ExtractParameterSets(data, data.Length);
+        return NalUtil.ExtractParameterSetsFromAvcConfiguration(data);
     }
 
     // ---- Dynamic controls -----------------------------------------------------------------
@@ -344,7 +355,8 @@ public sealed class H264Encoder : IVideoEncoder
             try
             {
                 using var t = _transform.GetOutputCurrentType(0);
-                _cachedParamSets = TryGetBlob(t, MfGuids.MF_MT_MPEG_SEQUENCE_HEADER) ?? _cachedParamSets;
+                _cachedParamSets = NormalizeParameterSets(
+                    TryGetBlob(t, MfGuids.MF_MT_MPEG_SEQUENCE_HEADER)) ?? _cachedParamSets;
             }
             catch { }
             buffer.Sample?.Dispose();
@@ -406,28 +418,45 @@ public sealed class H264Encoder : IVideoEncoder
         }
 
         int rawLen = currentLength;
+        byte[] accessUnit = _rawBuf;
+        int accessUnitLength = rawLen;
+        if (!NalUtil.IsAnnexB(_rawBuf, rawLen))
+        {
+            if (!NalUtil.TryConvertLengthPrefixedToAnnexB(
+                    _rawBuf, rawLen, ref _annexBBuf, out accessUnitLength))
+            {
+                if (!_loggedUnsupportedOutputFraming)
+                {
+                    _loggedUnsupportedOutputFraming = true;
+                    Console.Error.WriteLine("[encoder] unsupported H.264 output framing; dropping access units.");
+                }
+                return;
+            }
+            accessUnit = _annexBBuf;
+        }
+
         byte[] emit;
         int emitLen;
 
-        bool hasSps = NalUtil.ContainsSps(_rawBuf, rawLen);
+        bool hasSps = NalUtil.ContainsSps(accessUnit, accessUnitLength);
         if (keyframe && hasSps)
         {
             // Refresh cache from the in-band parameter sets so future IDRs can be patched.
-            _cachedParamSets = NalUtil.ExtractParameterSets(_rawBuf, rawLen);
+            _cachedParamSets = NalUtil.ExtractParameterSets(accessUnit, accessUnitLength);
         }
 
         if (keyframe && !hasSps && _cachedParamSets is { Length: > 0 })
         {
-            emitLen = _cachedParamSets.Length + rawLen;
+            emitLen = _cachedParamSets.Length + accessUnitLength;
             EnsureCapacity(ref _emitBuf, emitLen);
             Buffer.BlockCopy(_cachedParamSets, 0, _emitBuf, 0, _cachedParamSets.Length);
-            Buffer.BlockCopy(_rawBuf, 0, _emitBuf, _cachedParamSets.Length, rawLen);
+            Buffer.BlockCopy(accessUnit, 0, _emitBuf, _cachedParamSets.Length, accessUnitLength);
             emit = _emitBuf;
         }
         else
         {
-            emit = _rawBuf;
-            emitLen = rawLen;
+            emit = accessUnit;
+            emitLen = accessUnitLength;
         }
 
         OnEncodedFrame?.Invoke(emit, emitLen, keyframe, pts);

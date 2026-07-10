@@ -128,7 +128,7 @@ class MediaReceiver(
                 }
                 soTimeout = SOCKET_TIMEOUT_MS
             }
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             Log.e(TAG, "failed to open media socket", e)
             running = false
             return
@@ -137,7 +137,7 @@ class MediaReceiver(
 
         val address = try {
             InetAddress.getByName(serverIp)
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             Log.e(TAG, "failed to resolve media server", e)
             sock.close()
             socket = null
@@ -148,7 +148,7 @@ class MediaReceiver(
         // prevents unrelated LAN UDP traffic from falsely satisfying the stall watchdog.
         try {
             sock.connect(address, mediaPort)
-        } catch (e: IOException) {
+        } catch (e: Exception) {
             Log.e(TAG, "failed to connect media socket", e)
             sock.close()
             socket = null

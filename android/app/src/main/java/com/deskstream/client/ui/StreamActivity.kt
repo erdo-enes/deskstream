@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -255,41 +256,54 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun handleEvent(msg: ServerMessage) {
-        when (msg) {
-            is ServerMessage.StreamStarted -> onStreamStarted(msg)
-            is ServerMessage.AudioStarted -> onAudioStarted(msg)
-            is ServerMessage.AudioUnavailable -> onAudioUnavailable(msg.message)
-            is ServerMessage.GamepadStarted -> onGamepadStarted(msg)
-            is ServerMessage.GamepadUnavailable -> onGamepadUnavailable(msg)
-            is ServerMessage.GamepadRumble -> gamepadForwarder.rumble(
-                msg.controllerId, msg.largeMotor, msg.smallMotor
-            )
-            ServerMessage.InputStarted -> onInputStarted()
-            is ServerMessage.InputUnavailable -> onInputUnavailable(msg.message)
-            ServerMessage.StreamStopped -> {
-                stopReceivers()
-                if (!stallRecoveryInProgress && !streamStartFailed) {
-                    showCenterStatus("Stream stopped")
-                }
-            }
-            is ServerMessage.Bitrate -> {
-                negotiatedBitrateKbps = msg.kbps
-                renderDiagnostics()
-            }
-            is ServerMessage.Error -> {
-                if (msg.code == "STREAM_FAILED" || msg.code == "ENCODER_UNAVAILABLE") {
-                    // Do not immediately spin START_STREAM after a real server-side fault.
-                    // Keep the Activity visible with the actual error instead of looking as
-                    // though it crashed or disappeared.
-                    streamStartFailed = true
-                    streamRequested = true
+        try {
+            when (msg) {
+                is ServerMessage.StreamStarted -> onStreamStarted(msg)
+                is ServerMessage.AudioStarted -> onAudioStarted(msg)
+                is ServerMessage.AudioUnavailable -> onAudioUnavailable(msg.message)
+                is ServerMessage.GamepadStarted -> onGamepadStarted(msg)
+                is ServerMessage.GamepadUnavailable -> onGamepadUnavailable(msg)
+                is ServerMessage.GamepadRumble -> gamepadForwarder.rumble(
+                    msg.controllerId, msg.largeMotor, msg.smallMotor
+                )
+                ServerMessage.InputStarted -> onInputStarted()
+                is ServerMessage.InputUnavailable -> onInputUnavailable(msg.message)
+                ServerMessage.StreamStopped -> {
                     stopReceivers()
+                    if (!stallRecoveryInProgress && !streamStartFailed) {
+                        showCenterStatus("Stream stopped")
+                    }
                 }
-                val description = describeStreamError(msg)
-                showCenterStatus(description)
-                Snackbar.make(binding.streamRoot, description, Snackbar.LENGTH_LONG).show()
+                is ServerMessage.Bitrate -> {
+                    negotiatedBitrateKbps = msg.kbps
+                    renderDiagnostics()
+                }
+                is ServerMessage.Error -> {
+                    if (msg.code == "STREAM_FAILED" || msg.code == "ENCODER_UNAVAILABLE") {
+                        // Do not immediately spin START_STREAM after a real server-side fault.
+                        // Keep the Activity visible with the actual error instead of looking as
+                        // though it crashed or disappeared.
+                        streamStartFailed = true
+                        streamRequested = true
+                        stopReceivers()
+                    }
+                    val description = describeStreamError(msg)
+                    showCenterStatus(description)
+                    Snackbar.make(binding.streamRoot, description, Snackbar.LENGTH_LONG).show()
+                }
+                else -> {}
             }
-            else -> {}
+        } catch (e: Exception) {
+            // A setup failure must leave the control socket alive and visible to the user.
+            // It is also emitted to logcat with the full stack trace for device-specific fixes.
+            Log.e(TAG, "stream event setup failed for ${msg::class.java.simpleName}", e)
+            streamStartFailed = true
+            streamRequested = true
+            try { stopReceivers() } catch (_: Exception) { }
+            val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+            showCenterStatus("Client setup failed: $detail")
+            Snackbar.make(binding.streamRoot, "Client setup failed; see logcat", Snackbar.LENGTH_LONG).show()
+            ControlClient.stopStream()
         }
     }
 
@@ -733,6 +747,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     companion object {
+        private const val TAG = "StreamActivity"
         private const val MAX_BITRATE_KBPS = 20000
         private const val TARGET_FPS = 60
         private const val AUDIO_NEGOTIATION_TIMEOUT_MS = 3500L

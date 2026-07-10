@@ -23,12 +23,12 @@ Target: <50 ms glass-to-glass at 1080p60.
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
 
-## Current state (v0.3.2 released)
+## Current state (v0.3.3 released)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.2` is the latest published
-  release (tag `v0.3.2`, APK + win-x64 server zip attached); `main` matches it. It starts
-  capture only after the Android media endpoint is learned, forces an initial deliverable IDR,
-  keeps encoder faults from closing TCP, and uses Media Foundation by default.
+- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.3` is the latest published
+  release (tag `v0.3.3`, APK + win-x64 server zip attached); `main` matches it. It normalizes
+  Media Foundation H.264 output and SPS/PPS headers into Annex-B for Android decoders, and
+  keeps client setup errors visible instead of silently terminating the Activity.
 - **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
   `compileReleaseKotlin`: successful with JDK 17. Full release artifacts are the final step.
