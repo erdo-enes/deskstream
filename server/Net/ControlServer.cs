@@ -95,7 +95,13 @@ public sealed class ControlServer : IDisposable
             }
         }
 
-        var session = new StreamSession(Send, () => { try { tcp.Close(); } catch { } }, _pairing, _serverName);
+        var clientAddress = (remote as IPEndPoint)?.Address;
+        var session = new StreamSession(
+            Send,
+            () => { try { tcp.Close(); } catch { } },
+            _pairing,
+            _serverName,
+            clientAddress);
         Current = session;
 
         try

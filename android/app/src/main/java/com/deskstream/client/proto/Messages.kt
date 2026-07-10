@@ -48,6 +48,22 @@ object ClientMessages {
             put("type", "STOP_STREAM")
         }.toString()
 
+    fun startAudio(): String =
+        JSONObject().apply {
+            put("type", "AUDIO_START")
+        }.toString()
+
+    fun startGamepads(controllers: Int): String =
+        JSONObject().apply {
+            put("type", "GAMEPAD_START")
+            put("controllers", controllers.coerceIn(1, 4))
+        }.toString()
+
+    fun stopGamepads(): String =
+        JSONObject().apply {
+            put("type", "GAMEPAD_STOP")
+        }.toString()
+
     fun requestIdr(): String =
         JSONObject().apply {
             put("type", "REQUEST_IDR")
@@ -86,6 +102,21 @@ sealed class ServerMessage {
         val codec: String
     ) : ServerMessage()
     data object StreamStopped : ServerMessage()
+    data class AudioStarted(
+        val audioPort: Int,
+        val sampleRate: Int,
+        val channels: Int,
+        val format: String,
+        val packetSamples: Int
+    ) : ServerMessage()
+    data class AudioUnavailable(val message: String) : ServerMessage()
+    data class GamepadStarted(val controllers: Int, val controllerType: String) : ServerMessage()
+    data class GamepadUnavailable(val message: String, val driverUrl: String) : ServerMessage()
+    data class GamepadRumble(
+        val controllerId: Int,
+        val largeMotor: Int,
+        val smallMotor: Int
+    ) : ServerMessage()
     data class Bitrate(val kbps: Int) : ServerMessage()
     data object Pong : ServerMessage()
 
@@ -126,6 +157,29 @@ sealed class ServerMessage {
                     codec = obj.optString("codec", "h264")
                 )
                 "STREAM_STOPPED" -> StreamStopped
+                "AUDIO_STARTED" -> AudioStarted(
+                    audioPort = obj.optInt("audioPort", 0),
+                    sampleRate = obj.optInt("sampleRate", 0),
+                    channels = obj.optInt("channels", 0),
+                    format = obj.optString("format", ""),
+                    packetSamples = obj.optInt("packetSamples", 0)
+                )
+                "AUDIO_UNAVAILABLE" -> AudioUnavailable(
+                    message = obj.optString("message", "System audio is unavailable")
+                )
+                "GAMEPAD_STARTED" -> GamepadStarted(
+                    controllers = obj.optInt("controllers", 0),
+                    controllerType = obj.optString("controllerType", "xbox360")
+                )
+                "GAMEPAD_UNAVAILABLE" -> GamepadUnavailable(
+                    message = obj.optString("message", "Virtual controller is unavailable"),
+                    driverUrl = obj.optString("driverUrl", "")
+                )
+                "GAMEPAD_RUMBLE" -> GamepadRumble(
+                    controllerId = obj.optInt("controllerId", 0),
+                    largeMotor = obj.optInt("largeMotor", 0).coerceIn(0, 255),
+                    smallMotor = obj.optInt("smallMotor", 0).coerceIn(0, 255)
+                )
                 "BITRATE" -> Bitrate(kbps = obj.optInt("kbps", 0))
                 "PONG" -> Pong
                 else -> Unknown(type)

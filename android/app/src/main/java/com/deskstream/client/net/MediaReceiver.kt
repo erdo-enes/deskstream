@@ -3,6 +3,7 @@ package com.deskstream.client.net
 import android.os.SystemClock
 import android.util.Log
 import com.deskstream.client.proto.MediaPacketHeader
+import com.deskstream.client.proto.GamepadPacket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -65,6 +66,8 @@ class MediaReceiver(
     private var statsJob: Job? = null
     private var socket: DatagramSocket? = null
     private var thread: Thread? = null
+    private val gamepadSendGate = Any()
+    private var gamepadDatagram: DatagramPacket? = null
     @Volatile private var running = false
     private var serverIp: String = ""
     private var mediaPort: Int = 0
@@ -92,7 +95,18 @@ class MediaReceiver(
         }
         socket = sock
 
-        thread = Thread({ receiveLoop(sock) }, "MediaReceiver").apply { start() }
+        val address = try {
+            InetAddress.getByName(serverIp)
+        } catch (e: IOException) {
+            Log.e(TAG, "failed to resolve media server", e)
+            sock.close()
+            socket = null
+            running = false
+            return
+        }
+        gamepadDatagram = DatagramPacket(ByteArray(GamepadPacket.SIZE), GamepadPacket.SIZE, address, mediaPort)
+
+        thread = Thread({ receiveLoop(sock, address) }, "MediaReceiver").apply { start() }
         statsJob = scope.launch { statsLoop() }
     }
 
@@ -102,6 +116,7 @@ class MediaReceiver(
         statsJob = null
         socket?.close() // unblocks the blocking receive() in the worker thread
         socket = null
+        synchronized(gamepadSendGate) { gamepadDatagram = null }
         thread?.let { t ->
             try {
                 t.join(500)
@@ -123,12 +138,27 @@ class MediaReceiver(
         frameAssembler.requestDiscardUntilKeyframe()
     }
 
-    private fun receiveLoop(sock: DatagramSocket) {
+    /** Sends one already-serialized controller snapshot without allocating a DatagramPacket. */
+    fun sendGamepadPacket(data: ByteArray) {
+        if (!running || data.size != GamepadPacket.SIZE) return
+        synchronized(gamepadSendGate) {
+            val sock = socket ?: return
+            val packet = gamepadDatagram ?: return
+            try {
+                packet.setData(data, 0, data.size)
+                sock.send(packet)
+            } catch (e: IOException) {
+                if (running) Log.w(TAG, "gamepad packet send failed", e)
+            }
+        }
+    }
+
+    private fun receiveLoop(sock: DatagramSocket, serverAddress: InetAddress) {
         val buf = ByteArray(RECV_PACKET_BUFFER_BYTES)
         val packet = DatagramPacket(buf, buf.size)
         var receivedAny = false
         var lastHolePunchAt = SystemClock.elapsedRealtime()
-        sendHolePunch(sock)
+        sendHolePunch(sock, serverAddress)
 
         while (running) {
             packet.setLength(buf.size) // receive() shrinks this; must reset every iteration
@@ -138,7 +168,7 @@ class MediaReceiver(
                 if (!receivedAny) {
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastHolePunchAt >= 1000) {
-                        sendHolePunch(sock)
+                        sendHolePunch(sock, serverAddress)
                         lastHolePunchAt = now
                     }
                 }
@@ -161,10 +191,10 @@ class MediaReceiver(
         }
     }
 
-    private fun sendHolePunch(sock: DatagramSocket) {
+    private fun sendHolePunch(sock: DatagramSocket, serverAddress: InetAddress) {
         try {
             val bytes = HOLE_PUNCH_MESSAGE.toByteArray(Charsets.US_ASCII)
-            sock.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(serverIp), mediaPort))
+            sock.send(DatagramPacket(bytes, bytes.size, serverAddress, mediaPort))
         } catch (e: IOException) {
             Log.w(TAG, "hole punch send failed", e)
         }

@@ -70,9 +70,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (!pendingConnect) binding.tvSubtitle.text = "Searching this Wi-Fi network…"
         discoveryClient.start { server ->
             serverAdapter.upsert(server)
             updateEmptyState()
+            if (!pendingConnect) {
+                val count = serverAdapter.itemCount
+                binding.tvSubtitle.text = "$count DeskStream server${if (count == 1) "" else "s"} found"
+            }
         }
     }
 
@@ -98,6 +103,8 @@ class MainActivity : AppCompatActivity() {
         if (pendingConnect) return
         pendingConnect = true
         connectingServerName = server.name
+        binding.tvSubtitle.text = "Connecting to ${server.name} (${server.ip})…"
+        binding.btnConnect.isEnabled = false
         binding.progressDiscovering.visibility = View.VISIBLE
         ControlClient.connect(server.ip, server.controlPort)
     }
@@ -119,10 +126,13 @@ class MainActivity : AppCompatActivity() {
                 // user is now mid-connect-flow: completing the PIN should land them in the
                 // stream, so make sure the READY handler below navigates.
                 pendingConnect = true
+                binding.tvSubtitle.text = "Enter the PIN shown on the PC"
                 showPairDialog()
             }
             ControlClient.State.DISCONNECTED -> {
                 pendingConnect = false
+                binding.btnConnect.isEnabled = true
+                binding.tvSubtitle.text = "Searching this Wi-Fi network…"
                 binding.progressDiscovering.visibility = View.GONE
                 dismissPairDialog()
             }
@@ -130,7 +140,14 @@ class MainActivity : AppCompatActivity() {
                 // Only show progress for a user-initiated connect; background auto-reconnects
                 // (the process-wide client keeps its backoff loop running) shouldn't lock
                 // this screen's UI.
-                if (pendingConnect) binding.progressDiscovering.visibility = View.VISIBLE
+                if (pendingConnect) {
+                    binding.progressDiscovering.visibility = View.VISIBLE
+                    binding.tvSubtitle.text = if (state == ControlClient.State.RECONNECTING) {
+                        "Connection interrupted; retrying…"
+                    } else {
+                        "Connecting to ${connectingServerName.ifEmpty { ControlClient.serverIp }}…"
+                    }
+                }
             }
             ControlClient.State.READY, ControlClient.State.STREAMING -> {
                 // Drive navigation off *state* (a StateFlow, always replayed to a fresh
@@ -139,6 +156,7 @@ class MainActivity : AppCompatActivity() {
                 // event would be lost, but the state transition to READY is never lost, so we
                 // can't strand the user on this screen with no way forward.
                 binding.progressDiscovering.visibility = View.GONE
+                binding.btnConnect.isEnabled = true
                 dismissPairDialog()
                 if (pendingConnect) {
                     pendingConnect = false
@@ -168,6 +186,8 @@ class MainActivity : AppCompatActivity() {
             }
             is ServerMessage.Error -> {
                 pendingConnect = false
+                binding.btnConnect.isEnabled = true
+                binding.tvSubtitle.text = "Could not connect · tap a server to retry"
                 binding.progressDiscovering.visibility = View.GONE
                 dismissPairDialog()
                 Snackbar.make(binding.rootLayout, describeError(msg), Snackbar.LENGTH_LONG).show()

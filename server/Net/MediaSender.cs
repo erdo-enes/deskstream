@@ -19,6 +19,7 @@ public sealed class MediaSender : IDisposable
     private static readonly byte[] Dsmh = Encoding.ASCII.GetBytes("DSMH");
 
     private readonly Socket _socket;
+    private readonly IPAddress? _expectedClientAddress;
     private readonly byte[] _sendBuffer = new byte[MediaPacket.MaxDatagram];
     private readonly byte[] _fecBuffer = new byte[MediaPacket.MaxPayload];
 
@@ -26,11 +27,15 @@ public sealed class MediaSender : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _learnLoop;
 
+    /// <summary>Validated gamepad snapshots from the currently learned media endpoint.</summary>
+    public Action<GamepadState>? OnGamepadState { get; set; }
+
     public int Port { get; }
     public bool HasClient => _clientEndpoint != null;
 
-    public MediaSender(int preferredPort)
+    public MediaSender(int preferredPort, IPAddress? expectedClientAddress = null)
     {
+        _expectedClientAddress = expectedClientAddress;
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
         // Keep the OS send buffer small: dropping beats queuing for latency (PROTOCOL.md §3.3).
@@ -71,11 +76,23 @@ public sealed class MediaSender : IDisposable
                 var r = await _socket.ReceiveFromAsync(
                     buf, SocketFlags.None, new IPEndPoint(IPAddress.Any, 0), ct);
 
+                if (_expectedClientAddress != null &&
+                    r.RemoteEndPoint is IPEndPoint remote &&
+                    !remote.Address.Equals(_expectedClientAddress))
+                {
+                    continue;
+                }
+
                 if (r.ReceivedBytes >= Dsmh.Length &&
                     buf.AsSpan(0, Dsmh.Length).SequenceEqual(Dsmh))
                 {
                     // The server sends all media to the source of the most recent DSMH.
                     _clientEndpoint = r.RemoteEndPoint;
+                }
+                else if (_clientEndpoint?.Equals(r.RemoteEndPoint) == true &&
+                         GamepadPacket.TryParse(buf.AsSpan(0, r.ReceivedBytes), out var state))
+                {
+                    OnGamepadState?.Invoke(state);
                 }
             }
             catch (OperationCanceledException) { break; }

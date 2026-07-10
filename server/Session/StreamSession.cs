@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Net;
+using DeskStreamer.Server.Audio;
 using DeskStreamer.Server.Capture;
 using DeskStreamer.Server.Encode;
+using DeskStreamer.Server.Input;
 using DeskStreamer.Server.Net;
 using DeskStreamer.Server.Protocol;
 
@@ -28,6 +31,7 @@ public sealed class StreamSession : IDisposable
     private readonly Action _requestClose;
     private readonly PairingManager _pairing;
     private readonly string _serverName;
+    private readonly IPAddress? _clientAddress;
 
     private SessionState _state = SessionState.AwaitingHello;
     private string _clientId = "";
@@ -44,6 +48,9 @@ public sealed class StreamSession : IDisposable
 
     // Pipeline
     private MediaSender? _sender;
+    private AudioSender? _audioSender;
+    private SystemAudioCapture? _audioCapture;
+    private VirtualGamepadManager? _gamepads;
     private DesktopDuplicator? _duplicator;
     private Nv12Converter? _converter;
     private H264Encoder? _encoder;
@@ -52,6 +59,7 @@ public sealed class StreamSession : IDisposable
     private Stopwatch? _clock;
     private uint _frameId;
     private volatile bool _streaming;
+    private volatile bool _audioStreaming;
 
     // Adaptation
     private int _maxBitrateKbps = 20000;
@@ -67,18 +75,28 @@ public sealed class StreamSession : IDisposable
     private long _idrRequestTotal;
     public SessionState State => _state;
     public bool Streaming => _streaming;
+    public bool AudioStreaming => _audioStreaming;
+    public int GamepadCount => _gamepads?.Count ?? 0;
     public int Fps { get; private set; } = 60;
     public int CurrentBitrateKbps => _currentBitrateKbps;
     public int LastClientFramesDropped { get; private set; }
     public long EncodedFrames => Interlocked.Read(ref _encodedFrames);
     public long IdrRequestTotal => Interlocked.Read(ref _idrRequestTotal);
+    public long AudioPacketsSent => _audioSender?.PacketsSent ?? 0;
+    public long AudioBytesSent => _audioSender?.BytesSent ?? 0;
 
-    public StreamSession(Action<object> send, Action requestClose, PairingManager pairing, string serverName)
+    public StreamSession(
+        Action<object> send,
+        Action requestClose,
+        PairingManager pairing,
+        string serverName,
+        IPAddress? clientAddress)
     {
         _send = send;
         _requestClose = requestClose;
         _pairing = pairing;
         _serverName = serverName;
+        _clientAddress = clientAddress;
     }
 
     private static long NowMs() =>
@@ -94,6 +112,9 @@ public sealed class StreamSession : IDisposable
             case "PAIR_REQUEST": OnPairRequest(); break;
             case "PAIR_CODE": OnPairCode(payload); break;
             case "START_STREAM": OnStartStream(payload); break;
+            case "AUDIO_START": OnAudioStart(); break;
+            case "GAMEPAD_START": OnGamepadStart(payload); break;
+            case "GAMEPAD_STOP": StopGamepads(); break;
             case "STOP_STREAM": OnStopStream(); break;
             case "REQUEST_IDR": OnRequestIdr(); break;
             case "STATS": OnStats(payload); break;
@@ -236,11 +257,84 @@ public sealed class StreamSession : IDisposable
         Console.WriteLine("[session] streaming stopped.");
     }
 
+    private void OnAudioStart()
+    {
+        if (_state != SessionState.Streaming || !_streaming)
+            return;
+
+        // Idempotent: Activity recreation or a repeated request only needs the negotiated
+        // parameters again; it must not open a second WASAPI capture client.
+        if (_audioStreaming && _audioCapture != null && _audioSender != null)
+        {
+            _send(OutgoingMessages.AudioStarted(_audioSender.Port));
+            return;
+        }
+
+        // A device may have disappeared after a previous successful start. Clean up that
+        // stopped instance so an explicit retry can reacquire the current default device.
+        if (_audioCapture != null || _audioSender != null)
+            StopAudio();
+
+        try
+        {
+            _audioSender = new AudioSender(Ports.PreferredAudio, _clientAddress);
+            _audioSender.Start();
+            _audioCapture = new SystemAudioCapture(CurrentStreamPtsMs);
+            _audioCapture.DataAvailable += OnAudioData;
+            _audioCapture.Failed += OnAudioFailed;
+            _audioCapture.Start();
+            _audioStreaming = true;
+
+            _send(OutgoingMessages.AudioStarted(_audioSender.Port));
+            Console.WriteLine($"[audio] system output '{_audioCapture.DeviceName}' -> " +
+                              $"48 kHz stereo PCM16, UDP {_audioSender.Port}.");
+        }
+        catch (Exception ex)
+        {
+            StopAudio();
+            string message = string.IsNullOrWhiteSpace(ex.Message)
+                ? "Windows system audio capture could not be started"
+                : ex.Message;
+            _send(OutgoingMessages.AudioUnavailable(message));
+            Console.Error.WriteLine($"[audio] unavailable: {message}");
+        }
+    }
+
+    private void OnGamepadStart(ReadOnlySpan<byte> payload)
+    {
+        if (_state != SessionState.Streaming || !_streaming)
+            return;
+
+        var message = Json.Deserialize<GamepadStartMessage>(payload);
+        int requested = Math.Clamp(message?.Controllers ?? 1, 1, VirtualGamepadManager.MaxControllers);
+
+        try
+        {
+            if (_gamepads == null)
+            {
+                _gamepads = new VirtualGamepadManager();
+                _gamepads.Rumble += OnGamepadRumble;
+            }
+
+            int count = _gamepads.Start(requested);
+            _send(OutgoingMessages.GamepadStarted(count));
+            Console.WriteLine($"[gamepad] {count} virtual Xbox 360 controller(s) connected.");
+        }
+        catch (Exception ex)
+        {
+            StopGamepads();
+            string messageText = DescribeGamepadError(ex);
+            _send(OutgoingMessages.GamepadUnavailable(messageText));
+            Console.Error.WriteLine($"[gamepad] unavailable: {messageText}");
+        }
+    }
+
     // ---- Pipeline -------------------------------------------------------------------------
 
     private void StartPipeline()
     {
-        _sender = new MediaSender(Ports.PreferredMedia);
+        _sender = new MediaSender(Ports.PreferredMedia, _clientAddress);
+        _sender.OnGamepadState = OnGamepadState;
         _sender.Start();
 
         _duplicator = new DesktopDuplicator();
@@ -293,9 +387,46 @@ public sealed class StreamSession : IDisposable
         _sender?.SendFrame(data, length, id, keyframe, ptsMs);
     }
 
+    private uint CurrentStreamPtsMs() =>
+        _clock == null ? 0 : (uint)(_clock.ElapsedMilliseconds & 0xFFFFFFFF);
+
+    private void OnAudioData(byte[] data, int length, uint captureEndPtsMs)
+    {
+        _audioSender?.SendPcm(data, length, captureEndPtsMs);
+    }
+
+    private void OnAudioFailed(string message)
+    {
+        _audioStreaming = false;
+        _send(OutgoingMessages.AudioUnavailable(message));
+        Console.Error.WriteLine($"[audio] capture stopped: {message}");
+    }
+
+    private void OnGamepadState(GamepadState state)
+    {
+        try
+        {
+            _gamepads?.Apply(state);
+        }
+        catch (Exception ex)
+        {
+            string message = DescribeGamepadError(ex);
+            StopGamepads();
+            _send(OutgoingMessages.GamepadUnavailable(message));
+            Console.Error.WriteLine($"[gamepad] virtual controller stopped: {message}");
+        }
+    }
+
+    private void OnGamepadRumble(int controllerId, byte largeMotor, byte smallMotor)
+    {
+        _send(OutgoingMessages.GamepadRumble(controllerId, largeMotor, smallMotor));
+    }
+
     private void StopPipeline()
     {
         _streaming = false;
+        StopGamepads();
+        StopAudio();
         try { _captureCts?.Cancel(); } catch { }
         try { _captureThread?.Join(1500); } catch { }
         _captureThread = null;
@@ -303,10 +434,34 @@ public sealed class StreamSession : IDisposable
         try { _encoder?.Dispose(); } catch { }
         try { _converter?.Dispose(); } catch { }
         try { _duplicator?.Dispose(); } catch { }
+        if (_sender != null)
+            _sender.OnGamepadState = null;
         try { _sender?.Dispose(); } catch { }
         _encoder = null; _converter = null; _duplicator = null; _sender = null;
         _captureCts?.Dispose(); _captureCts = null;
         _clock = null;
+    }
+
+    private void StopAudio()
+    {
+        _audioStreaming = false;
+        if (_audioCapture != null)
+        {
+            _audioCapture.DataAvailable -= OnAudioData;
+            _audioCapture.Failed -= OnAudioFailed;
+        }
+        try { _audioCapture?.Dispose(); } catch { }
+        try { _audioSender?.Dispose(); } catch { }
+        _audioCapture = null;
+        _audioSender = null;
+    }
+
+    private void StopGamepads()
+    {
+        if (_gamepads != null)
+            _gamepads.Rumble -= OnGamepadRumble;
+        try { _gamepads?.Dispose(); } catch { }
+        _gamepads = null;
     }
 
     // ---- Adaptation controller (PROTOCOL.md §4) -------------------------------------------
@@ -418,6 +573,21 @@ public sealed class StreamSession : IDisposable
         Console.WriteLine("  |  (valid for 60 seconds)              |");
         Console.WriteLine("  +--------------------------------------+");
         Console.WriteLine();
+    }
+
+    private static string DescribeGamepadError(Exception ex)
+    {
+        string type = ex.GetType().Name;
+        if (type.Contains("BusNotFound", StringComparison.OrdinalIgnoreCase) ||
+            type.Contains("DllNotFound", StringComparison.OrdinalIgnoreCase))
+        {
+            return "ViGEmBus is not installed. Install the official ViGEmBus 1.22 driver, then restart DeskStream.";
+        }
+        if (type.Contains("BusVersionMismatch", StringComparison.OrdinalIgnoreCase))
+            return "The installed ViGEmBus driver is incompatible. Install ViGEmBus 1.22 and restart DeskStream.";
+        return string.IsNullOrWhiteSpace(ex.Message)
+            ? "The Windows virtual Xbox controller could not be created."
+            : ex.Message;
     }
 
     public void Dispose()

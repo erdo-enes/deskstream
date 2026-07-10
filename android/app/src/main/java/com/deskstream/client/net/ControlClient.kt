@@ -136,6 +136,18 @@ object ControlClient {
         }
     }
 
+    fun startAudio() {
+        scope.launch { writeFrame(ClientMessages.startAudio()) }
+    }
+
+    fun startGamepads(controllers: Int) {
+        scope.launch { writeFrame(ClientMessages.startGamepads(controllers)) }
+    }
+
+    fun stopGamepads() {
+        scope.launch { writeFrame(ClientMessages.stopGamepads()) }
+    }
+
     /** Client-side rate limit (300 ms) on top of the server's own rate limit, per §2.3. */
     fun requestIdr() {
         val now = SystemClock.elapsedRealtime()
@@ -247,6 +259,14 @@ object ControlClient {
             }
             ServerMessage.StreamStopped -> {
                 if (_state.value == State.STREAMING) _state.value = State.READY
+            }
+            is ServerMessage.AudioStarted, is ServerMessage.AudioUnavailable -> {
+                // event only; audio is optional and does not change video session state
+            }
+            is ServerMessage.GamepadStarted,
+            is ServerMessage.GamepadUnavailable,
+            is ServerMessage.GamepadRumble -> {
+                // event only; controller forwarding is optional
             }
             is ServerMessage.Bitrate -> {
                 // event only, no state change

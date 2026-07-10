@@ -3,8 +3,9 @@
 Both the Windows server and the Android client implement exactly this. All multi-byte
 integers are **big-endian**. All JSON is UTF-8. Protocol version is `1`.
 
-Default ports: discovery **UDP 47800**, control **TCP 47801**, media **UDP negotiated**
-(server picks, typically 47802, and reports it in `STREAM_STARTED`).
+Default ports: discovery **UDP 47800**, control **TCP 47801**, video **UDP negotiated**
+(server picks, typically 47802, and reports it in `STREAM_STARTED`), audio **UDP
+negotiated** (server picks, typically 47803, and reports it in `AUDIO_STARTED`).
 
 ---
 
@@ -80,6 +81,9 @@ Client → server:
 
 ```json
 {"type":"START_STREAM","maxBitrateKbps":20000,"fps":60}
+{"type":"AUDIO_START"}
+{"type":"GAMEPAD_START","controllers":1}
+{"type":"GAMEPAD_STOP"}
 {"type":"STOP_STREAM"}
 {"type":"REQUEST_IDR"}
 {"type":"STATS","framesOk":58,"framesDropped":2,"bytes":2411000,"intervalMs":1000}
@@ -89,6 +93,11 @@ Server → client:
 
 ```json
 {"type":"STREAM_STARTED","mediaPort":47802,"width":1920,"height":1080,"fps":60,"codec":"h264"}
+{"type":"AUDIO_STARTED","audioPort":47803,"sampleRate":48000,"channels":2,"format":"pcm_s16le","packetSamples":240}
+{"type":"AUDIO_UNAVAILABLE","message":"No active Windows playback device"}
+{"type":"GAMEPAD_STARTED","controllers":1,"controllerType":"xbox360"}
+{"type":"GAMEPAD_UNAVAILABLE","message":"ViGEmBus is not installed","driverUrl":"https://github.com/nefarius/ViGEmBus/releases/latest"}
+{"type":"GAMEPAD_RUMBLE","controllerId":0,"largeMotor":255,"smallMotor":128}
 {"type":"STREAM_STOPPED"}
 {"type":"BITRATE","kbps":14000}
 ```
@@ -99,10 +108,35 @@ arrive (and stops after). This is a **hole punch / address learn**: the server s
 media packets to the source address of the most recent `DSMH`. The stream always starts
 with an IDR frame carrying SPS/PPS.
 
+After `STREAM_STARTED`, an audio-capable client sends `AUDIO_START`. The server either
+starts Windows system-output loopback capture and replies `AUDIO_STARTED`, or replies
+`AUDIO_UNAVAILABLE` without stopping video. `AUDIO_START` is idempotent and is ignored
+unless the session is streaming. This opt-in makes old clients and servers interoperable:
+an old server ignores the unknown request, and a new server does not open an audio device
+for a client that never asks for it.
+
+After `AUDIO_STARTED`, the client sends the 4 ASCII bytes `DSAH` from its audio socket to
+`serverIp:audioPort` every second until an audio packet arrives. The server sends audio to
+the source address of the most recent `DSAH`. `STOP_STREAM`, socket death, or session
+disposal stops both video and audio.
+
+An Android client with one or more physical gamepad/joystick input devices sends
+`GAMEPAD_START` with `controllers` clamped to 1..4. The server creates that many virtual
+Xbox 360 controllers and replies `GAMEPAD_STARTED`, or replies `GAMEPAD_UNAVAILABLE`
+without stopping video/audio (normally because the optional ViGEmBus driver is absent).
+Repeating `GAMEPAD_START` changes the active count. `GAMEPAD_STOP`, `STOP_STREAM`, socket
+death, or session disposal disconnects all virtual controllers.
+
+While enabled, controller state snapshots use the video media socket and port described in
+§3B. The server accepts input only from the source endpoint of the most recent valid `DSMH`
+hole punch, preventing an unrelated LAN endpoint from injecting input into the session.
+`GAMEPAD_RUMBLE` carries the current XInput motor strengths (0..255) back over TCP. The
+client should stop vibration when both values are zero.
+
 `STATS` is sent every 1 s during streaming. `REQUEST_IDR` is sent whenever a frame is
 dropped as unrecoverable; server rate-limits IDR generation to at most one per 300 ms.
 
-Reserved for future: `INPUT`, `AUDIO_START` (ignore if received).
+Reserved for future: touch/mouse/keyboard `INPUT` (ignore if received).
 
 ## 3. Media channel (UDP, server → client)
 
@@ -168,6 +202,83 @@ If two or more packets of a group are missing, the frame is unrecoverable → dr
   (capture side already coalesces).
 - Socket send buffer small (≤256 KB). Set DSCP AF41 / TOS 0x88 on the media socket
   (best effort; ignore failures).
+
+## 3A. Audio channel (UDP, server → client)
+
+Audio uses a separate negotiated UDP socket so video loss/reassembly cannot delay audio,
+and so an older video receiver never mistakes audio for an H.264 packet. v1.1 audio is the
+Windows default playback device captured through WASAPI loopback and normalized to
+**48,000 Hz, stereo, signed 16-bit little-endian interleaved PCM**. It deliberately avoids
+a codec frame or decoder startup buffer; the tradeoff is a fixed 1,536 kbps audio payload
+rate while sound is active.
+
+Each datagram is a **16-byte header + exactly 960 payload bytes** (240 stereo sample frames,
+5 ms), except that no packets need be emitted while the Windows output device is silent.
+Header integers are big-endian; only the PCM samples in the payload are little-endian.
+
+```
+offset  size  field
+0       1     version        = 1
+1       1     format         = 1 (PCM_S16LE)
+2       2     uint16 payloadLen   = 960
+4       4     uint32 sequence     (monotonic audio-packet id, starts at 0)
+8       4     uint32 ptsMs        (same server stream clock as video; stats only)
+12      2     uint16 sampleCount  = 240 (sample frames per channel)
+14      2     reserved = 0
+16      ...   interleaved L, R PCM samples
+```
+
+Audio rules:
+
+- Packetize and send each 5 ms block immediately. Keep at most one partial block on the
+  server; never retransmit and do not add FEC.
+- The client validates `payloadLen == sampleCount × channels × 2`. Stale or reordered
+  packets are discarded. For a small forward sequence gap, it may write an equivalent
+  number of zero-filled 5 ms blocks before the newest packet to preserve audio time.
+- Feed accepted data to a low-latency streaming audio output immediately. There is no
+  network jitter buffer, PTS pacing, or wait for the matching video timestamp. If the
+  device playback buffer is full, drop audio rather than building a queue.
+- Client mute is local: keep receiving and draining the stream while setting playback
+  volume to zero, so unmute is immediate and does not require renegotiation.
+
+## 3B. Gamepad input (UDP, client → server)
+
+Gamepad messages are **complete state snapshots**, not deltas. Losing a datagram therefore
+heals on the next snapshot without retransmission or TCP head-of-line blocking. Send on
+state change at no more than 120 Hz and send an unchanged heartbeat at least every 250 ms
+while a controller is present. The fixed datagram is 24 bytes:
+
+```
+offset  size  field
+0       4     ASCII magic = "DSGP"
+4       1     version = 1
+5       1     controllerId = 0..3
+6       2     uint16 buttons (XInput bit layout, big-endian)
+8       1     leftTrigger  = 0..255
+9       1     rightTrigger = 0..255
+10      2     int16 leftX   (big-endian, -32768..32767)
+12      2     int16 leftY   (big-endian, up is positive)
+14      2     int16 rightX  (big-endian, -32768..32767)
+16      2     int16 rightY  (big-endian, up is positive)
+18      4     uint32 sequence (big-endian, monotonic per controller)
+22      2     reserved = 0
+```
+
+Button bits match `XINPUT_GAMEPAD.wButtons`: D-pad up/down/left/right =
+`0x0001/0x0002/0x0004/0x0008`; Start `0x0010`; Back `0x0020`; left/right stick click
+`0x0040/0x0080`; left/right shoulder `0x0100/0x0200`; Guide `0x0400`; A/B/X/Y
+`0x1000/0x2000/0x4000/0x8000`.
+
+Server rules:
+
+- Ignore malformed packets, unknown versions, controller ids outside the negotiated count,
+  packets from any endpoint other than the current `DSMH` endpoint, and duplicate/stale
+  sequence numbers (using wrap-safe uint32 comparison).
+- Apply accepted snapshots immediately to the matching virtual controller. There is no
+  queue. On controller/session stop, submit a neutral state before disconnecting it so no
+  button or axis can remain stuck.
+- Gamepad support is optional. Failure to create the virtual device must produce
+  `GAMEPAD_UNAVAILABLE`; it must never stop screen or audio streaming.
 
 ## 4. Adaptation (server-side controller)
 

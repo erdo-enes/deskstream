@@ -29,6 +29,10 @@ DXGI Desktop Duplication (present-driven, GPU texture)     1–3 ms
   → MediaCodec async (KEY_LOW_LATENCY) → SurfaceView       3–8 ms
   → panel scan-out                                          8–16 ms
                                           glass-to-glass ~25–45 ms
+
+WASAPI system-output loopback → shared-mode 48 kHz PCM16
+  → fixed 5 ms UDP blocks → Android low-latency AudioTrack
+  → non-blocking playback (no network jitter queue)        ~20–40 ms
 ```
 
 Rules that keep it low:
@@ -44,7 +48,9 @@ Rules that keep it low:
   D3D11/DXGI/Media Foundation interop. Hot path is allocation-free per frame
   (pooled buffers, GC SustainedLowLatency).
 - `android/` — Kotlin app. UDP receiver + FEC + assembler feed MediaCodec in async
-  mode rendering directly to a SurfaceView. `KEY_LOW_LATENCY` when supported.
+  mode rendering directly to a SurfaceView. `KEY_LOW_LATENCY` when supported. A separate
+  receiver feeds 5 ms PCM blocks to a low-latency `AudioTrack` with local mute. Physical
+  Android gamepads are reduced to newest-state snapshots and forwarded at up to 120 Hz.
 - `docs/PROTOCOL.md` — the wire contract both sides implement. **Normative.**
 
 ## Networking model
@@ -53,8 +59,14 @@ Rules that keep it low:
   multicast is filtered), plus manual IP entry as a never-dead-end fallback.
 - **Control** — TCP port 47801, length-prefixed JSON. Pairing, session start/stop,
   IDR requests, stats, keepalive.
-- **Media** — UDP (server → client, port negotiated over control). 20-byte binary
+- **Video** — UDP (server → client, port negotiated over control). 20-byte binary
   header + H.264 Annex-B payload, per-frame XOR FEC groups.
+- **Audio** — separate negotiated UDP port. Opt-in `AUDIO_START` negotiation, `DSAH`
+  address learning, and 5 ms 48 kHz stereo PCM16 datagrams. It is separate so audio can
+  never block video assembly and old clients remain compatible.
+- **Gamepad** — client→server state snapshots share the video UDP socket after optional
+  control-channel negotiation. Windows exposes up to four Xbox 360 controllers through
+  ViGEmBus; rumble returns over the control channel.
 
 ## Adaptation (bitrate → fps → resolution)
 
@@ -66,14 +78,14 @@ Framerate/resolution steps are v1.1 — the control messages already carry the f
 ## Deliberate non-goals (v1)
 
 No WAN/relay/NAT traversal. No accounts. No virtual/extended display. No multi-client,
-no multi-monitor. No audio (transport carries PTS from day one so Opus audio can slot in
-at v1.1 without redesign). No iOS/desktop clients. No HEVC/AV1 (multiplies encoder quirk
-surface; H.264 has the widest low-latency Android decoder support). No input/remote
-control in v1 (control channel reserves the message type).
+no multi-monitor. No iOS/desktop clients. No HEVC/AV1 (multiplies encoder quirk
+surface; H.264 has the widest low-latency Android decoder support). Physical gamepads are
+supported, but touch-as-mouse and keyboard remote control remain out of scope for this version.
 
 ## v2 upgrade path (documented, not built)
 
 Direct NVENC via P/Invoke (`NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY`, intra-refresh +
 reference-frame invalidation instead of IDR-on-loss) shaves a few ms and improves loss
 recovery; Reed-Solomon FEC replaces XOR parity; TLS on control + AES-GCM on media;
-mDNS advertisement alongside broadcast discovery; QR pairing.
+mDNS advertisement alongside broadcast discovery; QR pairing. Opus can replace PCM audio
+when conserving ~1.5 Mbps matters more than codec-free startup latency.

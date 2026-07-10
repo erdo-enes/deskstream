@@ -9,6 +9,7 @@ public static class Ports
     public const int Discovery = 47800;   // UDP
     public const int Control = 47801;      // TCP
     public const int PreferredMedia = 47802; // UDP (server picks; reported in STREAM_STARTED)
+    public const int PreferredAudio = 47803; // UDP (server picks; reported in AUDIO_STARTED)
 }
 
 /// <summary>Protocol constant.</summary>
@@ -62,6 +63,11 @@ public sealed class StartStreamMessage
     [JsonPropertyName("fps")] public int Fps { get; set; }
 }
 
+public sealed class GamepadStartMessage
+{
+    [JsonPropertyName("controllers")] public int Controllers { get; set; }
+}
+
 public sealed class StatsMessage
 {
     [JsonPropertyName("framesOk")] public int FramesOk { get; set; }
@@ -92,6 +98,34 @@ public static class OutgoingMessages
 
     public static object StreamStarted(int mediaPort, int width, int height, int fps) =>
         new { type = "STREAM_STARTED", mediaPort, width, height, fps, codec = "h264" };
+
+    public static object AudioStarted(int audioPort) =>
+        new
+        {
+            type = "AUDIO_STARTED",
+            audioPort,
+            sampleRate = AudioPacket.SampleRate,
+            channels = AudioPacket.Channels,
+            format = "pcm_s16le",
+            packetSamples = AudioPacket.SamplesPerPacket,
+        };
+
+    public static object AudioUnavailable(string message) =>
+        new { type = "AUDIO_UNAVAILABLE", message };
+
+    public static object GamepadStarted(int controllers) =>
+        new { type = "GAMEPAD_STARTED", controllers, controllerType = "xbox360" };
+
+    public static object GamepadUnavailable(string message) =>
+        new
+        {
+            type = "GAMEPAD_UNAVAILABLE",
+            message,
+            driverUrl = "https://github.com/nefarius/ViGEmBus/releases/latest",
+        };
+
+    public static object GamepadRumble(int controllerId, byte largeMotor, byte smallMotor) =>
+        new { type = "GAMEPAD_RUMBLE", controllerId, largeMotor, smallMotor };
 
     public static object StreamStopped() => new { type = "STREAM_STOPPED" };
 

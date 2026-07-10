@@ -16,9 +16,10 @@ Console.WriteLine("=================");
 Console.WriteLine($"Host: {hostname}");
 Console.WriteLine("Listening on:");
 foreach (var ip in LocalIPv4Addresses())
-    Console.WriteLine($"  {ip}   (discovery UDP {Ports.Discovery}, control TCP {Ports.Control}, media UDP {Ports.PreferredMedia})");
+    Console.WriteLine($"  {ip}   (discovery UDP {Ports.Discovery}, control TCP {Ports.Control}, " +
+                      $"video UDP {Ports.PreferredMedia}, audio UDP {Ports.PreferredAudio})");
 Console.WriteLine();
-Console.WriteLine("Firewall: allow UDP 47800/47802 and TCP 47801 on the Private network profile.");
+Console.WriteLine("Firewall: allow UDP 47800/47802/47803 and TCP 47801 on the Private network profile.");
 Console.WriteLine("Waiting for a client to connect...");
 Console.WriteLine();
 
@@ -40,6 +41,7 @@ Console.CancelKeyPress += (_, e) =>
 // 1 Hz status line while streaming.
 long prevEncoded = 0;
 long prevIdr = 0;
+long prevAudioBytes = 0;
 try
 {
     while (!shutdown.IsCancellationRequested)
@@ -53,17 +55,29 @@ try
             long idr = session.IdrRequestTotal;
             long fps = enc - prevEncoded;
             long idrDelta = idr - prevIdr;
+            long audioBytes = session.AudioBytesSent;
+            long audioKbps = Math.Max(0, (audioBytes - prevAudioBytes) * 8 / 1000);
             prevEncoded = enc;
             prevIdr = idr;
+            prevAudioBytes = audioBytes;
+
+            string audioStatus = session.AudioStreaming
+                ? $"audio {audioKbps,4} kbps"
+                : "audio off";
+            string gamepadStatus = session.GamepadCount > 0
+                ? $"gamepads {session.GamepadCount}"
+                : "gamepads off";
 
             Console.WriteLine(
                 $"[stats] {fps,3} fps encoded | {session.CurrentBitrateKbps,6} kbps | " +
-                $"client dropped {session.LastClientFramesDropped,3} | IDR req/s {idrDelta}");
+                $"client dropped {session.LastClientFramesDropped,3} | IDR req/s {idrDelta} | " +
+                $"{audioStatus} | {gamepadStatus}");
         }
         else
         {
             prevEncoded = 0;
             prevIdr = 0;
+            prevAudioBytes = 0;
         }
     }
 }

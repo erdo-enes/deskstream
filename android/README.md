@@ -18,8 +18,8 @@ it sync. Requirements:
 Command line: `./gradlew assembleDebug` (or `assembleRelease` — the release build type is
 deliberately signed with the debug key so it installs without a keystore).
 
-This project was written without an Android build environment available, so it has **never
-been compiled** — expect the possibility of trivial compile errors on first sync.
+`assembleRelease` is compile-verified with JDK 17 and Android SDK 34. Physical-device audio
+and video latency still needs validation against a Windows host.
 
 ## App flow
 
@@ -32,9 +32,15 @@ been compiled** — expect the possibility of trivial compile errors on first sy
 3. **StreamActivity** (fullscreen, landscape, keep-screen-on) sends `START_STREAM` once the
    surface exists, opens the UDP media socket on `STREAM_STARTED`, hole-punches with `DSMH`
    datagrams until video flows, and feeds reassembled H.264 access units to a MediaCodec
-   async decoder rendering straight to the SurfaceView. Tap toggles a stats overlay
-   (fps / bitrate / drops / loss). Back sends `STOP_STREAM` and exits; backgrounding sends
-   `STOP_STREAM` but keeps the control socket (protocol §5), re-`START_STREAM` on return.
+   async decoder rendering straight to the SurfaceView. It then negotiates system audio on
+   a separate UDP socket, hole-punches with `DSAH`, and writes fixed 5 ms PCM blocks to a
+   low-latency AudioTrack. Tap toggles detailed video/network/audio diagnostics; the audio
+   button locally mutes without stopping reception. Back sends `STOP_STREAM` and exits;
+   backgrounding sends `STOP_STREAM` but keeps the control socket (protocol §5), then sends
+   `START_STREAM` again on return.
+4. A connected Bluetooth/USB gamepad is detected automatically. Buttons, D-pad, sticks,
+   analog triggers, hot-plug events, and up to four controller slots are forwarded to the
+   PC over UDP. The PC exposes Xbox 360 controllers and returns rumble to Android.
 
 ## Code map
 
@@ -54,18 +60,30 @@ app/src/main/java/com/deskstream/client/
   video/VideoDecoder.kt   MediaCodec video/avc async mode → Surface, KEY_LOW_LATENCY when
                           supported, immediate render, tiny bounded input queue with
                           drop + REQUEST_IDR + discard-until-keyframe on overflow/error
+  audio/AudioReceiver.kt  DSAH audio UDP receiver, sequence-gap handling, immediate
+                          non-blocking AudioTrack playback, local mute + audio stats
+  input/GamepadForwarder.kt
+                          physical controller detection/mapping, 120 Hz newest-state sender,
+                          hot-plug neutralization and rumble
   proto/Messages.kt       control JSON models (org.json)
   proto/MediaPacket.kt    media header parser
+  proto/AudioPacket.kt    allocation-free reusable audio-header parser
   data/Prefs.kt           clientId (UUID, generated once) + paired server {ip, token, name}
 ```
 
 ## Notes / first-run checklist
 
 - The server must be running and reachable on UDP 47800 (discovery) and TCP 47801 (control);
-  the media UDP port is negotiated and reported in `STREAM_STARTED`.
+  the video and audio UDP ports are negotiated and reported in `STREAM_STARTED` and
+  `AUDIO_STARTED` (preferred ports 47802 and 47803).
 - If discovery finds nothing (some APs filter broadcast even with the multicast lock), use
   manual IP entry — it is always shown.
 - Decoder latency knobs applied: async mode, `KEY_LOW_LATENCY` (API 30+ where supported),
   `KEY_PRIORITY=0`, `KEY_OPERATING_RATE=240`, render-on-arrival (never paced by PTS).
 - Pairing tokens are stored per server IP in SharedPreferences; a `PAIR_REQUIRED` in response
   to a non-empty token clears it and re-pairs automatically.
+- Audio is optional and backward-compatible. If an older server ignores `AUDIO_START`, the
+  stream screen reports that no audio reply arrived while video continues normally.
+- Gamepad forwarding is also optional and requires ViGEmBus 1.22 on Windows. Connect the
+  controller to Android before or during a stream; the bottom status chip reports detection,
+  PC negotiation, driver errors, and live forwarding.

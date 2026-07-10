@@ -13,9 +13,10 @@ Miracast, and Chromecast, and designing those failure modes out. See
 
 - `server/` — Windows server, C#/.NET 8. DXGI Desktop Duplication → GPU NV12 convert
   → Media Foundation hardware H.264 (NVENC/AMF/QuickSync, low-latency CBR) → UDP with
-  XOR FEC.
+  XOR FEC, plus WASAPI system-audio loopback on an independent low-latency UDP channel.
 - `android/` — Android client (Kotlin, minSdk 26). UDP receive + FEC → MediaCodec
-  async low-latency decode → SurfaceView. No jitter buffer.
+  async low-latency decode → SurfaceView; PCM audio → low-latency AudioTrack. No network
+  jitter buffer. Bluetooth/USB gamepads forward as virtual Xbox 360 controllers on the PC.
 - `docs/` — architecture and normative protocol spec.
 
 ## Quick start
@@ -23,7 +24,10 @@ Miracast, and Chromecast, and designing those failure modes out. See
 **PC (Windows 10/11, a GPU with an H.264 hardware encoder):**
 1. Install the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 2. `cd server && dotnet run -c Release`
-3. Allow the firewall prompt (or pre-allow TCP 47801, UDP 47800/47802 on private networks).
+3. Allow the firewall prompt (or pre-allow TCP 47801, UDP 47800/47802/47803 on private networks).
+4. Optional for gamepad forwarding: install the official
+   [ViGEmBus 1.22 driver](https://github.com/nefarius/ViGEmBus/releases/latest), then restart
+   DeskStream. Video and audio work without it.
 
 **Android (8.0+):**
 1. Open `android/` in Android Studio, run on your device.
@@ -39,4 +43,8 @@ Miracast, and Chromecast, and designing those failure modes out. See
   retransmission, stale frames dropped rather than queued.
 - Android decodes straight to the screen surface in async low-latency mode; frames
   render the moment they decode — there is no buffer anywhere that can grow.
+- PC system audio uses fixed 5 ms PCM blocks and non-blocking Android playback. Audio is
+  negotiated separately, so it can fail or be muted without interrupting video.
+- Physical Android controllers forward complete state snapshots at up to 120 Hz over UDP,
+  appear to Windows games as Xbox 360 controllers, and receive rumble feedback.
 - Closed-loop bitrate adaptation so WiFi congestion degrades quality, not latency.
