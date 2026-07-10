@@ -67,6 +67,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var audioMuted = false
     private var audioNegotiationJob: Job? = null
     private var inputNegotiationJob: Job? = null
+    private var stallRecoveryInProgress = false
     private var audioStatus = "starting"
     private var audioDetail = "Waiting for the server"
     private var lastVideoStats: StreamStats? = null
@@ -262,7 +263,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             is ServerMessage.InputUnavailable -> onInputUnavailable(msg.message)
             ServerMessage.StreamStopped -> {
                 stopReceivers()
-                showCenterStatus("Stream stopped")
+                if (!stallRecoveryInProgress) showCenterStatus("Stream stopped")
             }
             is ServerMessage.Bitrate -> {
                 negotiatedBitrateKbps = msg.kbps
@@ -286,6 +287,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun onStreamStarted(msg: ServerMessage.StreamStarted) {
+        stallRecoveryInProgress = false
         binding.tvConnecting.visibility = View.GONE
         lastStreamWidth = msg.width
         lastStreamHeight = msg.height
@@ -409,7 +411,10 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun restartStalledStream() {
-        if (!surfaceReady || ControlClient.state.value != ControlClient.State.STREAMING) return
+        if (stallRecoveryInProgress || !surfaceReady ||
+            ControlClient.state.value != ControlClient.State.STREAMING
+        ) return
+        stallRecoveryInProgress = true
         showCenterStatus("Video stalled\nRecovering stream…")
         remoteMouse.setEnabled(false)
         streamRequested = false
@@ -644,15 +649,22 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun createWifiLock() {
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } else {
-            @Suppress("DEPRECATION")
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF
-        }
-        wifiLock = wifi.createWifiLock(mode, "DeskStream:low-latency").apply {
-            setReferenceCounted(false)
+        // This is only a latency optimization. Some Android TV and OEM Wi-Fi services reject
+        // low-latency locks, so failure must never take down the streaming Activity.
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                ?: return
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wifi.createWifiLock(mode, "DeskStream:low-latency").apply {
+                setReferenceCounted(false)
+            }
+        } catch (_: Exception) {
+            wifiLock = null
         }
     }
 

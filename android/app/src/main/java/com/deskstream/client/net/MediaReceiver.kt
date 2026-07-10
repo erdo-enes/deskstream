@@ -98,7 +98,10 @@ class MediaReceiver(
     private var streamClockBaseUs: Long = 0
     private var lastPtsRawMs = -1L
     private var ptsEpochMs = 0L
+    /** Any packet, including DSHB, proves the UDP mapping/server socket is still alive. */
     @Volatile private var lastPacketAt = 0L
+    /** Valid media only; used to request an IDR without restarting a genuinely static desktop. */
+    @Volatile private var lastVideoPacketAt = 0L
     private val captureLatency = LatencyWindow()
     private val decoderLatency = LatencyWindow()
     private val encoderLatency = LatencyWindow()
@@ -110,7 +113,9 @@ class MediaReceiver(
         lastPtsRawMs = -1L
         ptsEpochMs = 0L
         running = true
-        lastPacketAt = SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
+        lastPacketAt = now
+        lastVideoPacketAt = now
 
         val sock = try {
             DatagramSocket(null).apply {
@@ -264,6 +269,9 @@ class MediaReceiver(
 
             val header = MediaPacketHeader.parse(buf, length) ?: continue
             if (header.version != 1) continue
+            // Only valid video proves the encode/media path is alive. Heartbeats and cursor
+            // feedback must not mask a frozen picture from the stall watchdog.
+            lastVideoPacketAt = SystemClock.elapsedRealtime()
 
             frameAssembler.onPacket(header, buf, MediaPacketHeader.HEADER_SIZE)
         }
@@ -312,15 +320,20 @@ class MediaReceiver(
         var stallReported = false
         while (currentCoroutineContext().isActive) {
             delay(500)
-            val silenceMs = SystemClock.elapsedRealtime() - lastPacketAt
-            if (silenceMs >= VIDEO_REPUNCH_MS) {
+            val now = SystemClock.elapsedRealtime()
+            val videoSilenceMs = now - lastVideoPacketAt
+            if (videoSilenceMs >= VIDEO_REPUNCH_MS) {
                 sendHolePunch(sock, serverAddress)
                 ControlClient.requestIdr()
             }
-            if (silenceMs >= VIDEO_STALL_MS && !stallReported) {
+            // DSHB is deliberately sent when the desktop is static. It should keep a still
+            // image stable rather than causing an endless stop/start loop, but it must not
+            // prevent an IDR request when fresh video ought to be arriving.
+            val transportSilenceMs = now - lastPacketAt
+            if (transportSilenceMs >= VIDEO_STALL_MS && !stallReported) {
                 stallReported = true
                 onStalled()
-            } else if (silenceMs < VIDEO_REPUNCH_MS) {
+            } else if (transportSilenceMs < VIDEO_REPUNCH_MS) {
                 stallReported = false
             }
         }
@@ -346,7 +359,9 @@ class MediaReceiver(
         private const val TAG = "MediaReceiver"
         private const val HOLE_PUNCH_MESSAGE = "DSMH"
         private const val RECV_PACKET_BUFFER_BYTES = 1500
-        private const val RECV_SOCKET_BUFFER_BYTES = 256 * 1024 // bounded stale-data exposure
+        // IDR access units arrive as a burst. 256 KiB caused a loss -> IDR -> larger burst
+        // feedback loop on real Wi-Fi devices.
+        private const val RECV_SOCKET_BUFFER_BYTES = 1024 * 1024
         private const val SOCKET_TIMEOUT_MS = 1000
         private const val VIDEO_REPUNCH_MS = 1500L
         private const val VIDEO_STALL_MS = 4000L
@@ -377,7 +392,9 @@ private class LatencyWindow {
 // =========================================================================================
 
 private const val PACKET_PAYLOAD_MAX = 1200
-private const val MAX_INFLIGHT_FRAMES = 2
+// Tolerates Wi-Fi packet reordering without adding a render queue: completed frames still
+// go directly to the separately bounded decoder input queue.
+private const val MAX_INFLIGHT_FRAMES = 4
 /** Sanity ceiling on packetCount to refuse to allocate absurd buffers for a corrupt header. */
 private const val MAX_REASONABLE_PACKET_COUNT = 4096
 

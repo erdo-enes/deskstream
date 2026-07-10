@@ -32,7 +32,6 @@ public sealed class MediaSender : IDisposable
     /// <summary>Validated gamepad snapshots from the currently learned media endpoint.</summary>
     public Action<GamepadState>? OnGamepadState { get; set; }
     public Action<MouseMotion>? OnMouseMotion { get; set; }
-    public Action? OnSendCongested { get; set; }
 
     public int Port { get; }
     public bool HasClient => _clientEndpoint != null;
@@ -43,7 +42,7 @@ public sealed class MediaSender : IDisposable
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
         // Keep the OS send buffer small: dropping beats queuing for latency (PROTOCOL.md §3.3).
-        try { _socket.SendBufferSize = 128 * 1024; } catch { }
+        try { _socket.SendBufferSize = 256 * 1024; } catch { }
 
         // DSCP AF41 / TOS 0x88, best-effort (PROTOCOL.md §3.3). IP_TOS = 3; Windows usually
         // ignores this without qWAVE, hence best-effort. May throw without privilege.
@@ -61,9 +60,9 @@ public sealed class MediaSender : IDisposable
             _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
             Port = ((IPEndPoint)_socket.LocalEndPoint!).Port;
         }
-        // A slow Wi-Fi driver must drop a frame, never block the encoder callback and grow
-        // latency behind the kernel send queue.
-        try { _socket.Blocking = false; } catch { }
+        // Keep the default blocking mode. Non-blocking Windows UDP commonly returns
+        // WSAEWOULDBLOCK during IDR bursts; abandoning the remainder then guarantees an
+        // incomplete frame. The bounded kernel buffer still limits queue growth.
     }
 
     /// <summary>Starts the background loop that learns the client's media address from DSMH packets.</summary>
@@ -161,11 +160,7 @@ public sealed class MediaSender : IDisposable
                 (ushort)i, (ushort)packetCount, (ushort)fecCount, ptsMs, pipelineDelayMs);
 
             Buffer.BlockCopy(au, offset, _sendBuffer, MediaPacket.HeaderSize, payloadLen);
-            if (!SendDatagram(client, MediaPacket.HeaderSize + payloadLen))
-            {
-                OnSendCongested?.Invoke();
-                return;
-            }
+            SendDatagram(client, MediaPacket.HeaderSize + payloadLen);
         }
 
         // ---- FEC packets: one XOR parity per group of up to 8 data packets ----
@@ -195,8 +190,7 @@ public sealed class MediaSender : IDisposable
                 (ushort)g, (ushort)packetCount, (ushort)fecCount, ptsMs, pipelineDelayMs);
 
             Buffer.BlockCopy(_fecBuffer, 0, _sendBuffer, MediaPacket.HeaderSize, maxLen);
-            if (!SendDatagram(client, MediaPacket.HeaderSize + maxLen))
-                return; // all data is sent; missing optional parity does not corrupt the frame
+            SendDatagram(client, MediaPacket.HeaderSize + maxLen);
         }
     }
 
@@ -211,15 +205,14 @@ public sealed class MediaSender : IDisposable
         catch (ObjectDisposedException) { }
     }
 
-    private bool SendDatagram(EndPoint client, int totalLen)
+    private void SendDatagram(EndPoint client, int totalLen)
     {
         try
         {
             _socket.SendTo(_sendBuffer, 0, totalLen, SocketFlags.None, client);
-            return true;
         }
-        catch (SocketException) { return false; }
-        catch (ObjectDisposedException) { return false; }
+        catch (SocketException) { }
+        catch (ObjectDisposedException) { }
     }
 
     public void Dispose()

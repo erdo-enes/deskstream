@@ -394,7 +394,6 @@ public sealed class StreamSession : IDisposable
         _sender = new MediaSender(Ports.PreferredMedia, _clientAddress);
         _sender.OnGamepadState = OnGamepadState;
         _sender.OnMouseMotion = OnMouseMotion;
-        _sender.OnSendCongested = OnMediaSendCongested;
         _sender.Start();
 
         _duplicator = new DesktopDuplicator();
@@ -515,11 +514,6 @@ public sealed class StreamSession : IDisposable
         }
     }
 
-    private void OnMediaSendCongested()
-    {
-        _encoder?.RequestIdr();
-    }
-
     private void StopPipeline()
     {
         _streaming = false;
@@ -537,7 +531,6 @@ public sealed class StreamSession : IDisposable
         {
             _sender.OnGamepadState = null;
             _sender.OnMouseMotion = null;
-            _sender.OnSendCongested = null;
         }
         try { _sender?.Dispose(); } catch { }
         _encoder = null; _converter = null; _duplicator = null; _sender = null;
