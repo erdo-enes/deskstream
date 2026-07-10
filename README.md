@@ -12,11 +12,12 @@ Miracast, and Chromecast, and designing those failure modes out. See
 ## Layout
 
 - `server/` — Windows server, C#/.NET 8. DXGI Desktop Duplication → GPU NV12 convert
-  → Media Foundation hardware H.264 (NVENC/AMF/QuickSync, low-latency CBR) → UDP with
-  XOR FEC, plus WASAPI system-audio loopback on an independent low-latency UDP channel.
+  → native NVIDIA NVENC ultra-low-latency H.264, with Media Foundation hardware H.264
+  fallback for NVIDIA/AMD/Intel → UDP with XOR FEC, plus WASAPI system-audio loopback.
 - `android/` — Android client (Kotlin, minSdk 26). UDP receive + FEC → MediaCodec
   async low-latency decode → SurfaceView; PCM audio → low-latency AudioTrack. No network
-  jitter buffer. Bluetooth/USB gamepads forward as virtual Xbox 360 controllers on the PC.
+  jitter buffer. Touch controls the PC mouse, while Bluetooth/USB gamepads forward as
+  virtual Xbox 360 controllers on the PC.
 - `docs/` — architecture and normative protocol spec.
 
 ## Quick start
@@ -39,6 +40,8 @@ Miracast, and Chromecast, and designing those failure modes out. See
 
 - Present-driven GPU capture; the frame never touches the CPU before the encoder.
 - Hardware H.264 tuned for latency: CBR, no B-frames, ~1-frame VBV, IDR only on demand.
+- NVIDIA hosts use the native NVENC ultra-low-latency preset; other supported GPUs and
+  incompatible NVIDIA drivers automatically fall back to Media Foundation hardware encode.
 - Custom UDP transport: ≤1200-byte packets, forward error correction instead of
   retransmission, stale frames dropped rather than queued.
 - Android decodes straight to the screen surface in async low-latency mode; frames
@@ -47,4 +50,8 @@ Miracast, and Chromecast, and designing those failure modes out. See
   negotiated separately, so it can fail or be muted without interrupting video.
 - Physical Android controllers forward complete state snapshots at up to 120 Hz over UDP,
   appear to Windows games as Xbox 360 controllers, and receive rumble feedback.
+- Android touch offers touchpad and direct-pointer modes. Motion/scroll use newest-wins UDP;
+  ordered mouse buttons use the authenticated TCP control channel and are released on stop.
+- Clock-synchronized p95 pipeline telemetry, a media heartbeat, UDP re-punching, bounded
+  pools/queues, and automatic stream restart keep long sessions from accumulating delay.
 - Closed-loop bitrate adaptation so WiFi congestion degrades quality, not latency.

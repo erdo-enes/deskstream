@@ -19,7 +19,7 @@ namespace DeskStreamer.Server.Encode;
 ///  * SPS/PPS: we cache the parameter sets seen on the first IDR and prepend them to any IDR
 ///    access unit that lacks in-band SPS, guaranteeing every keyframe is self-contained.
 /// </summary>
-public sealed class H264Encoder : IDisposable
+public sealed class H264Encoder : IVideoEncoder
 {
     private static readonly Guid Iid_ID3D11Texture2D = typeof(ID3D11Texture2D).GUID;
 
@@ -51,7 +51,8 @@ public sealed class H264Encoder : IDisposable
     private bool _loggedProcessOutputError;
 
     /// <summary>Called on the encoder event thread with a reused buffer. Consume synchronously.</summary>
-    public Action<byte[], int, bool, uint>? OnEncodedFrame;
+    public Action<byte[], int, bool, uint>? OnEncodedFrame { get; set; }
+    public string BackendName => "media-foundation";
 
     public H264Encoder(ID3D11Device device, int width, int height, int fps, int initialBitrateKbps)
     {
@@ -184,6 +185,12 @@ public sealed class H264Encoder : IDisposable
         TrySetCodecBool(MfGuids.CODECAPI_AVLowLatencyMode, true);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonRateControlMode, MfGuids.RateControlMode_CBR);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonMeanBitRate, (uint)(bitrateKbps * 1000));
+        // H.264 expresses HRD/VBV size in bytes. One frame prevents the rate controller from
+        // hiding a deep leaky-bucket queue while still allowing normal frame-size variation.
+        TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonBufferSize,
+            (uint)Math.Max(4096, bitrateKbps * 1000L / 8 / _fps));
+        // 33 is the fastest edge of Microsoft's documented low-complexity range (0..33).
+        TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonQualityVsSpeed, 33);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncMPVGOPSize, 0xFFFF);
 
@@ -218,8 +225,12 @@ public sealed class H264Encoder : IDisposable
     public void RequestIdr() => TrySetCodecU32(MfGuids.CODECAPI_AVEncVideoForceKeyFrame, 1);
 
     /// <summary>Adjusts the CBR target mid-stream (adaptation controller, PROTOCOL.md §4).</summary>
-    public void SetBitrate(int kbps) =>
+    public void SetBitrate(int kbps)
+    {
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonMeanBitRate, (uint)(kbps * 1000));
+        TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonBufferSize,
+            (uint)Math.Max(4096, kbps * 1000L / 8 / _fps));
+    }
 
     private void TrySetCodecU32(Guid key, uint value)
     {

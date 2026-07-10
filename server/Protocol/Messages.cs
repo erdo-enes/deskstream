@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Diagnostics;
 
 namespace DeskStreamer.Server.Protocol;
 
@@ -17,6 +18,25 @@ public static class ProtocolConstants
 {
     public const int Version = 1;
     public const int MaxControlFrame = 65536;
+}
+
+public static class MonotonicClock
+{
+    private static readonly long Origin = Stopwatch.GetTimestamp();
+    public static long NowUs
+    {
+        get
+        {
+            // Split quotient/remainder before scaling. Multiplying the full tick count by
+            // 1,000,000 can overflow in days on a 10 MHz Stopwatch -- exactly the kind of
+            // long-session failure this shared clock exists to avoid.
+            long ticks = Stopwatch.GetTimestamp() - Origin;
+            long seconds = ticks / Stopwatch.Frequency;
+            long remainder = ticks % Stopwatch.Frequency;
+            return seconds * 1_000_000 + remainder * 1_000_000 / Stopwatch.Frequency;
+        }
+    }
+    public static long NowMs => NowUs / 1000;
 }
 
 /// <summary>
@@ -74,6 +94,20 @@ public sealed class StatsMessage
     [JsonPropertyName("framesDropped")] public int FramesDropped { get; set; }
     [JsonPropertyName("bytes")] public long Bytes { get; set; }
     [JsonPropertyName("intervalMs")] public int IntervalMs { get; set; }
+    [JsonPropertyName("captureToReceiveP95Ms")] public int CaptureToReceiveP95Ms { get; set; } = -1;
+    [JsonPropertyName("decodeToSurfaceP95Ms")] public int DecodeToSurfaceP95Ms { get; set; } = -1;
+}
+
+public sealed class InputStartMessage
+{
+    [JsonPropertyName("mouse")] public bool Mouse { get; set; }
+}
+
+public sealed class MouseButtonMessage
+{
+    [JsonPropertyName("sequence")] public uint Sequence { get; set; }
+    [JsonPropertyName("button")] public string Button { get; set; } = "";
+    [JsonPropertyName("down")] public bool Down { get; set; }
 }
 
 /// <summary>
@@ -96,8 +130,9 @@ public static class OutgoingMessages
 
     public static object Error(string code, string message) => new { type = "ERROR", code, message };
 
-    public static object StreamStarted(int mediaPort, int width, int height, int fps) =>
-        new { type = "STREAM_STARTED", mediaPort, width, height, fps, codec = "h264" };
+    public static object StreamStarted(
+        int mediaPort, int width, int height, int fps, string encoderBackend, long clockBaseUs) =>
+        new { type = "STREAM_STARTED", mediaPort, width, height, fps, codec = "h264", encoderBackend, clockBaseUs };
 
     public static object AudioStarted(int audioPort) =>
         new
@@ -127,9 +162,15 @@ public static class OutgoingMessages
     public static object GamepadRumble(int controllerId, byte largeMotor, byte smallMotor) =>
         new { type = "GAMEPAD_RUMBLE", controllerId, largeMotor, smallMotor };
 
+    public static object InputStarted() => new { type = "INPUT_STARTED", mouse = true };
+
+    public static object InputUnavailable(string message) =>
+        new { type = "INPUT_UNAVAILABLE", message };
+
     public static object StreamStopped() => new { type = "STREAM_STOPPED" };
 
     public static object Bitrate(int kbps) => new { type = "BITRATE", kbps };
 
-    public static object Pong() => new { type = "PONG" };
+    public static object Pong(long? t0Us = null, long? t1Us = null, long? t2Us = null) =>
+        new { type = "PONG", t0Us, t1Us, t2Us };
 }

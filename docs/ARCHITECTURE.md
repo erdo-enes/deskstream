@@ -11,7 +11,7 @@ modes of Sunshine/Moonlight, Parsec, spacedesk, Steam Link, Miracast, and Chrome
 | Parsec needs an account + cloud even on LAN | **Zero cloud, zero account, fully offline.** LAN only. |
 | Sunshine/Moonlight pairing hell (PIN desync, cert files) | **TOFU pairing**: server displays a 6-digit PIN once, client enters it, keys pinned. Auto-connect afterwards. |
 | spacedesk resolution/ghost-display bugs | **Mirror the primary display only.** No virtual display driver, ever (v1). |
-| NVIDIA-only encoder coupling (GameStream/Sunshine quirks) | **Media Foundation hardware encoder** — one API fronting NVENC/AMF/QuickSync, with clear error if none found. |
+| NVIDIA-only encoder coupling (GameStream/Sunshine quirks) | **NVIDIA-first, vendor-neutral fallback** — direct NVENC for its best latency controls, Media Foundation hardware encode for NVENC/AMF/QuickSync. |
 | Steam Link/Miracast stutter-then-collapse | **Closed-loop adaptation**: client stats drive a bitrate-first ladder; frames are dropped, never queued. |
 | Sessions die on sleep/background | **Session tokens independent of sockets** + reconnect state machine. |
 
@@ -20,9 +20,9 @@ modes of Sunshine/Moonlight, Parsec, spacedesk, Steam Link, Miracast, and Chrome
 ```
 DXGI Desktop Duplication (present-driven, GPU texture)     1–3 ms
   → GPU BGRA→NV12 convert (D3D11 video processor)
-  → MF hardware H.264 encoder (CBR, no B-frames,           3–8 ms
-    CODECAPI_AVLowLatencyMode, GOP = infinite-ish,
-    IDR on demand, VBV ≈ 1 frame)
+  → native NVENC ULL or MF hardware H.264 fallback         3–8 ms
+    (CBR, no B-frames/lookahead, IDR on demand,
+    zero reorder delay, VBV ≈ 1 frame)
   → Packetize ≤1200 B + XOR FEC → UDP                      <1 ms
   → WiFi (5 GHz)                                            1–5 ms
   → Kotlin UDP receive + FEC recover + frame assemble      1–2 ms
@@ -36,7 +36,8 @@ WASAPI system-output loopback → shared-mode 48 kHz PCM16
 ```
 
 Rules that keep it low:
-- **Every stage holds at most one frame.** Encoder busy → skip the stale capture.
+- **Every stage is tightly bounded.** At most one decoder frame is submitted and one is
+  pending; media assembly holds at most two frames so limited UDP reordering can heal.
 - **No jitter buffer on the client.** Render as decoded; PTS is for stats only.
 - **Never retransmit video.** FEC recovers isolated loss; unrecoverable frame → drop it
   and send `REQUEST_IDR` on the control channel.
@@ -51,6 +52,7 @@ Rules that keep it low:
   mode rendering directly to a SurfaceView. `KEY_LOW_LATENCY` when supported. A separate
   receiver feeds 5 ms PCM blocks to a low-latency `AudioTrack` with local mute. Physical
   Android gamepads are reduced to newest-state snapshots and forwarded at up to 120 Hz.
+  Touch becomes either relative touchpad motion or direct absolute primary-display motion.
 - `docs/PROTOCOL.md` — the wire contract both sides implement. **Normative.**
 
 ## Networking model
@@ -67,11 +69,15 @@ Rules that keep it low:
 - **Gamepad** — client→server state snapshots share the video UDP socket after optional
   control-channel negotiation. Windows exposes up to four Xbox 360 controllers through
   ViGEmBus; rumble returns over the control channel.
+- **Mouse** — newest-wins motion/scroll datagrams share the authenticated media endpoint;
+  ordered button transitions stay on TCP. Windows `SendInput` injects into the interactive
+  desktop and every stop/reset path releases held buttons.
 
 ## Adaptation (bitrate → fps → resolution)
 
-Client reports stats every second (received/dropped frames, bytes, IDR requests).
-Server controller: on loss/IDR-request pressure, cut bitrate 30% immediately (floor
+Client reports stats every second (received/dropped frames, bytes, IDR requests, and
+clock-synchronized capture→receive plus decode→surface p95 latency). Server controller:
+on loss, rising latency, or IDR-request pressure, cut bitrate 30% immediately (floor
 2 Mbps); on 5 s of clean stats, ramp up 10% (slow-start, ceiling = configured max).
 Framerate/resolution steps are v1.1 — the control messages already carry the fields.
 
@@ -79,13 +85,12 @@ Framerate/resolution steps are v1.1 — the control messages already carry the f
 
 No WAN/relay/NAT traversal. No accounts. No virtual/extended display. No multi-client,
 no multi-monitor. No iOS/desktop clients. No HEVC/AV1 (multiplies encoder quirk
-surface; H.264 has the widest low-latency Android decoder support). Physical gamepads are
-supported, but touch-as-mouse and keyboard remote control remain out of scope for this version.
+surface; H.264 has the widest low-latency Android decoder support). Physical gamepads and
+touch-as-mouse are supported; keyboard forwarding remains out of scope for this version.
 
 ## v2 upgrade path (documented, not built)
 
-Direct NVENC via P/Invoke (`NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY`, intra-refresh +
-reference-frame invalidation instead of IDR-on-loss) shaves a few ms and improves loss
-recovery; Reed-Solomon FEC replaces XOR parity; TLS on control + AES-GCM on media;
+Reference-frame invalidation/intra-refresh can replace some IDR-on-loss recovery; Reed-Solomon
+FEC replaces XOR parity; TLS on control + AES-GCM on media;
 mDNS advertisement alongside broadcast discovery; QR pairing. Opus can replace PCM audio
 when conserving ~1.5 Mbps matters more than codec-free startup latency.

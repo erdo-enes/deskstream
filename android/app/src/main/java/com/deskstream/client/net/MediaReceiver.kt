@@ -4,6 +4,9 @@ import android.os.SystemClock
 import android.util.Log
 import com.deskstream.client.proto.MediaPacketHeader
 import com.deskstream.client.proto.GamepadPacket
+import com.deskstream.client.proto.MousePacket
+import com.deskstream.client.proto.CursorPacket
+import com.deskstream.client.proto.CursorPosition
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -32,17 +35,33 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * One-shot: call [start] once, [stop] once. Create a new instance for a new stream.
  */
-data class StreamStats(val fps: Int, val kbps: Int, val framesDropped: Int, val lossPercent: Float)
+data class StreamStats(
+    val fps: Int,
+    val kbps: Int,
+    val framesDropped: Int,
+    val lossPercent: Float,
+    val serverPipelineP95Ms: Int,
+    val captureToReceiveP95Ms: Int,
+    val decodeToSurfaceP95Ms: Int
+)
 
 class MediaReceiver(
     /** Invoked (on the receive thread) with a complete, ordered, decodable access unit.
      * The callee takes ownership of [data] and MUST eventually pass it back via
      * [BufferPool.release] on [bufferPool] once done with it (VideoDecoder does this right
      * after copying into a MediaCodec input buffer). */
-    private val onFrame: (data: ByteArray, length: Int, keyframe: Boolean, frameId: Long) -> Unit,
+    private val onFrame: (
+        data: ByteArray,
+        length: Int,
+        keyframe: Boolean,
+        frameId: Long,
+        captureToReceiveMs: Int
+    ) -> Unit,
     /** Optional: mirrors each 1 s STATS flush for a local UI overlay. Called off the main
      * thread -- the caller must post to the UI thread itself. */
-    private val onStats: (StreamStats) -> Unit = {}
+    private val onStats: (StreamStats) -> Unit = {},
+    private val onStalled: () -> Unit = {},
+    private val onCursorPosition: (CursorPosition) -> Unit = {}
 ) {
     val bufferPool = BufferPool()
 
@@ -52,9 +71,12 @@ class MediaReceiver(
 
     private val frameAssembler = FrameAssembler(
         bufferPool = bufferPool,
-        onFrameComplete = { buf, len, keyframe, frameId ->
+        onFrameComplete = { buf, len, keyframe, frameId, ptsMs, pipelineDelayMs ->
             framesOk.incrementAndGet()
-            onFrame(buf, len, keyframe, frameId)
+            val latencyMs = captureToReceiveLatencyMs(ptsMs)
+            if (latencyMs >= 0) captureLatency.add(latencyMs)
+            encoderLatency.add(pipelineDelayMs)
+            onFrame(buf, len, keyframe, frameId, latencyMs)
         },
         onFrameDropped = {
             framesDropped.incrementAndGet()
@@ -64,18 +86,31 @@ class MediaReceiver(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var statsJob: Job? = null
+    private var watchdogJob: Job? = null
     private var socket: DatagramSocket? = null
     private var thread: Thread? = null
     private val gamepadSendGate = Any()
     private var gamepadDatagram: DatagramPacket? = null
+    private var mouseDatagram: DatagramPacket? = null
     @Volatile private var running = false
     private var serverIp: String = ""
     private var mediaPort: Int = 0
+    private var streamClockBaseUs: Long = 0
+    private var lastPtsRawMs = -1L
+    private var ptsEpochMs = 0L
+    @Volatile private var lastPacketAt = 0L
+    private val captureLatency = LatencyWindow()
+    private val decoderLatency = LatencyWindow()
+    private val encoderLatency = LatencyWindow()
 
-    fun start(serverIp: String, mediaPort: Int) {
+    fun start(serverIp: String, mediaPort: Int, streamClockBaseUs: Long) {
         this.serverIp = serverIp
         this.mediaPort = mediaPort
+        this.streamClockBaseUs = streamClockBaseUs
+        lastPtsRawMs = -1L
+        ptsEpochMs = 0L
         running = true
+        lastPacketAt = SystemClock.elapsedRealtime()
 
         val sock = try {
             DatagramSocket(null).apply {
@@ -104,19 +139,37 @@ class MediaReceiver(
             running = false
             return
         }
+        // Filter inbound datagrams in the kernel to the negotiated server endpoint. This also
+        // prevents unrelated LAN UDP traffic from falsely satisfying the stall watchdog.
+        try {
+            sock.connect(address, mediaPort)
+        } catch (e: IOException) {
+            Log.e(TAG, "failed to connect media socket", e)
+            sock.close()
+            socket = null
+            running = false
+            return
+        }
         gamepadDatagram = DatagramPacket(ByteArray(GamepadPacket.SIZE), GamepadPacket.SIZE, address, mediaPort)
+        mouseDatagram = DatagramPacket(ByteArray(MousePacket.SIZE), MousePacket.SIZE, address, mediaPort)
 
         thread = Thread({ receiveLoop(sock, address) }, "MediaReceiver").apply { start() }
         statsJob = scope.launch { statsLoop() }
+        watchdogJob = scope.launch { watchdogLoop(sock, address) }
     }
 
     fun stop() {
         running = false
         statsJob?.cancel()
         statsJob = null
+        watchdogJob?.cancel()
+        watchdogJob = null
         socket?.close() // unblocks the blocking receive() in the worker thread
         socket = null
-        synchronized(gamepadSendGate) { gamepadDatagram = null }
+        synchronized(gamepadSendGate) {
+            gamepadDatagram = null
+            mouseDatagram = null
+        }
         thread?.let { t ->
             try {
                 t.join(500)
@@ -153,6 +206,24 @@ class MediaReceiver(
         }
     }
 
+    fun sendMousePacket(data: ByteArray) {
+        if (!running || data.size != MousePacket.SIZE) return
+        synchronized(gamepadSendGate) {
+            val sock = socket ?: return
+            val packet = mouseDatagram ?: return
+            try {
+                packet.setData(data, 0, data.size)
+                sock.send(packet)
+            } catch (e: IOException) {
+                if (running) Log.w(TAG, "mouse packet send failed", e)
+            }
+        }
+    }
+
+    fun recordDecoderSurfaceLatency(latencyMs: Int) {
+        if (latencyMs >= 0) decoderLatency.add(latencyMs)
+    }
+
     private fun receiveLoop(sock: DatagramSocket, serverAddress: InetAddress) {
         val buf = ByteArray(RECV_PACKET_BUFFER_BYTES)
         val packet = DatagramPacket(buf, buf.size)
@@ -182,7 +253,14 @@ class MediaReceiver(
             }
 
             val length = packet.length
+            lastPacketAt = SystemClock.elapsedRealtime()
             bytesReceived.addAndGet(length.toLong())
+
+            val cursor = CursorPacket.parse(buf, length)
+            if (cursor != null) {
+                onCursorPosition(cursor)
+                continue
+            }
 
             val header = MediaPacketHeader.parse(buf, length) ?: continue
             if (header.version != 1) continue
@@ -210,21 +288,87 @@ class MediaReceiver(
             val ok = framesOk.getAndSet(0)
             val dropped = framesDropped.getAndSet(0)
             val bytes = bytesReceived.getAndSet(0)
-            ControlClient.sendStats(ok, dropped, bytes, intervalMs)
+            val captureP95 = captureLatency.drainP95()
+            val decoderP95 = decoderLatency.drainP95()
+            val encoderP95 = encoderLatency.drainP95()
+            ControlClient.sendStats(ok, dropped, bytes, intervalMs, captureP95, decoderP95)
 
             val total = ok + dropped
             val lossPercent = if (total > 0) dropped * 100f / total else 0f
             val kbps = if (intervalMs > 0) (bytes * 8 / intervalMs).toInt() else 0
-            onStats(StreamStats(fps = ok, kbps = kbps, framesDropped = dropped, lossPercent = lossPercent))
+            onStats(StreamStats(
+                fps = ok,
+                kbps = kbps,
+                framesDropped = dropped,
+                lossPercent = lossPercent,
+                serverPipelineP95Ms = encoderP95,
+                captureToReceiveP95Ms = captureP95,
+                decodeToSurfaceP95Ms = decoderP95
+            ))
         }
+    }
+
+    private suspend fun watchdogLoop(sock: DatagramSocket, serverAddress: InetAddress) {
+        var stallReported = false
+        while (currentCoroutineContext().isActive) {
+            delay(500)
+            val silenceMs = SystemClock.elapsedRealtime() - lastPacketAt
+            if (silenceMs >= VIDEO_REPUNCH_MS) {
+                sendHolePunch(sock, serverAddress)
+                ControlClient.requestIdr()
+            }
+            if (silenceMs >= VIDEO_STALL_MS && !stallReported) {
+                stallReported = true
+                onStalled()
+            } else if (silenceMs < VIDEO_REPUNCH_MS) {
+                stallReported = false
+            }
+        }
+    }
+
+    private fun captureToReceiveLatencyMs(ptsMs: Long): Int {
+        if (streamClockBaseUs <= 0L || !ControlClient.clockSynchronized) return -1
+        val serverCaptureUs = streamClockBaseUs + unwrapPtsMs(ptsMs) * 1000L
+        val captureOnClientClockUs = serverCaptureUs - ControlClient.serverClockOffsetUs
+        return ((SystemClock.elapsedRealtimeNanos() / 1000L - captureOnClientClockUs) / 1000L)
+            .coerceIn(0L, 60_000L).toInt()
+    }
+
+    private fun unwrapPtsMs(raw: Long): Long {
+        if (lastPtsRawMs >= 0L && raw < lastPtsRawMs && lastPtsRawMs - raw > 0x80000000L) {
+            ptsEpochMs += 0x1_0000_0000L
+        }
+        lastPtsRawMs = raw
+        return ptsEpochMs + raw
     }
 
     companion object {
         private const val TAG = "MediaReceiver"
         private const val HOLE_PUNCH_MESSAGE = "DSMH"
         private const val RECV_PACKET_BUFFER_BYTES = 1500
-        private const val RECV_SOCKET_BUFFER_BYTES = 1024 * 1024 // 1 MB, best-effort
+        private const val RECV_SOCKET_BUFFER_BYTES = 256 * 1024 // bounded stale-data exposure
         private const val SOCKET_TIMEOUT_MS = 1000
+        private const val VIDEO_REPUNCH_MS = 1500L
+        private const val VIDEO_STALL_MS = 4000L
+    }
+}
+
+private class LatencyWindow {
+    private val values = ArrayList<Int>(256)
+    private val lock = Any()
+
+    fun add(value: Int) = synchronized(lock) {
+        if (values.size >= 256) values.removeAt(0)
+        values.add(value)
+    }
+
+    fun drainP95(): Int = synchronized(lock) {
+        if (values.isEmpty()) return@synchronized -1
+        values.sort()
+        val index = ((values.size - 1) * 0.95).toInt()
+        val result = values[index]
+        values.clear()
+        result
     }
 }
 
@@ -233,7 +377,7 @@ class MediaReceiver(
 // =========================================================================================
 
 private const val PACKET_PAYLOAD_MAX = 1200
-private const val MAX_INFLIGHT_FRAMES = 4
+private const val MAX_INFLIGHT_FRAMES = 2
 /** Sanity ceiling on packetCount to refuse to allocate absurd buffers for a corrupt header. */
 private const val MAX_REASONABLE_PACKET_COUNT = 4096
 
@@ -249,7 +393,14 @@ private const val MAX_REASONABLE_PACKET_COUNT = 4096
  */
 private class FrameAssembler(
     private val bufferPool: BufferPool,
-    private val onFrameComplete: (buf: ByteArray, length: Int, keyframe: Boolean, frameId: Long) -> Unit,
+    private val onFrameComplete: (
+        buf: ByteArray,
+        length: Int,
+        keyframe: Boolean,
+        frameId: Long,
+        ptsMs: Long,
+        pipelineDelayMs: Int
+    ) -> Unit,
     private val onFrameDropped: () -> Unit
 ) {
     private val inFlight = LinkedHashMap<Long, InFlightFrame>()
@@ -309,7 +460,14 @@ private class FrameAssembler(
             }
             val assemblyBuf = bufferPool.acquire(header.packetCount * PACKET_PAYLOAD_MAX)
             frame = InFlightFrame(
-                header.frameId, header.packetCount, header.fecCount, header.keyframe, assemblyBuf, bufferPool
+                header.frameId,
+                header.packetCount,
+                header.fecCount,
+                header.keyframe,
+                header.ptsMs,
+                header.pipelineDelayMs,
+                assemblyBuf,
+                bufferPool
             )
             inFlight[header.frameId] = frame
         } else if (frame.packetCount != header.packetCount || frame.fecCount != header.fecCount) {
@@ -354,7 +512,14 @@ private class FrameAssembler(
         }
 
         val totalLen = (frame.packetCount - 1) * PACKET_PAYLOAD_MAX + frame.lastPacketLen
-        onFrameComplete(frame.assemblyBuf, totalLen, frame.keyframe, frame.frameId)
+        onFrameComplete(
+            frame.assemblyBuf,
+            totalLen,
+            frame.keyframe,
+            frame.frameId,
+            frame.ptsMs,
+            frame.pipelineDelayMs
+        )
     }
 
     private fun triggerDrop() {
@@ -374,6 +539,8 @@ private class InFlightFrame(
     val packetCount: Int,
     val fecCount: Int,
     val keyframe: Boolean,
+    val ptsMs: Long,
+    val pipelineDelayMs: Int,
     val assemblyBuf: ByteArray,
     private val pool: BufferPool
 ) {

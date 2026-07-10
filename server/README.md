@@ -2,15 +2,15 @@
 
 The Windows half of **DeskStream**, a low-latency LAN screen streamer. It captures the
 primary display with DXGI Desktop Duplication, converts BGRA→NV12 on the GPU, hardware-
-encodes H.264 via a Media Foundation encoder MFT, and streams to the Android client per
+encodes H.264 through native NVIDIA NVENC or a Media Foundation fallback, and streams per
 [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md). It also captures the default Windows playback
 device through WASAPI loopback and streams normalized 48 kHz stereo PCM in fixed 5 ms blocks.
 
 ## Requirements
 
-- Windows 10/11 (x64) with a GPU that exposes a **hardware H.264 encoder MFT**
-  (NVIDIA NVENC, AMD AMF, or Intel QuickSync). There is **no CPU fallback** — the server
-  logs a clear error and exits if none is found.
+- Windows 10/11 (x64) with NVIDIA NVENC, AMD AMF, or Intel QuickSync hardware H.264.
+  NVIDIA is attempted through the native NVENC API first; Media Foundation is the automatic
+  fallback. There is **no CPU encoder** — the server exits clearly if both paths fail.
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - Optional for controller forwarding: the
   [ViGEmBus 1.22 driver](https://github.com/nefarius/ViGEmBus/releases/latest). Without it,
@@ -59,6 +59,7 @@ See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md). Source layout:
 | `Capture/DesktopDuplicator.cs` | DXGI Output Duplication + shared D3D11 device |
 | `Capture/Nv12Converter.cs` | GPU BGRA→NV12 via `ID3D11VideoProcessor` |
 | `Encode/H264Encoder.cs` | Async hardware H.264 MFT (D3D-managed input, CODECAPI controls) |
+| `Encode/NvencH264Encoder.cs` | Native NVENC ULL, single-pass CBR, zero reorder, one-frame VBV |
 | `Encode/MfGuids.cs` / `Encode/NalUtil.cs` | MF/CODECAPI GUIDs; Annex-B NAL scanning |
 | `Net/DiscoveryResponder.cs` | UDP 47800 `DSPROBE1` → `DSREPLY` |
 | `Net/ControlServer.cs` | TCP 47801 length-prefixed JSON, keepalive, single client |
@@ -66,6 +67,7 @@ See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md). Source layout:
 | `Audio/SystemAudioCapture.cs` | Low-latency WASAPI system-output loopback, normalized PCM |
 | `Net/AudioSender.cs` | `DSAH` address learning + fixed 5 ms audio packetizer/UDP send |
 | `Input/VirtualGamepadManager.cs` | Up to four ViGEm-backed virtual Xbox 360 controllers |
+| `Input/RemoteMouseManager.cs` | Authenticated `SendInput` mouse motion/buttons with safe reset |
 | `Session/StreamSession.cs` | Control state machine + adaptation controller (§4) |
 | `Session/PairingManager.cs` | TOFU PIN pairing, `paired_clients.json` persistence |
 | `Protocol/*.cs` | Wire DTOs and big-endian media header helpers |
@@ -77,3 +79,5 @@ See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md). Source layout:
   is busy (newest-wins), never queued.
 - `EnableWindowsTargeting` is set so the project compiles on non-Windows CI, but it only
   **runs** on Windows.
+- Windows UIPI blocks a normal process from injecting into an elevated game. Run the server
+  at the same integrity level as the target app when remote mouse input is needed there.

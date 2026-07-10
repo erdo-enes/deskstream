@@ -17,6 +17,7 @@ public sealed class MediaSender : IDisposable
 {
     private const int FecGroup = 8;
     private static readonly byte[] Dsmh = Encoding.ASCII.GetBytes("DSMH");
+    private static readonly byte[] Dshb = Encoding.ASCII.GetBytes("DSHB");
 
     private readonly Socket _socket;
     private readonly IPAddress? _expectedClientAddress;
@@ -26,9 +27,12 @@ public sealed class MediaSender : IDisposable
     private volatile EndPoint? _clientEndpoint;
     private CancellationTokenSource? _cts;
     private Task? _learnLoop;
+    private Task? _heartbeatLoop;
 
     /// <summary>Validated gamepad snapshots from the currently learned media endpoint.</summary>
     public Action<GamepadState>? OnGamepadState { get; set; }
+    public Action<MouseMotion>? OnMouseMotion { get; set; }
+    public Action? OnSendCongested { get; set; }
 
     public int Port { get; }
     public bool HasClient => _clientEndpoint != null;
@@ -39,7 +43,7 @@ public sealed class MediaSender : IDisposable
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
         // Keep the OS send buffer small: dropping beats queuing for latency (PROTOCOL.md §3.3).
-        try { _socket.SendBufferSize = 256 * 1024; } catch { }
+        try { _socket.SendBufferSize = 128 * 1024; } catch { }
 
         // DSCP AF41 / TOS 0x88, best-effort (PROTOCOL.md §3.3). IP_TOS = 3; Windows usually
         // ignores this without qWAVE, hence best-effort. May throw without privilege.
@@ -57,6 +61,9 @@ public sealed class MediaSender : IDisposable
             _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
             Port = ((IPEndPoint)_socket.LocalEndPoint!).Port;
         }
+        // A slow Wi-Fi driver must drop a frame, never block the encoder callback and grow
+        // latency behind the kernel send queue.
+        try { _socket.Blocking = false; } catch { }
     }
 
     /// <summary>Starts the background loop that learns the client's media address from DSMH packets.</summary>
@@ -64,6 +71,21 @@ public sealed class MediaSender : IDisposable
     {
         _cts = new CancellationTokenSource();
         _learnLoop = Task.Run(() => LearnLoopAsync(_cts.Token));
+        _heartbeatLoop = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
+    }
+
+    private async Task HeartbeatLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(1000, ct); }
+            catch (OperationCanceledException) { break; }
+            var client = _clientEndpoint;
+            if (client == null) continue;
+            try { _socket.SendTo(Dshb, client); }
+            catch (SocketException) { }
+            catch (ObjectDisposedException) { break; }
+        }
     }
 
     private async Task LearnLoopAsync(CancellationToken ct)
@@ -94,6 +116,11 @@ public sealed class MediaSender : IDisposable
                 {
                     OnGamepadState?.Invoke(state);
                 }
+                else if (_clientEndpoint?.Equals(r.RemoteEndPoint) == true &&
+                         MousePacket.TryParse(buf.AsSpan(0, r.ReceivedBytes), out var motion))
+                {
+                    OnMouseMotion?.Invoke(motion);
+                }
             }
             catch (OperationCanceledException) { break; }
             catch (ObjectDisposedException) { break; }
@@ -109,7 +136,8 @@ public sealed class MediaSender : IDisposable
     /// <param name="frameId">Monotonic frame id.</param>
     /// <param name="keyframe">True if this AU is an IDR (carries SPS/PPS).</param>
     /// <param name="ptsMs">Server steady-clock ms (stats only).</param>
-    public void SendFrame(byte[] au, int length, uint frameId, bool keyframe, uint ptsMs)
+    public void SendFrame(
+        byte[] au, int length, uint frameId, bool keyframe, uint ptsMs, ushort pipelineDelayMs)
     {
         var client = _clientEndpoint;
         if (client == null || length <= 0)
@@ -130,10 +158,14 @@ public sealed class MediaSender : IDisposable
 
             MediaPacket.WriteHeader(
                 _sendBuffer, dataFlags, (ushort)payloadLen, frameId,
-                (ushort)i, (ushort)packetCount, (ushort)fecCount, ptsMs);
+                (ushort)i, (ushort)packetCount, (ushort)fecCount, ptsMs, pipelineDelayMs);
 
             Buffer.BlockCopy(au, offset, _sendBuffer, MediaPacket.HeaderSize, payloadLen);
-            SendDatagram(client, MediaPacket.HeaderSize + payloadLen);
+            if (!SendDatagram(client, MediaPacket.HeaderSize + payloadLen))
+            {
+                OnSendCongested?.Invoke();
+                return;
+            }
         }
 
         // ---- FEC packets: one XOR parity per group of up to 8 data packets ----
@@ -160,21 +192,34 @@ public sealed class MediaSender : IDisposable
             byte fecFlags = (byte)(dataFlags | MediaPacket.FlagFec);
             MediaPacket.WriteHeader(
                 _sendBuffer, fecFlags, (ushort)maxLen, frameId,
-                (ushort)g, (ushort)packetCount, (ushort)fecCount, ptsMs);
+                (ushort)g, (ushort)packetCount, (ushort)fecCount, ptsMs, pipelineDelayMs);
 
             Buffer.BlockCopy(_fecBuffer, 0, _sendBuffer, MediaPacket.HeaderSize, maxLen);
-            SendDatagram(client, MediaPacket.HeaderSize + maxLen);
+            if (!SendDatagram(client, MediaPacket.HeaderSize + maxLen))
+                return; // all data is sent; missing optional parity does not corrupt the frame
         }
     }
 
-    private void SendDatagram(EndPoint client, int totalLen)
+    public void SendCursorPosition(uint sequence, CursorPosition position)
+    {
+        var client = _clientEndpoint;
+        if (client == null) return;
+        Span<byte> packet = stackalloc byte[CursorPacket.Size];
+        CursorPacket.Write(packet, sequence, position);
+        try { _socket.SendTo(packet, SocketFlags.None, client); }
+        catch (SocketException) { }
+        catch (ObjectDisposedException) { }
+    }
+
+    private bool SendDatagram(EndPoint client, int totalLen)
     {
         try
         {
             _socket.SendTo(_sendBuffer, 0, totalLen, SocketFlags.None, client);
+            return true;
         }
-        catch (SocketException) { /* drop on transient send errors — never block the pipeline */ }
-        catch (ObjectDisposedException) { }
+        catch (SocketException) { return false; }
+        catch (ObjectDisposedException) { return false; }
     }
 
     public void Dispose()
@@ -182,6 +227,7 @@ public sealed class MediaSender : IDisposable
         try { _cts?.Cancel(); } catch { }
         try { _socket.Dispose(); } catch { }
         try { _learnLoop?.Wait(1000); } catch { }
+        try { _heartbeatLoop?.Wait(1000); } catch { }
         _cts?.Dispose();
     }
 }

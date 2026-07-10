@@ -3,6 +3,7 @@ package com.deskstream.client.audio
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import com.deskstream.client.proto.AudioPacketHeader
@@ -126,7 +127,7 @@ class AudioReceiver(
             audioTrack = playback
             playback.setVolume(if (muted) 0f else 1f)
             playback.play()
-            val outputBufferMs = playback.bufferSizeInFrames * 1000 / sampleRate
+            var outputBufferMs = playback.bufferSizeInFrames * 1000 / sampleRate
             onState(
                 AudioPlaybackState.READY,
                 "Audio ready · ${sampleRate / 1000} kHz stereo · ${outputBufferMs} ms output buffer"
@@ -147,6 +148,8 @@ class AudioReceiver(
             var intervalLost = 0L
             var intervalOutputDrops = 0
             var intervalBytes = 0L
+            var lastUnderruns = playback.underrunCount
+            var cleanBufferIntervals = 0
 
             fun sendHolePunch(now: Long) {
                 try {
@@ -163,13 +166,33 @@ class AudioReceiver(
                 val total = intervalPackets.toLong() + intervalLost
                 val loss = if (total > 0) intervalLost * 100f / total else 0f
                 val kbps = if (intervalMs > 0) (intervalBytes * 8 / intervalMs).toInt() else 0
+                val currentUnderruns = playback.underrunCount
+                if (currentUnderruns > lastUnderruns) {
+                    cleanBufferIntervals = 0
+                    playback.setBufferSizeInFrames(
+                        (playback.bufferSizeInFrames + packetSamples)
+                            .coerceAtMost(playback.bufferCapacityInFrames)
+                    )
+                } else {
+                    cleanBufferIntervals++
+                    if (cleanBufferIntervals >= 10 && playback.bufferSizeInFrames > packetSamples * 2) {
+                        playback.setBufferSizeInFrames(
+                            (playback.bufferSizeInFrames - packetSamples)
+                                .coerceAtLeast(packetSamples * 2)
+                        )
+                        cleanBufferIntervals = 0
+                    }
+                }
+                lastUnderruns = currentUnderruns
+                outputBufferMs = playback.bufferSizeInFrames * 1000 / sampleRate
+
                 onStats(
                     AudioStats(
                         kbps = kbps,
                         packetLossPercent = loss,
                         packetsLost = intervalLost,
                         outputDrops = intervalOutputDrops,
-                        underruns = playback.underrunCount,
+                        underruns = currentUnderruns,
                         receivingAudio = intervalPackets > 0,
                         outputBufferMs = outputBufferMs
                     )
@@ -302,6 +325,16 @@ class AudioReceiver(
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             track.release()
             throw IllegalStateException("Audio output could not be initialized")
+        }
+        track.setBufferSizeInFrames(
+            (packetBytes / (channels * AudioPacketHeader.BYTES_PER_SAMPLE) * 3)
+                .coerceAtMost(track.bufferCapacityInFrames)
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            track.setStartThresholdInFrames(
+                (packetBytes / (channels * AudioPacketHeader.BYTES_PER_SAMPLE) * 2)
+                    .coerceAtMost(track.bufferSizeInFrames)
+            )
         }
         return track
     }

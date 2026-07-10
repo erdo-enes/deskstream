@@ -16,7 +16,7 @@ import java.nio.ByteOrder
  * 10      2     uint16 packetCount
  * 12      2     uint16 fecCount
  * 14      4     uint32 ptsMs
- * 18      2     reserved = 0
+ * 18      2     uint16 pipelineDelayMs
  * 20      ...   payload
  * ```
  *
@@ -31,7 +31,8 @@ data class MediaPacketHeader(
     val packetIndex: Int,
     val packetCount: Int,
     val fecCount: Int,
-    val ptsMs: Long
+    val ptsMs: Long,
+    val pipelineDelayMs: Int
 ) {
     companion object {
         const val HEADER_SIZE = 20
@@ -55,7 +56,7 @@ data class MediaPacketHeader(
             val packetCount = bb.short.toInt() and 0xFFFF
             val fecCount = bb.short.toInt() and 0xFFFF
             val ptsMs = bb.int.toLong() and 0xFFFFFFFFL
-            // bytes 18-19 reserved, ignored
+            val pipelineDelayMs = bb.short.toInt() and 0xFFFF
 
             if (HEADER_SIZE + payloadLen > length) return null
 
@@ -68,7 +69,8 @@ data class MediaPacketHeader(
                 packetIndex = packetIndex,
                 packetCount = packetCount,
                 fecCount = fecCount,
-                ptsMs = ptsMs
+                ptsMs = ptsMs,
+                pipelineDelayMs = pipelineDelayMs
             )
         }
     }

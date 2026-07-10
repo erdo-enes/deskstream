@@ -38,7 +38,8 @@ class VideoDecoder(
     private val onDropOrError: () -> Unit,
     /** Called to return a frame buffer to its pool once this decoder is done with it (either
      * fed to the codec, or dropped without ever being fed). */
-    private val onBufferRelease: (ByteArray) -> Unit
+    private val onBufferRelease: (ByteArray) -> Unit,
+    private val onFrameRendered: (latencyMs: Int) -> Unit = {}
 ) {
     private data class PendingFrame(val data: ByteArray, val length: Int, val frameId: Long)
 
@@ -54,6 +55,8 @@ class VideoDecoder(
 
     private val pendingFrames = ArrayDeque<PendingFrame>()
     private val pendingInputIndices = ArrayDeque<Int>()
+    private val submitTimesUs = HashMap<Long, Long>()
+    private var codecFramesInFlight = 0
 
     private val callback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(mc: MediaCodec, index: Int) {
@@ -70,6 +73,12 @@ class VideoDecoder(
                 mc.releaseOutputBuffer(index, true)
             } catch (e: IllegalStateException) {
                 // codec was torn down concurrently (e.g. surface destroyed); safe to ignore
+            }
+            synchronized(lock) {
+                if (mc === codec) {
+                    codecFramesInFlight = (codecFramesInFlight - 1).coerceAtLeast(0)
+                    drainLocked()
+                }
             }
         }
 
@@ -149,7 +158,7 @@ class VideoDecoder(
     private fun enqueueFrameLocked(frame: PendingFrame) {
         pendingFrames.addLast(frame)
         var dropped = false
-        while (pendingFrames.size > 2) {
+        while (pendingFrames.size > 1) {
             val old = pendingFrames.removeFirst()
             onBufferRelease(old.data)
             dropped = true
@@ -162,7 +171,9 @@ class VideoDecoder(
     }
 
     private fun drainLocked() {
-        while (pendingFrames.isNotEmpty() && pendingInputIndices.isNotEmpty()) {
+        while (pendingFrames.isNotEmpty() && pendingInputIndices.isNotEmpty() &&
+            codecFramesInFlight < MAX_CODEC_FRAMES_IN_FLIGHT
+        ) {
             val frame = pendingFrames.removeFirst()
             val index = pendingInputIndices.removeFirst()
             feedInputBufferLocked(index, frame)
@@ -181,8 +192,11 @@ class VideoDecoder(
             inputBuffer.put(frame.data, 0, frame.length)
             // Monotonic local clock for PTS; the wire ptsMs is stats-only per protocol §3 and
             // must never be used to pace rendering.
-            val ptsUs = SystemClock.elapsedRealtimeNanos() / 1000
+            var ptsUs = SystemClock.elapsedRealtimeNanos() / 1000
+            while (submitTimesUs.containsKey(ptsUs)) ptsUs++
             c.queueInputBuffer(index, 0, frame.length, ptsUs, 0)
+            submitTimesUs[ptsUs] = ptsUs
+            codecFramesInFlight++
         } catch (e: Exception) {
             Log.w(TAG, "queueInputBuffer failed", e)
         } finally {
@@ -213,6 +227,16 @@ class VideoDecoder(
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
 
             c.configure(format, surface, null, 0)
+            c.setOnFrameRenderedListener({ renderedCodec, presentationTimeUs, nanoTime ->
+                val submittedUs = synchronized(lock) {
+                    if (renderedCodec === codec) submitTimesUs.remove(presentationTimeUs) else null
+                }
+                if (submittedUs != null) {
+                    val latencyMs = ((nanoTime / 1000L - submittedUs) / 1000L)
+                        .coerceIn(0L, 60_000L).toInt()
+                    onFrameRendered(latencyMs)
+                }
+            }, handler)
             c.start()
             codec = c
             started = true
@@ -239,6 +263,8 @@ class VideoDecoder(
             onBufferRelease(pendingFrames.removeFirst().data)
         }
         pendingInputIndices.clear()
+        submitTimesUs.clear()
+        codecFramesInFlight = 0
         return c
     }
 
@@ -260,5 +286,6 @@ class VideoDecoder(
     companion object {
         private const val TAG = "VideoDecoder"
         private const val MIME_TYPE = "video/avc"
+        private const val MAX_CODEC_FRAMES_IN_FLIGHT = 1
     }
 }

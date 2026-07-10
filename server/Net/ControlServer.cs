@@ -121,7 +121,10 @@ public sealed class ControlServer : IDisposable
 
                 if (type == "PING")
                 {
-                    Send(OutgoingMessages.Pong());
+                    long t1Us = MonotonicClock.NowUs;
+                    long? t0Us = ReadOptionalInt64(frame, "t0Us");
+                    Send(OutgoingMessages.Pong(t0Us, t0Us.HasValue ? t1Us : null,
+                        t0Us.HasValue ? MonotonicClock.NowUs : null));
                     continue;
                 }
 
@@ -150,6 +153,18 @@ public sealed class ControlServer : IDisposable
             using var doc = JsonDocument.Parse(frame);
             if (doc.RootElement.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String)
                 return t.GetString();
+        }
+        catch (JsonException) { }
+        return null;
+    }
+
+    private static long? ReadOptionalInt64(byte[] frame, string name)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(frame);
+            if (doc.RootElement.TryGetProperty(name, out var value) && value.TryGetInt64(out long result))
+                return result;
         }
         catch (JsonException) { }
         return null;

@@ -13,6 +13,20 @@
         android:layout_gravity="center" />
 
     <TextView
+        android:id="@+id/tvRemoteCursor"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
+        android:gravity="center"
+        android:shadowColor="#CC000000"
+        android:shadowDx="2"
+        android:shadowDy="2"
+        android:shadowRadius="3"
+        android:text="➤"
+        android:textColor="@color/white"
+        android:textSize="24sp"
+        android:visibility="gone" />
+
+    <TextView
         android:id="@+id/tvConnecting"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -50,6 +64,19 @@
         tools:text="LIVE · 1920×1080 @ 60 · audio on"
         tools:visibility="visible" />
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnPointerMode"
+        style="@style/Widget.MaterialComponents.Button.TextButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="12dp"
+        android:backgroundTint="#99000000"
+        android:enabled="false"
+        android:minWidth="120dp"
+        android:text="Mouse: Touchpad"
+        android:textColor="@color/white" />
+
     <TextView
         android:id="@+id/tvGestureHint"
         android:layout_width="wrap_content"
@@ -59,7 +86,7 @@
         android:background="#88000000"
         android:paddingHorizontal="10dp"
         android:paddingVertical="7dp"
-        android:text="Tap video for diagnostics"
+        android:text="Tap LIVE status for diagnostics"
         android:textColor="@color/white"
         android:textSize="12sp" />
 

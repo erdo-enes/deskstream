@@ -34,13 +34,18 @@ and video latency still needs validation against a Windows host.
    datagrams until video flows, and feeds reassembled H.264 access units to a MediaCodec
    async decoder rendering straight to the SurfaceView. It then negotiates system audio on
    a separate UDP socket, hole-punches with `DSAH`, and writes fixed 5 ms PCM blocks to a
-   low-latency AudioTrack. Tap toggles detailed video/network/audio diagnostics; the audio
-   button locally mutes without stopping reception. Back sends `STOP_STREAM` and exits;
+   low-latency AudioTrack. Tap the LIVE status chip for detailed video/network/audio/latency
+   diagnostics; the audio button locally mutes without stopping reception. Back sends
+   `STOP_STREAM` and exits;
    backgrounding sends `STOP_STREAM` but keeps the control socket (protocol §5), then sends
    `START_STREAM` again on return.
 4. A connected Bluetooth/USB gamepad is detected automatically. Buttons, D-pad, sticks,
    analog triggers, hot-plug events, and up to four controller slots are forwarded to the
    PC over UDP. The PC exposes Xbox 360 controllers and returns rumble to Android.
+5. Touch input is negotiated after video starts. The top-right control switches between a
+   relative **Touchpad** and absolute **Direct** pointer. Tap = left-click, hold + move =
+   drag, two-finger move = scroll, and two-finger tap = right-click. Mouse buttons are reset
+   whenever the stream stops or the app backgrounds.
 
 ## Code map
 
@@ -65,6 +70,8 @@ app/src/main/java/com/deskstream/client/
   input/GamepadForwarder.kt
                           physical controller detection/mapping, 120 Hz newest-state sender,
                           hot-plug neutralization and rumble
+  input/RemoteMouseController.kt
+                          touchpad/direct gestures, 120 Hz motion coalescing, safe reset
   proto/Messages.kt       control JSON models (org.json)
   proto/MediaPacket.kt    media header parser
   proto/AudioPacket.kt    allocation-free reusable audio-header parser
@@ -80,6 +87,10 @@ app/src/main/java/com/deskstream/client/
   manual IP entry — it is always shown.
 - Decoder latency knobs applied: async mode, `KEY_LOW_LATENCY` (API 30+ where supported),
   `KEY_PRIORITY=0`, `KEY_OPERATING_RATE=240`, render-on-arrival (never paced by PTS).
+- While foreground streaming, Android requests the Wi-Fi low-latency lock and a matching
+  surface frame rate. Backgrounding stops video/audio/input but leaves control reconnectable.
+- The client re-punches a silent media path, requests an IDR, and restarts a stream that does
+  not recover. Buffer pools, frame assembly, codec input, and AudioTrack tuning are bounded.
 - Pairing tokens are stored per server IP in SharedPreferences; a `PAIR_REQUIRED` in response
   to a non-empty token clears it and re-pairs automatically.
 - Audio is optional and backward-compatible. If an older server ignores `AUDIO_START`, the

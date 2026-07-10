@@ -11,45 +11,51 @@ Low-latency Windows → Android screen streamer over LAN WiFi. No cloud, no acco
 Target: <50 ms glass-to-glass at 1080p60.
 
 - `server/` — C#/.NET 8 (`net8.0-windows`) console app. DXGI Desktop Duplication →
-  GPU BGRA→NV12 (D3D11 VideoProcessor) → Media Foundation hardware H.264 async MFT
-  (low-latency CBR, no B-frames, ~infinite GOP, IDR on demand) → custom UDP packetizer
+  GPU BGRA→NV12 (D3D11 VideoProcessor) → native NVIDIA NVENC ULL or Media Foundation
+  hardware H.264 fallback (CBR, no B-frames, one-frame VBV, IDR on demand) → UDP packetizer
   (≤1200 B chunks, XOR FEC groups of 8) + WASAPI system-audio loopback → dedicated
   5 ms PCM UDP packets + TCP control channel + UDP discovery responder.
 - `android/` — Kotlin app (minSdk 26, AGP 8.5.2, Kotlin 2.0.21). UDP broadcast
   discovery → TCP control client (PIN pairing, reconnect state machine) → UDP media
   receiver (FEC recovery, frame assembly, drop-until-keyframe) → MediaCodec async
   H.264 decode straight to SurfaceView (`KEY_LOW_LATENCY`, no jitter buffer) + separate
-  PCM receiver feeding a low-latency `AudioTrack` + up to four physical Android gamepads
-  forwarded as virtual Xbox 360 controllers with rumble.
+  PCM receiver feeding an adaptively-sized low-latency `AudioTrack` + up to four physical
+  Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
+  mouse input, long-session recovery, and p95 latency telemetry.
 
-## Current state (v0.2.0, released)
+## Current state (v0.3.0 working tree)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). Tags `v0.1.0` and `v0.2.0`;
-  releases contain `DeskStream-Server-win-x64.zip` (self-contained exe) and
-  `DeskStream-Client.apk` (debug-signed installable release build).
-- **Both sides compile clean with audio and gamepad support.** Server:
-  `dotnet build -c Release` zero errors/warnings using .NET 8. Client:
-  `gradlew assembleRelease` succeeds using JDK 17.
+- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.2.0` is the latest published
+  release at the time this section was updated. The current branch contains the v0.3.0
+  latency/input work and still needs commit/publish/release after final packaging.
+- **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
+  Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
+  `compileReleaseKotlin`: successful with JDK 17. Full release artifacts are the final step.
 - **NOT yet run on real hardware.** Everything was developed and compile-verified on
   macOS. No end-to-end test on a physical Windows PC + Android device has happened yet.
   The riskiest first-run areas (in order):
-  1. MF async-MFT event loop and D3D device-manager binding on real GPUs
+  1. Native NVENC D3D11 texture registration/mapping and dynamic bitrate reconfiguration on
+     NVIDIA hardware (`server/Encode/NvencH264Encoder.cs`). Startup failure falls back to MF.
+  2. MF async-MFT event loop and D3D device-manager binding on real GPUs
      (`server/Encode/H264Encoder.cs`) — MFT quirks differ per vendor.
-  2. VideoProcessor color range/space left at driver default
+  3. VideoProcessor color range/space left at driver default
      (`server/Capture/Nv12Converter.cs`) — colors may look washed out; fix is setting
      stream/output color spaces explicitly.
-  3. OEM Android decoders that dislike in-band-SPS/PPS startup without explicit CSD
+  4. OEM Android decoders that dislike in-band-SPS/PPS startup without explicit CSD
      (`android/.../video/VideoDecoder.kt`) — symptom: black screen while
      `queueInputBuffer` succeeds.
-  4. GPU texture handoff has no explicit fence (tiny tearing risk under extreme rates;
+  5. GPU texture handoff has no explicit fence (tiny tearing risk under extreme rates;
      3-texture pool mitigates).
-  5. WASAPI loopback conversion and 20 ms capture-buffer behavior across real playback
+  6. WASAPI event-driven loopback conversion across real playback
      devices (`server/Audio/SystemAudioCapture.cs`).
-  6. OEM Android low-latency `AudioTrack` buffer sizing. The diagnostics overlay reports
+  7. OEM Android low-latency `AudioTrack` buffer sizing. The diagnostics overlay reports
      actual output-buffer size, non-blocking output drops, and underruns.
-  7. ViGEmBus virtual-controller behavior and controller mappings on real Windows/Android
+  8. ViGEmBus virtual-controller behavior and controller mappings on real Windows/Android
      hardware. ViGEmBus 1.22 must be installed separately on Windows; video/audio remain
      usable if it is absent.
+  9. `SendInput` mouse behavior in games, Windows scaling/multi-monitor setups, and UIPI.
+     Absolute input intentionally maps the captured primary display only; elevated games
+     require the server to run at the same integrity level.
 
 ## Feature status
 
@@ -61,7 +67,8 @@ Target: <50 ms glass-to-glass at 1080p60.
 | Closed-loop bitrate adaptation (§4 of protocol) | ✅ implemented (bitrate only) |
 | Reconnect state machine (background/foreground, socket death) | ✅ implemented |
 | Stats overlay on client, 1 Hz stats line on server | ✅ implemented |
-| **Input / remote control (touch → PC mouse/keyboard)** | ❌ NOT implemented |
+| **Touch → PC mouse** | ✅ touchpad/direct, click/drag/right-click/scroll, safe reset |
+| **Keyboard forwarding** | ❌ NOT implemented |
 | **Game controller / gamepad forwarding** | ✅ implemented (1–4 physical Android pads → Xbox 360 + rumble) |
 | **Audio streaming** | ✅ implemented, compile-verified; hardware test pending |
 | Encryption (TLS control / AES-GCM media) | ❌ NOT implemented (LAN plaintext) |
@@ -69,30 +76,31 @@ Target: <50 ms glass-to-glass at 1080p60.
 | Framerate/resolution adaptation steps | ❌ NOT implemented (bitrate ladder only) |
 | HEVC/AV1, HDR, multi-monitor, multi-client, WAN | ❌ deliberate v1 non-goals |
 
-## Remaining input work: touch/mouse/keyboard
+## Mouse/input implementation added for v0.3.0
 
-Physical Android controllers can now control Windows games through virtual Xbox 360
-controllers. Touch-as-mouse, on-screen virtual controls, and keyboard forwarding are not
-implemented yet.
+- Android `RemoteMouseController` offers relative touchpad and absolute direct modes.
+  Tap/hold/two-finger gestures cover click, drag, right-click, and wheel scrolling; motion
+  is coalesced to 120 Hz and uses unbuffered dispatch.
+- High-rate `DSMI` motion and `DSMC` authoritative cursor feedback share the learned media
+  UDP endpoint. Ordered button transitions use TCP. The server ignores UDP input until the
+  authenticated session negotiates `INPUT_STARTED`.
+- Windows `RemoteMouseManager` injects through `SendInput`, rejects stale sequences, tracks
+  held buttons, and releases everything on reset, input stop, stream stop, or disconnect.
+- Keyboard forwarding and on-screen virtual gamepad controls remain unimplemented.
 
-The protocol already reserves the hook: PROTOCOL.md §2.3 reserves the `INPUT` control
-message type (both sides must ignore unknown types, so shipping input is
-backward-compatible). Design guidance for whoever implements it:
+## Latency and long-session work added for v0.3.0
 
-1. **Transport:** input events client → server. Low-rate events (keys, buttons) can ride
-   the existing TCP control channel; high-rate events (touch moves, analog sticks,
-   mouse deltas) should NOT — TCP head-of-line blocking will add lag. Either add a
-   client→server UDP path on the existing media socket (it's already bidirectional —
-   the `DSMH` hole-punch proves the path) or accept TCP for v1 and measure.
-2. **Server-side injection:** use Windows `SendInput` (user32) for mouse/keyboard.
-   Absolute mouse positioning must map client-view coordinates → virtual-desktop
-   coordinates (mind letterboxing: the client already knows the video aspect rect in
-   `StreamActivity`). Gamepads already use the separate `VirtualGamepadManager` path.
-3. **Client-side:** touch → pointer events from `StreamActivity`'s SurfaceView (map
-   through the letterbox rect). Physical `InputDevice`/`MotionEvent` gamepads are done.
-4. **Extend PROTOCOL.md first** — it is the normative contract. Define `INPUT` message
-   schema(s) there before writing code, keep both implementations in lockstep, and bump
-   nothing: unknown-type tolerance means version stays 1.
+- Direct NVENC uses ULL tuning, P3, single-pass CBR, no B-frames/lookahead, zero reorder,
+  repeated SPS/PPS, and one-frame VBV. `EncoderFactory` falls back to the existing MF MFT.
+- Android requests Wi-Fi low-latency mode and display frame-rate matching while foreground;
+  receive/assembly/decoder/buffer-pool queues are smaller and hard bounded.
+- NTP-like `PING`/`PONG` timestamps plus stream clock origin produce capture→receive p95;
+  MediaCodec frame callbacks produce decode→surface p95. Rising latency triggers bitrate
+  reduction before a drop-only controller would react.
+- Static-desktop media heartbeats, UDP re-punch + IDR, stream restart, server encoder-stall
+  detection, clock reset after reconnect, and ordered background stop improve long sessions.
+- WASAPI is event-driven; Android AudioTrack begins around 10 ms, targets around 15 ms,
+  grows after underruns, and shrinks after clean playback.
 
 ## Audio implementation added after v0.1.0
 
@@ -144,11 +152,11 @@ backward-compatible). Design guidance for whoever implements it:
 
 - `docs/PROTOCOL.md` is normative. Any wire change goes there first; server and client
   must be updated together. Unknown JSON message types are ignored by both sides.
-- Latency invariants are non-negotiable: single-frame pipeline (every stage holds at
-  most one frame), never retransmit video, no jitter buffer, drop stale frames, UDP
-  payloads ≤1200 B, PTS never gates rendering.
+- Latency invariants are non-negotiable: tightly bounded one-in-flight/one-pending video
+  pipeline, never retransmit video, no jitter buffer, drop stale frames, UDP payloads
+  ≤1200 B, PTS never gates rendering.
 - Hot paths must stay allocation-free (server packetizer/encoder callback; client
   receive/assembly loop uses pooled buffers).
-- v2 roadmap ideas already documented in ARCHITECTURE.md: direct NVENC + intra-refresh +
-  reference-frame invalidation, Reed-Solomon FEC, TLS/AES-GCM, mDNS, QR pairing, audio
+- v2 roadmap ideas already documented in ARCHITECTURE.md: intra-refresh/reference-frame
+  invalidation, Reed-Solomon FEC, TLS/AES-GCM, mDNS, QR pairing, audio
   compression with Opus, framerate/resolution adaptation steps.

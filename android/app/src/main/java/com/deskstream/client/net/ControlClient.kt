@@ -84,6 +84,11 @@ object ControlClient {
     @Volatile private var explicitlyDisconnected = false
     @Volatile private var lastSentToken = ""
     @Volatile private var backoffMs = INITIAL_BACKOFF_MS
+    @Volatile private var bestClockRttUs = Long.MAX_VALUE
+    @Volatile var serverClockOffsetUs = 0L
+        private set
+    @Volatile var clockSynchronized = false
+        private set
 
     fun init(context: Context) {
         if (!::appContext.isInitialized) {
@@ -100,6 +105,9 @@ object ControlClient {
         serverIp = ip
         serverPort = port
         backoffMs = INITIAL_BACKOFF_MS
+        bestClockRttUs = Long.MAX_VALUE
+        serverClockOffsetUs = 0L
+        clockSynchronized = false
         _state.value = State.CONNECTING
         connectionJob = scope.launch { doConnect(ip, port, isReconnect = false) }
     }
@@ -131,9 +139,6 @@ object ControlClient {
 
     fun stopStream() {
         scope.launch { writeFrame(ClientMessages.stopStream()) }
-        if (_state.value == State.STREAMING) {
-            _state.value = State.READY
-        }
     }
 
     fun startAudio() {
@@ -148,6 +153,30 @@ object ControlClient {
         scope.launch { writeFrame(ClientMessages.stopGamepads()) }
     }
 
+    fun startMouseInput() {
+        scope.launch { writeFrame(ClientMessages.startMouseInput()) }
+    }
+
+    fun stopInput() {
+        scope.launch { writeFrame(ClientMessages.stopInput()) }
+    }
+
+    fun resetMouse() {
+        scope.launch { writeFrame(ClientMessages.resetMouse()) }
+    }
+
+    fun sendMouseButton(sequence: Long, button: String, down: Boolean) {
+        scope.launch { writeFrame(ClientMessages.mouseButton(sequence, button, down)) }
+    }
+
+    fun sendMouseClick(firstSequence: Long, button: String) {
+        scope.launch {
+            // One coroutine + the write mutex preserves down/up ordering for a tap.
+            writeFrame(ClientMessages.mouseButton(firstSequence, button, true))
+            writeFrame(ClientMessages.mouseButton(firstSequence + 1, button, false))
+        }
+    }
+
     /** Client-side rate limit (300 ms) on top of the server's own rate limit, per §2.3. */
     fun requestIdr() {
         val now = SystemClock.elapsedRealtime()
@@ -156,8 +185,20 @@ object ControlClient {
         scope.launch { writeFrame(ClientMessages.requestIdr()) }
     }
 
-    fun sendStats(framesOk: Int, framesDropped: Int, bytes: Long, intervalMs: Long) {
-        scope.launch { writeFrame(ClientMessages.stats(framesOk, framesDropped, bytes, intervalMs)) }
+    fun sendStats(
+        framesOk: Int,
+        framesDropped: Int,
+        bytes: Long,
+        intervalMs: Long,
+        captureToReceiveP95Ms: Int,
+        decodeToSurfaceP95Ms: Int
+    ) {
+        scope.launch {
+            writeFrame(ClientMessages.stats(
+                framesOk, framesDropped, bytes, intervalMs,
+                captureToReceiveP95Ms, decodeToSurfaceP95Ms
+            ))
+        }
     }
 
     // -----------------------------------------------------------------------------------
@@ -183,6 +224,11 @@ object ControlClient {
         socket = sock
         backoffMs = INITIAL_BACKOFF_MS
         lastReceivedAt = SystemClock.elapsedRealtime()
+        // A reconnect may land on a freshly restarted server whose monotonic-clock origin is
+        // different. Never carry an old low-RTT estimate across TCP connections.
+        bestClockRttUs = Long.MAX_VALUE
+        serverClockOffsetUs = 0L
+        clockSynchronized = false
         startPingAndWatchdog()
 
         scope.launch {
@@ -268,11 +314,14 @@ object ControlClient {
             is ServerMessage.GamepadRumble -> {
                 // event only; controller forwarding is optional
             }
+            ServerMessage.InputStarted, is ServerMessage.InputUnavailable -> {
+                // event only; authenticated remote input is optional
+            }
             is ServerMessage.Bitrate -> {
                 // event only, no state change
             }
-            ServerMessage.Pong -> {
-                // keepalive only
+            is ServerMessage.Pong -> {
+                updateClockEstimate(msg)
             }
             is ServerMessage.Unknown -> {
                 return // ignore unknown types per spec, don't forward as an event
@@ -322,7 +371,7 @@ object ControlClient {
         pingJob = scope.launch {
             while (isActive) {
                 delay(PING_INTERVAL_MS)
-                writeFrame(ClientMessages.ping())
+                writeFrame(ClientMessages.ping(nowUs()))
             }
         }
         watchdogJob = scope.launch {
@@ -339,6 +388,19 @@ object ControlClient {
             }
         }
     }
+
+    private fun updateClockEstimate(pong: ServerMessage.Pong) {
+        if (pong.t0Us <= 0L || pong.t1Us <= 0L || pong.t2Us < pong.t1Us) return
+        val t3Us = nowUs()
+        val rttUs = (t3Us - pong.t0Us) - (pong.t2Us - pong.t1Us)
+        if (rttUs < 0L || rttUs >= bestClockRttUs) return
+        bestClockRttUs = rttUs
+        // NTP offset: positive means the server monotonic clock is ahead of Android's.
+        serverClockOffsetUs = ((pong.t1Us - pong.t0Us) + (pong.t2Us - t3Us)) / 2L
+        clockSynchronized = true
+    }
+
+    private fun nowUs(): Long = SystemClock.elapsedRealtimeNanos() / 1000L
 
     private fun stopPingAndWatchdog() {
         pingJob?.cancel(); pingJob = null

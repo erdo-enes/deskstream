@@ -64,23 +64,53 @@ object ClientMessages {
             put("type", "GAMEPAD_STOP")
         }.toString()
 
+    fun startMouseInput(): String =
+        JSONObject().apply {
+            put("type", "INPUT_START")
+            put("mouse", true)
+        }.toString()
+
+    fun stopInput(): String =
+        JSONObject().apply { put("type", "INPUT_STOP") }.toString()
+
+    fun resetMouse(): String =
+        JSONObject().apply { put("type", "MOUSE_RESET") }.toString()
+
+    fun mouseButton(sequence: Long, button: String, down: Boolean): String =
+        JSONObject().apply {
+            put("type", "MOUSE_BUTTON")
+            put("sequence", sequence and 0xFFFFFFFFL)
+            put("button", button)
+            put("down", down)
+        }.toString()
+
     fun requestIdr(): String =
         JSONObject().apply {
             put("type", "REQUEST_IDR")
         }.toString()
 
-    fun stats(framesOk: Int, framesDropped: Int, bytes: Long, intervalMs: Long): String =
+    fun stats(
+        framesOk: Int,
+        framesDropped: Int,
+        bytes: Long,
+        intervalMs: Long,
+        captureToReceiveP95Ms: Int,
+        decodeToSurfaceP95Ms: Int
+    ): String =
         JSONObject().apply {
             put("type", "STATS")
             put("framesOk", framesOk)
             put("framesDropped", framesDropped)
             put("bytes", bytes)
             put("intervalMs", intervalMs)
+            put("captureToReceiveP95Ms", captureToReceiveP95Ms)
+            put("decodeToSurfaceP95Ms", decodeToSurfaceP95Ms)
         }.toString()
 
-    fun ping(): String =
+    fun ping(t0Us: Long): String =
         JSONObject().apply {
             put("type", "PING")
+            put("t0Us", t0Us)
         }.toString()
 }
 
@@ -99,7 +129,9 @@ sealed class ServerMessage {
         val width: Int,
         val height: Int,
         val fps: Int,
-        val codec: String
+        val codec: String,
+        val encoderBackend: String,
+        val clockBaseUs: Long
     ) : ServerMessage()
     data object StreamStopped : ServerMessage()
     data class AudioStarted(
@@ -117,8 +149,10 @@ sealed class ServerMessage {
         val largeMotor: Int,
         val smallMotor: Int
     ) : ServerMessage()
+    data object InputStarted : ServerMessage()
+    data class InputUnavailable(val message: String) : ServerMessage()
     data class Bitrate(val kbps: Int) : ServerMessage()
-    data object Pong : ServerMessage()
+    data class Pong(val t0Us: Long, val t1Us: Long, val t2Us: Long) : ServerMessage()
 
     /** Any type not recognized above; per spec, unknown types MUST be ignored. */
     data class Unknown(val type: String) : ServerMessage()
@@ -154,7 +188,9 @@ sealed class ServerMessage {
                     width = obj.optInt("width", 0),
                     height = obj.optInt("height", 0),
                     fps = obj.optInt("fps", 0),
-                    codec = obj.optString("codec", "h264")
+                    codec = obj.optString("codec", "h264"),
+                    encoderBackend = obj.optString("encoderBackend", "media-foundation"),
+                    clockBaseUs = obj.optLong("clockBaseUs", 0L)
                 )
                 "STREAM_STOPPED" -> StreamStopped
                 "AUDIO_STARTED" -> AudioStarted(
@@ -180,8 +216,16 @@ sealed class ServerMessage {
                     largeMotor = obj.optInt("largeMotor", 0).coerceIn(0, 255),
                     smallMotor = obj.optInt("smallMotor", 0).coerceIn(0, 255)
                 )
+                "INPUT_STARTED" -> InputStarted
+                "INPUT_UNAVAILABLE" -> InputUnavailable(
+                    message = obj.optString("message", "Remote mouse is unavailable")
+                )
                 "BITRATE" -> Bitrate(kbps = obj.optInt("kbps", 0))
-                "PONG" -> Pong
+                "PONG" -> Pong(
+                    t0Us = obj.optLong("t0Us", 0L),
+                    t1Us = obj.optLong("t1Us", 0L),
+                    t2Us = obj.optLong("t2Us", 0L)
+                )
                 else -> Unknown(type)
             }
         }

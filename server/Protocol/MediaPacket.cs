@@ -37,7 +37,8 @@ public static class MediaPacket
         ushort packetIndex,
         ushort packetCount,
         ushort fecCount,
-        uint ptsMs)
+        uint ptsMs,
+        ushort pipelineDelayMs)
     {
         dst[0] = Version;
         dst[1] = flags;
@@ -47,7 +48,6 @@ public static class MediaPacket
         BinaryPrimitives.WriteUInt16BigEndian(dst.Slice(10, 2), packetCount);
         BinaryPrimitives.WriteUInt16BigEndian(dst.Slice(12, 2), fecCount);
         BinaryPrimitives.WriteUInt32BigEndian(dst.Slice(14, 4), ptsMs);
-        dst[18] = 0;
-        dst[19] = 0;
+        BinaryPrimitives.WriteUInt16BigEndian(dst.Slice(18, 2), pipelineDelayMs);
     }
 }

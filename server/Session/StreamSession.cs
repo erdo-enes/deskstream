@@ -51,12 +51,14 @@ public sealed class StreamSession : IDisposable
     private AudioSender? _audioSender;
     private SystemAudioCapture? _audioCapture;
     private VirtualGamepadManager? _gamepads;
+    private RemoteMouseManager? _mouse;
     private DesktopDuplicator? _duplicator;
     private Nv12Converter? _converter;
-    private H264Encoder? _encoder;
+    private IVideoEncoder? _encoder;
     private Thread? _captureThread;
     private CancellationTokenSource? _captureCts;
     private Stopwatch? _clock;
+    private long _clockBaseUs;
     private uint _frameId;
     private volatile bool _streaming;
     private volatile bool _audioStreaming;
@@ -68,10 +70,12 @@ public sealed class StreamSession : IDisposable
     private int _idrSinceLastStats;
     private readonly Queue<long> _idrTimes = new();
     private long _lastIdrGenMs = -1000;
-    private static readonly long StartTicks = Stopwatch.GetTimestamp();
+    private int _bestCaptureToReceiveMs = int.MaxValue;
+    private int _bestDecodeToSurfaceMs = int.MaxValue;
 
     // Stats surfaced to the console (Program reads these)
     private long _encodedFrames;
+    private int _capturedSinceEncode;
     private long _idrRequestTotal;
     public SessionState State => _state;
     public bool Streaming => _streaming;
@@ -99,8 +103,9 @@ public sealed class StreamSession : IDisposable
         _clientAddress = clientAddress;
     }
 
-    private static long NowMs() =>
-        (Stopwatch.GetTimestamp() - StartTicks) * 1000 / Stopwatch.Frequency;
+    private static long NowMs() => MonotonicClock.NowMs;
+
+    private static long NowUs() => MonotonicClock.NowUs;
 
     // ---- Message dispatch -----------------------------------------------------------------
 
@@ -115,6 +120,10 @@ public sealed class StreamSession : IDisposable
             case "AUDIO_START": OnAudioStart(); break;
             case "GAMEPAD_START": OnGamepadStart(payload); break;
             case "GAMEPAD_STOP": StopGamepads(); break;
+            case "INPUT_START": OnInputStart(payload); break;
+            case "MOUSE_BUTTON": OnMouseButton(payload); break;
+            case "MOUSE_RESET": _mouse?.Reset(); break;
+            case "INPUT_STOP": StopMouse(); break;
             case "STOP_STREAM": OnStopStream(); break;
             case "REQUEST_IDR": OnRequestIdr(); break;
             case "STATS": OnStats(payload); break;
@@ -223,7 +232,13 @@ public sealed class StreamSession : IDisposable
         try
         {
             StartPipeline();
-            _send(OutgoingMessages.StreamStarted(_sender!.Port, _duplicator!.Width, _duplicator.Height, Fps));
+            _send(OutgoingMessages.StreamStarted(
+                _sender!.Port,
+                _duplicator!.Width,
+                _duplicator.Height,
+                Fps,
+                _encoder!.BackendName,
+                _clockBaseUs));
             _state = SessionState.Streaming;
             Console.WriteLine($"[session] streaming started: {_duplicator.Width}x{_duplicator.Height}@{Fps}, " +
                               $"start bitrate {_currentBitrateKbps} kbps, media port {_sender.Port}.");
@@ -329,25 +344,79 @@ public sealed class StreamSession : IDisposable
         }
     }
 
+    private void OnInputStart(ReadOnlySpan<byte> payload)
+    {
+        if (_state != SessionState.Streaming || !_streaming)
+            return;
+
+        var request = Json.Deserialize<InputStartMessage>(payload);
+        if (request?.Mouse != true)
+        {
+            _send(OutgoingMessages.InputUnavailable("The client did not request a supported input device"));
+            return;
+        }
+
+        try
+        {
+            _mouse ??= new RemoteMouseManager();
+            _send(OutgoingMessages.InputStarted());
+            Console.WriteLine("[input] authenticated remote mouse enabled.");
+        }
+        catch (Exception ex)
+        {
+            StopMouse();
+            _send(OutgoingMessages.InputUnavailable(ex.Message));
+        }
+    }
+
+    private void OnMouseButton(ReadOnlySpan<byte> payload)
+    {
+        if (_state != SessionState.Streaming || _mouse == null)
+            return;
+        var message = Json.Deserialize<MouseButtonMessage>(payload);
+        if (message == null)
+            return;
+        try
+        {
+            _mouse.SetButton(message.Sequence, message.Button, message.Down);
+        }
+        catch (Exception ex)
+        {
+            StopMouse();
+            _send(OutgoingMessages.InputUnavailable(ex.Message));
+        }
+    }
+
     // ---- Pipeline -------------------------------------------------------------------------
 
     private void StartPipeline()
     {
         _sender = new MediaSender(Ports.PreferredMedia, _clientAddress);
         _sender.OnGamepadState = OnGamepadState;
+        _sender.OnMouseMotion = OnMouseMotion;
+        _sender.OnSendCongested = OnMediaSendCongested;
         _sender.Start();
 
         _duplicator = new DesktopDuplicator();
         _converter = new Nv12Converter(_duplicator.Device, _duplicator.Width, _duplicator.Height, Fps);
 
         _currentBitrateKbps = Math.Min(8000, _maxBitrateKbps); // start bitrate (PROTOCOL.md §4)
-        _encoder = new H264Encoder(_duplicator.Device, _duplicator.Width, _duplicator.Height, Fps, _currentBitrateKbps);
+        _encoder = EncoderFactory.Create(
+            _duplicator.Device,
+            _duplicator.Width,
+            _duplicator.Height,
+            Fps,
+            _currentBitrateKbps);
         _encoder.OnEncodedFrame = OnEncoded;
 
         _frameId = 0;
+        _capturedSinceEncode = 0;
         _cleanStreak = 0;
         _idrSinceLastStats = 0;
         _idrTimes.Clear();
+        _bestCaptureToReceiveMs = int.MaxValue;
+        _bestDecodeToSurfaceMs = int.MaxValue;
+        _clockBaseUs = NowUs();
         _clock = Stopwatch.StartNew();
 
         _captureCts = new CancellationTokenSource();
@@ -368,6 +437,8 @@ public sealed class StreamSession : IDisposable
             {
                 if (_duplicator!.TryAcquire(100, out var bgra))
                 {
+                    if (Interlocked.Increment(ref _capturedSinceEncode) > Fps * 3)
+                        throw new InvalidOperationException("The hardware encoder stopped producing frames");
                     var nv12 = _converter!.Convert(bgra);
                     uint pts = (uint)(_clock!.ElapsedMilliseconds & 0xFFFFFFFF);
                     _encoder!.Submit(nv12, pts);
@@ -377,14 +448,21 @@ public sealed class StreamSession : IDisposable
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[capture] loop terminated: {ex.Message}");
+            if (!ct.IsCancellationRequested)
+            {
+                _send(OutgoingMessages.Error("STREAM_FAILED", ex.Message));
+                _requestClose();
+            }
         }
     }
 
     private void OnEncoded(byte[] data, int length, bool keyframe, uint ptsMs)
     {
         uint id = _frameId++;
+        Interlocked.Exchange(ref _capturedSinceEncode, 0);
         Interlocked.Increment(ref _encodedFrames);
-        _sender?.SendFrame(data, length, id, keyframe, ptsMs);
+        ushort pipelineDelayMs = (ushort)Math.Min(ushort.MaxValue, CurrentStreamPtsMs() - ptsMs);
+        _sender?.SendFrame(data, length, id, keyframe, ptsMs, pipelineDelayMs);
     }
 
     private uint CurrentStreamPtsMs() =>
@@ -422,9 +500,30 @@ public sealed class StreamSession : IDisposable
         _send(OutgoingMessages.GamepadRumble(controllerId, largeMotor, smallMotor));
     }
 
+    private void OnMouseMotion(MouseMotion motion)
+    {
+        try
+        {
+            CursorPosition? position = _mouse?.Apply(motion);
+            if (position.HasValue)
+                _sender?.SendCursorPosition(motion.Sequence, position.Value);
+        }
+        catch (Exception ex)
+        {
+            StopMouse();
+            _send(OutgoingMessages.InputUnavailable(ex.Message));
+        }
+    }
+
+    private void OnMediaSendCongested()
+    {
+        _encoder?.RequestIdr();
+    }
+
     private void StopPipeline()
     {
         _streaming = false;
+        StopMouse();
         StopGamepads();
         StopAudio();
         try { _captureCts?.Cancel(); } catch { }
@@ -435,11 +534,16 @@ public sealed class StreamSession : IDisposable
         try { _converter?.Dispose(); } catch { }
         try { _duplicator?.Dispose(); } catch { }
         if (_sender != null)
+        {
             _sender.OnGamepadState = null;
+            _sender.OnMouseMotion = null;
+            _sender.OnSendCongested = null;
+        }
         try { _sender?.Dispose(); } catch { }
         _encoder = null; _converter = null; _duplicator = null; _sender = null;
         _captureCts?.Dispose(); _captureCts = null;
         _clock = null;
+        _clockBaseUs = 0;
     }
 
     private void StopAudio()
@@ -462,6 +566,12 @@ public sealed class StreamSession : IDisposable
             _gamepads.Rumble -= OnGamepadRumble;
         try { _gamepads?.Dispose(); } catch { }
         _gamepads = null;
+    }
+
+    private void StopMouse()
+    {
+        try { _mouse?.Dispose(); } catch { }
+        _mouse = null;
     }
 
     // ---- Adaptation controller (PROTOCOL.md §4) -------------------------------------------
@@ -502,9 +612,19 @@ public sealed class StreamSession : IDisposable
         int total = s.FramesOk + s.FramesDropped;
         double dropRate = total > 0 ? (double)s.FramesDropped / total : 0.0;
 
-        bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0;
+        if (s.CaptureToReceiveP95Ms >= 0)
+            _bestCaptureToReceiveMs = Math.Min(_bestCaptureToReceiveMs, s.CaptureToReceiveP95Ms);
+        if (s.DecodeToSurfaceP95Ms >= 0)
+            _bestDecodeToSurfaceMs = Math.Min(_bestDecodeToSurfaceMs, s.DecodeToSurfaceP95Ms);
 
-        if (dropRate > 0.02)
+        bool latencyGrowing =
+            (_bestCaptureToReceiveMs != int.MaxValue &&
+             s.CaptureToReceiveP95Ms > _bestCaptureToReceiveMs + 15) ||
+            (_bestDecodeToSurfaceMs != int.MaxValue &&
+             s.DecodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 12);
+        bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 && !latencyGrowing;
+
+        if (dropRate > 0.01 || latencyGrowing)
         {
             AdaptDown();
         }
@@ -542,9 +662,18 @@ public sealed class StreamSession : IDisposable
     {
         if (kbps == _currentBitrateKbps || _encoder == null)
             return;
-        _currentBitrateKbps = kbps;
-        _encoder.SetBitrate(kbps);
-        _send(OutgoingMessages.Bitrate(kbps));
+        try
+        {
+            _encoder.SetBitrate(kbps);
+            _currentBitrateKbps = kbps;
+            _send(OutgoingMessages.Bitrate(kbps));
+        }
+        catch (Exception ex)
+        {
+            // Some vendor drivers expose hardware encode but reject live reconfiguration.
+            // Keep the healthy stream at its previous target instead of dropping the session.
+            Console.Error.WriteLine($"[encoder] bitrate reconfiguration rejected: {ex.Message}");
+        }
     }
 
     // ---- Helpers --------------------------------------------------------------------------

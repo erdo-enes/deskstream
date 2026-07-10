@@ -37,6 +37,17 @@ Keepalive: client sends `PING` every 2 s; server answers `PONG`. Either side tre
 6 s of silence as a dead connection. Client then auto-reconnects (same token) with
 exponential backoff (0.5 s, 1 s, 2 s, capped 5 s).
 
+Latency-capable clients include their monotonic timestamp in microseconds:
+
+```json
+{"type":"PING","t0Us":1234567890}
+{"type":"PONG","t0Us":1234567890,"t1Us":2234567000,"t2Us":2234567050}
+```
+
+`t1Us` and `t2Us` are the server receive/reply monotonic times. The client samples its
+own `t3Us` on receipt and uses the lowest-RTT sample to estimate the server/client clock
+offset. Old peers may continue sending fieldless `PING`/`PONG` messages.
+
 ### 2.1 Session establishment
 
 Client connects and sends first:
@@ -84,20 +95,26 @@ Client → server:
 {"type":"AUDIO_START"}
 {"type":"GAMEPAD_START","controllers":1}
 {"type":"GAMEPAD_STOP"}
+{"type":"INPUT_START","mouse":true}
+{"type":"MOUSE_BUTTON","sequence":7,"button":"left","down":true}
+{"type":"MOUSE_RESET"}
+{"type":"INPUT_STOP"}
 {"type":"STOP_STREAM"}
 {"type":"REQUEST_IDR"}
-{"type":"STATS","framesOk":58,"framesDropped":2,"bytes":2411000,"intervalMs":1000}
+{"type":"STATS","framesOk":58,"framesDropped":2,"bytes":2411000,"intervalMs":1000,"captureToReceiveP95Ms":12,"decodeToSurfaceP95Ms":8}
 ```
 
 Server → client:
 
 ```json
-{"type":"STREAM_STARTED","mediaPort":47802,"width":1920,"height":1080,"fps":60,"codec":"h264"}
+{"type":"STREAM_STARTED","mediaPort":47802,"width":1920,"height":1080,"fps":60,"codec":"h264","encoderBackend":"media-foundation","clockBaseUs":2234500000}
 {"type":"AUDIO_STARTED","audioPort":47803,"sampleRate":48000,"channels":2,"format":"pcm_s16le","packetSamples":240}
 {"type":"AUDIO_UNAVAILABLE","message":"No active Windows playback device"}
 {"type":"GAMEPAD_STARTED","controllers":1,"controllerType":"xbox360"}
 {"type":"GAMEPAD_UNAVAILABLE","message":"ViGEmBus is not installed","driverUrl":"https://github.com/nefarius/ViGEmBus/releases/latest"}
 {"type":"GAMEPAD_RUMBLE","controllerId":0,"largeMotor":255,"smallMotor":128}
+{"type":"INPUT_STARTED","mouse":true}
+{"type":"INPUT_UNAVAILABLE","message":"Windows input injection is unavailable"}
 {"type":"STREAM_STOPPED"}
 {"type":"BITRATE","kbps":14000}
 ```
@@ -107,6 +124,10 @@ After `STREAM_STARTED` the client sends one UDP datagram containing the 4 ASCII 
 arrive (and stops after). This is a **hole punch / address learn**: the server sends all
 media packets to the source address of the most recent `DSMH`. The stream always starts
 with an IDR frame carrying SPS/PPS.
+
+While the desktop is static the server sends the 4 ASCII bytes `DSHB` once per second on
+the media socket. It is a liveness heartbeat, not a video packet; the client ignores its
+payload but uses its arrival to distinguish an idle desktop from a dead UDP path.
 
 After `STREAM_STARTED`, an audio-capable client sends `AUDIO_START`. The server either
 starts Windows system-output loopback capture and replies `AUDIO_STARTED`, or replies
@@ -136,7 +157,13 @@ client should stop vibration when both values are zero.
 `STATS` is sent every 1 s during streaming. `REQUEST_IDR` is sent whenever a frame is
 dropped as unrecoverable; server rate-limits IDR generation to at most one per 300 ms.
 
-Reserved for future: touch/mouse/keyboard `INPUT` (ignore if received).
+Mouse input is opt-in and backward-compatible. After `STREAM_STARTED`, the client sends
+`INPUT_START`; the server replies `INPUT_STARTED` or `INPUT_UNAVAILABLE`. High-rate motion
+uses §3C UDP packets. Ordered button transitions use `MOUSE_BUTTON` on TCP. Supported button
+names are `left`, `right`, `middle`, `back`, and `forward`. Duplicate/stale button sequences
+are ignored. `MOUSE_RESET`, `INPUT_STOP`, `STOP_STREAM`, socket death, or session disposal
+releases every injected button so input can never remain stuck. Input is accepted only for
+the authenticated, actively-streaming session.
 
 ## 3. Media channel (UDP, server → client)
 
@@ -153,7 +180,7 @@ offset  size  field
 10      2     uint16 packetCount    (number of DATA packets in this frame)
 12      2     uint16 fecCount       (number of FEC packets in this frame)
 14      4     uint32 ptsMs          (server steady-clock ms, wraps; stats only)
-18      2     reserved = 0
+18      2     uint16 pipelineDelayMs (capture through encoder output, saturated at 65535)
 20      ...   payload
 ```
 
@@ -166,7 +193,7 @@ chunks; chunk `i` goes in the packet with `packetIndex = i`.
 
 - Reassemble by `frameId`. A frame is complete when all `packetCount` chunks are
   present (after FEC recovery). Feed complete frames to the decoder **immediately**.
-- Keep at most 4 frames in assembly. If a **newer** frame completes while an older one
+- Keep at most 2 frames in assembly. If a **newer** frame completes while an older one
   is incomplete, or assembly is full: drop the older frame. If the dropped frame might
   be referenced (i.e. any drop), send `REQUEST_IDR` and **discard everything** until the
   next `KEYFRAME` frame arrives (decoding a stream with a missing reference produces
@@ -280,15 +307,47 @@ Server rules:
 - Gamepad support is optional. Failure to create the virtual device must produce
   `GAMEPAD_UNAVAILABLE`; it must never stop screen or audio streaming.
 
+## 3C. Mouse motion (UDP, client → server)
+
+High-rate cursor motion and scrolling share the learned media endpoint. The fixed packet is
+28 bytes; all integers are big-endian:
+
+```
+offset  size  field
+0       4     ASCII magic = "DSMI"
+4       1     version = 1
+5       1     mode: 0 relative, 1 absolute
+6       2     reserved = 0
+8       4     uint32 sequence
+12      4     int32 x (relative delta, or absolute 0..65535)
+16      4     int32 y (relative delta, or absolute 0..65535)
+20      4     int32 horizontalWheel (Windows wheel units)
+24      4     int32 verticalWheel (Windows wheel units)
+```
+
+The Android client coalesces motion to at most 120 packets/s and uses unbuffered touch
+dispatch where supported. Absolute coordinates map only the captured primary display.
+The server rejects motion before `INPUT_STARTED`, from a source other than the learned media
+endpoint, or with a stale sequence. Relative packets use newest-arrival order; lost deltas are
+not retransmitted. Button transitions stay on TCP so packet loss cannot leave a button stuck.
+
+After applying a motion packet the server may return a 16-byte authoritative cursor packet
+on the media channel: ASCII `DSMC`, version byte `1`, three reserved zero bytes, the echoed
+uint32 motion sequence, then uint16 normalized primary-display X and Y. The client uses this
+for its cursor overlay; clients that do not recognize it ignore it.
+
 ## 4. Adaptation (server-side controller)
 
 Inputs: `STATS` messages and IDR request rate.
-- **Down:** if `framesDropped / (framesOk+framesDropped) > 2%` in a stats interval, or
+- **Down:** if `framesDropped / (framesOk+framesDropped) > 1%` in a stats interval, latency
+  grows materially above the session's best observed baseline, or
   ≥2 `REQUEST_IDR` in 1 s → new bitrate = max(2000, current × 0.7), apply to encoder,
   send `BITRATE`.
 - **Up:** after 5 consecutive clean intervals (0 drops, 0 IDR requests) → new bitrate =
   min(maxBitrateKbps, current × 1.1).
 - Start at min(8000, maxBitrateKbps).
+- Optional latency fields do not break older peers. Sustained capture-to-receive or
+  decode-to-surface growth should be treated as congestion before a queue can form.
 
 ## 5. Client connection state machine
 

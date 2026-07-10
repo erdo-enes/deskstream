@@ -1,10 +1,14 @@
 package com.deskstream.client.ui
 
+import android.content.Context
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -22,10 +26,13 @@ import com.deskstream.client.audio.AudioStats
 import com.deskstream.client.databinding.ActivityStreamBinding
 import com.deskstream.client.input.GamepadForwarder
 import com.deskstream.client.input.GamepadInventory
+import com.deskstream.client.input.MouseMode
+import com.deskstream.client.input.RemoteMouseController
 import com.deskstream.client.net.ControlClient
 import com.deskstream.client.net.MediaReceiver
 import com.deskstream.client.net.StreamStats
 import com.deskstream.client.proto.ServerMessage
+import com.deskstream.client.proto.CursorPosition
 import com.deskstream.client.video.VideoDecoder
 import com.google.android.material.snackbar.Snackbar
 import kotlinx.coroutines.Job
@@ -49,6 +56,8 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     @Volatile private var gamepadForwardingEnabled = false
 
     private lateinit var gamepadForwarder: GamepadForwarder
+    private lateinit var remoteMouse: RemoteMouseController
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private var surfaceReady = false
     /** True once START_STREAM has been sent for the current READY session; reset whenever we
@@ -57,6 +66,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var statsVisible = false
     private var audioMuted = false
     private var audioNegotiationJob: Job? = null
+    private var inputNegotiationJob: Job? = null
     private var audioStatus = "starting"
     private var audioDetail = "Waiting for the server"
     private var lastVideoStats: StreamStats? = null
@@ -68,6 +78,8 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var lastStreamHeight = 0
     private var lastStreamFps = 0
     private var lastStreamCodec = "h264"
+    private var lastEncoderBackend = "media-foundation"
+    private var mouseStatus = "negotiating"
     private var gamepadInventory = GamepadInventory(0, 0, emptyList())
     private var gamepadStatus = "none detected"
     private var gamepadDetail = "Connect a Bluetooth or USB controller to Android"
@@ -78,20 +90,27 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         binding = ActivityStreamBinding.inflate(layoutInflater)
         setContentView(binding.root)
         gamepadForwarder = GamepadForwarder(applicationContext, ::onGamepadInventoryChanged)
+        remoteMouse = RemoteMouseController(
+            binding.surfaceView,
+            sendMotion = { packet -> mediaReceiver?.sendMousePacket(packet) },
+            onModeChanged = { updatePointerButton(it) }
+        )
+        createWifiLock()
         applyImmersiveMode()
 
         binding.surfaceView.holder.addCallback(this)
         binding.streamRoot.setOnClickListener {
-            statsVisible = !statsVisible
-            binding.tvStats.visibility = if (statsVisible) View.VISIBLE else View.GONE
-            binding.tvGestureHint.visibility = View.GONE
-            renderDiagnostics()
+            toggleDiagnostics()
         }
+        binding.tvStreamStatus.setOnClickListener { toggleDiagnostics() }
         binding.btnAudio.setOnClickListener {
             audioMuted = !audioMuted
             audioReceiver?.setMuted(audioMuted)
             updateAudioButton()
             renderDiagnostics()
+        }
+        binding.btnPointerMode.setOnClickListener {
+            updatePointerButton(remoteMouse.toggleMode())
         }
         binding.streamRoot.addOnLayoutChangeListener { _, l, t, r, b, oldL, oldT, oldR, oldB ->
             if ((r - l) != (oldR - oldL) || (b - t) != (oldB - oldT)) {
@@ -111,6 +130,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     override fun onStart() {
         super.onStart()
+        acquireWifiLock()
         gamepadForwarder.start { packet ->
             if (gamepadForwardingEnabled) mediaReceiver?.sendGamepadPacket(packet)
         }
@@ -121,6 +141,9 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         super.onStop()
         // Per §5: backgrounding stops the stream but keeps the control socket alive.
         ControlClient.stopStream()
+        ControlClient.stopInput()
+        remoteMouse.setEnabled(false)
+        releaseWifiLock()
         streamRequested = false
         gamepadForwardingEnabled = false
         gamepadForwarder.stop()
@@ -162,7 +185,8 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         videoDecoder?.release()
         videoDecoder = VideoDecoder(
             onDropOrError = { mediaReceiver?.notifyExternalDrop() },
-            onBufferRelease = { buf -> mediaReceiver?.bufferPool?.release(buf) }
+            onBufferRelease = { buf -> mediaReceiver?.bufferPool?.release(buf) },
+            onFrameRendered = { latencyMs -> mediaReceiver?.recordDecoderSurfaceLatency(latencyMs) }
         )
         maybeStartStream()
     }
@@ -234,6 +258,8 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             is ServerMessage.GamepadRumble -> gamepadForwarder.rumble(
                 msg.controllerId, msg.largeMotor, msg.smallMotor
             )
+            ServerMessage.InputStarted -> onInputStarted()
+            is ServerMessage.InputUnavailable -> onInputUnavailable(msg.message)
             ServerMessage.StreamStopped -> {
                 stopReceivers()
                 showCenterStatus("Stream stopped")
@@ -265,6 +291,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         lastStreamHeight = msg.height
         lastStreamFps = msg.fps
         lastStreamCodec = msg.codec
+        lastEncoderBackend = msg.encoderBackend
         negotiatedBitrateKbps = 0
         lastVideoStats = null
         lastAudioStats = null
@@ -284,16 +311,29 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         // numbering restarts server-side even if they don't (protocol §5).
         mediaReceiver?.stop()
         decoder.resetForNewStream(holder.surface, msg.width, msg.height)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                holder.surface.setFrameRate(
+                    msg.fps.toFloat(),
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE
+                )
+            } catch (_: Exception) { }
+        }
 
         val receiver = MediaReceiver(
-            onFrame = { data, length, keyframe, frameId -> decoder.submitFrame(data, length, keyframe, frameId) },
-            onStats = { stats -> runOnUiThread { updateStatsOverlay(stats) } }
+            onFrame = { data, length, keyframe, frameId, _ ->
+                decoder.submitFrame(data, length, keyframe, frameId)
+            },
+            onStats = { stats -> runOnUiThread { updateStatsOverlay(stats) } },
+            onStalled = { runOnUiThread { restartStalledStream() } },
+            onCursorPosition = { position -> runOnUiThread { updateRemoteCursor(position) } }
         )
         mediaReceiver = receiver
-        receiver.start(ControlClient.serverIp, msg.mediaPort)
+        receiver.start(ControlClient.serverIp, msg.mediaPort, msg.clockBaseUs)
 
         gamepadForwardingEnabled = false
         negotiateGamepads()
+        negotiateMouseInput()
 
         binding.tvStreamStatus.visibility = View.VISIBLE
         binding.btnAudio.isEnabled = false
@@ -312,8 +352,81 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
     }
 
+    private fun negotiateMouseInput() {
+        remoteMouse.setEnabled(false)
+        binding.btnPointerMode.isEnabled = false
+        mouseStatus = "negotiating"
+        updatePointerButton(remoteMouse.currentMode())
+        ControlClient.startMouseInput()
+        inputNegotiationJob?.cancel()
+        inputNegotiationJob = lifecycleScope.launch {
+            delay(INPUT_NEGOTIATION_TIMEOUT_MS)
+            if (!binding.btnPointerMode.isEnabled) {
+                mouseStatus = "unavailable"
+                updatePointerButton(remoteMouse.currentMode())
+            }
+        }
+    }
+
+    private fun onInputStarted() {
+        inputNegotiationJob?.cancel()
+        inputNegotiationJob = null
+        mouseStatus = "live"
+        remoteMouse.setEnabled(true)
+        binding.btnPointerMode.isEnabled = true
+        binding.tvRemoteCursor.visibility = View.VISIBLE
+        updatePointerButton(remoteMouse.currentMode())
+        renderDiagnostics()
+    }
+
+    private fun onInputUnavailable(message: String) {
+        inputNegotiationJob?.cancel()
+        inputNegotiationJob = null
+        mouseStatus = "unavailable"
+        remoteMouse.setEnabled(false)
+        binding.btnPointerMode.isEnabled = false
+        binding.tvRemoteCursor.visibility = View.GONE
+        updatePointerButton(remoteMouse.currentMode())
+        Snackbar.make(binding.streamRoot, "Remote mouse unavailable: $message", Snackbar.LENGTH_LONG).show()
+    }
+
+    private fun updatePointerButton(mode: MouseMode) {
+        binding.btnPointerMode.text = when (mouseStatus) {
+            "negotiating" -> "Mouse…"
+            "unavailable" -> "No mouse"
+            else -> if (mode == MouseMode.TOUCHPAD) "Mouse: Touchpad" else "Mouse: Direct"
+        }
+    }
+
+    private fun updateRemoteCursor(position: CursorPosition) {
+        if (mouseStatus != "live") return
+        val surface = binding.surfaceView
+        val cursor = binding.tvRemoteCursor
+        if (surface.width <= 0 || surface.height <= 0) return
+        cursor.translationX = surface.x + position.x / 65535f * surface.width - cursor.width * 0.25f
+        cursor.translationY = surface.y + position.y / 65535f * surface.height - cursor.height * 0.25f
+        cursor.visibility = View.VISIBLE
+    }
+
+    private fun restartStalledStream() {
+        if (!surfaceReady || ControlClient.state.value != ControlClient.State.STREAMING) return
+        showCenterStatus("Video stalled\nRecovering stream…")
+        remoteMouse.setEnabled(false)
+        streamRequested = false
+        // Wait for STREAM_STOPPED/READY before requesting the replacement pipeline. This
+        // preserves STOP_STREAM -> START_STREAM ordering on the control connection.
+        ControlClient.stopStream()
+    }
+
     private fun updateStatsOverlay(stats: StreamStats) {
         lastVideoStats = stats
+        renderDiagnostics()
+    }
+
+    private fun toggleDiagnostics() {
+        statsVisible = !statsVisible
+        binding.tvStats.visibility = if (statsVisible) View.VISIBLE else View.GONE
+        binding.tvGestureHint.visibility = View.GONE
         renderDiagnostics()
     }
 
@@ -449,6 +562,11 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private fun stopReceivers() {
         audioNegotiationJob?.cancel()
         audioNegotiationJob = null
+        inputNegotiationJob?.cancel()
+        inputNegotiationJob = null
+        remoteMouse.setEnabled(false)
+        binding.btnPointerMode.isEnabled = false
+        binding.tvRemoteCursor.visibility = View.GONE
         mediaReceiver?.stop()
         mediaReceiver = null
         audioReceiver?.stop()
@@ -494,14 +612,21 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         binding.tvStats.text = buildString {
             append("STATE  LIVE · ${ControlClient.serverIp}\n")
             append("VIDEO  ${lastStreamWidth}×${lastStreamHeight} @ $lastStreamFps · ${lastStreamCodec.uppercase()}\n")
+            append("ENC    $lastEncoderBackend")
+            if (negotiatedBitrateKbps > 0) append(" · $negotiatedBitrateKbps kbps target")
+            append('\n')
             if (video != null) {
                 append("NET    ${video.kbps} kbps · ${"%.1f".format(video.lossPercent)}% loss\n")
                 append("DROPS  ${video.framesDropped}/s · ${video.fps} fps received\n")
+                if (video.serverPipelineP95Ms >= 0 || video.captureToReceiveP95Ms >= 0 ||
+                    video.decodeToSurfaceP95Ms >= 0
+                ) {
+                    append("LAT    ${video.serverPipelineP95Ms} ms server · ")
+                    append("${video.captureToReceiveP95Ms} ms capture→receive · ")
+                    append("${video.decodeToSurfaceP95Ms} ms decode→surface (p95)\n")
+                }
             } else {
                 append("NET    waiting for first video stats…\n")
-            }
-            if (negotiatedBitrateKbps > 0) {
-                append("ENC    $negotiatedBitrateKbps kbps target\n")
             }
             append("AUDIO  $audioDetail")
             if (audioMuted) append(" · locally muted")
@@ -514,7 +639,29 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 append("A-NET  waiting for audio packets…")
             }
             append("\nPAD    $gamepadDetail")
+            append("\nMOUSE  $mouseStatus · ${remoteMouse.currentMode().name.lowercase()}")
         }
+    }
+
+    private fun createWifiLock() {
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            @Suppress("DEPRECATION")
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        wifiLock = wifi.createWifiLock(mode, "DeskStream:low-latency").apply {
+            setReferenceCounted(false)
+        }
+    }
+
+    private fun acquireWifiLock() {
+        try { if (wifiLock?.isHeld != true) wifiLock?.acquire() } catch (_: Exception) { }
+    }
+
+    private fun releaseWifiLock() {
+        try { if (wifiLock?.isHeld == true) wifiLock?.release() } catch (_: Exception) { }
     }
 
     private fun describeStreamError(msg: ServerMessage.Error): String = when (msg.code) {
@@ -561,5 +708,6 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         private const val MAX_BITRATE_KBPS = 20000
         private const val TARGET_FPS = 60
         private const val AUDIO_NEGOTIATION_TIMEOUT_MS = 3500L
+        private const val INPUT_NEGOTIATION_TIMEOUT_MS = 2500L
     }
 }

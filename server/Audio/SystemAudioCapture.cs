@@ -21,7 +21,7 @@ public sealed class SystemAudioCapture : IDisposable
     {
         _getStreamPtsMs = getStreamPtsMs;
         _device = WasapiLoopbackCapture.GetDefaultLoopbackCaptureDevice();
-        _capture = new LowLatencyLoopbackCapture(_device, bufferMilliseconds: 20)
+        _capture = new LowLatencyLoopbackCapture(_device, bufferMilliseconds: 10)
         {
             WaveFormat = new WaveFormat(
                 Protocol.AudioPacket.SampleRate,
@@ -59,14 +59,14 @@ public sealed class SystemAudioCapture : IDisposable
     }
 
     /// <summary>
-    /// NAudio's stock loopback type uses a 100 ms capture buffer. The base class exposes
-    /// the buffer duration, so request 20 ms while retaining shared-mode resampling and
-    /// the loopback flag. Each emitted network block is still only 5 ms.
+    /// NAudio's stock loopback type uses a 100 ms capture buffer. Windows 10 1703+ supports
+    /// event-driven loopback capture, so request a 10 ms event period while retaining
+    /// shared-mode resampling. Each emitted network block is still only 5 ms.
     /// </summary>
     private sealed class LowLatencyLoopbackCapture : WasapiCapture
     {
         public LowLatencyLoopbackCapture(MMDevice device, int bufferMilliseconds)
-            : base(device, useEventSync: false, audioBufferMillisecondsLength: bufferMilliseconds)
+            : base(device, useEventSync: true, audioBufferMillisecondsLength: bufferMilliseconds)
         {
         }
 
