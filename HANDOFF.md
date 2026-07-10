@@ -23,18 +23,22 @@ Target: <50 ms glass-to-glass at 1080p60.
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
 
-## Current state (v0.3.5 released)
+## Current state (v0.3.6 release candidate)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.5` is the latest published
-  release (tag `v0.3.5`, APK + win-x64 server zip attached); `main` matches it. It caps capture
-  at the requested FPS, reports actual media endpoint/send throughput, exposes Android media
-  socket failures, and adds explicit mouse on/off, mode, and click controls.
+  release (tag `v0.3.5`, APK + win-x64 server zip attached); `main` matches it. The local
+  v0.3.6 candidate fixes the real-device crash on first mouse motion: Android had called
+  `DatagramSocket.send()` directly from the UI-thread touch callback. Mouse and gamepad UDP
+  now pass through one bounded IO sender. It also makes single-tap movement-only, double-tap
+  left-click, double-tap-drag intentional drag, and requires Back twice to exit the stream.
 - **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
-  `compileReleaseKotlin`: successful with JDK 17. Full release artifacts are the final step.
-- **NOT yet run on real hardware.** Everything was developed and compile-verified on
-  macOS. No end-to-end test on a physical Windows PC + Android device has happened yet.
-  The riskiest first-run areas (in order):
+  `assembleRelease lintRelease`: successful with JDK 17. Publishing v0.3.6 is blocked only
+  by the expired local GitHub CLI login; run `gh auth login -h github.com` and resume.
+- **Real hardware testing is in progress** on Windows plus a Samsung SM-S911B. The supplied
+  server logs proved the UDP endpoint and media sender were active, then the TCP control
+  socket vanished as soon as touch input began. Static analysis found the matching uncaught
+  Android `NetworkOnMainThreadException` path. The remaining risky areas are:
   1. Native NVENC D3D11 texture registration/mapping and dynamic bitrate reconfiguration on
      NVIDIA hardware (`server/Encode/NvencH264Encoder.cs`). It is now explicit opt-in via
      `DESKSTREAM_ENCODER=nvenc` rather than the default path.
@@ -69,7 +73,7 @@ Target: <50 ms glass-to-glass at 1080p60.
 | Closed-loop bitrate adaptation (§4 of protocol) | ✅ implemented (bitrate only) |
 | Reconnect state machine (background/foreground, socket death) | ✅ implemented |
 | Stats overlay on client, 1 Hz stats line on server | ✅ implemented |
-| **Touch → PC mouse** | ✅ touchpad/direct, click/drag/right-click/scroll, safe reset |
+| **Touch → PC mouse** | ✅ movement-only tap, double-tap click/drag, right-click/scroll, safe reset |
 | **Keyboard forwarding** | ❌ NOT implemented |
 | **Game controller / gamepad forwarding** | ✅ implemented (1–4 physical Android pads → Xbox 360 + rumble) |
 | **Audio streaming** | ✅ implemented, compile-verified; hardware test pending |
@@ -78,14 +82,16 @@ Target: <50 ms glass-to-glass at 1080p60.
 | Framerate/resolution adaptation steps | ❌ NOT implemented (bitrate ladder only) |
 | HEVC/AV1, HDR, multi-monitor, multi-client, WAN | ❌ deliberate v1 non-goals |
 
-## Mouse/input implementation added for v0.3.0
+## Mouse/input implementation added for v0.3.0 and hardened for v0.3.6
 
 - Android `RemoteMouseController` offers relative touchpad and absolute direct modes.
-  Tap/hold/two-finger gestures cover click, drag, right-click, and wheel scrolling; motion
-  is coalesced to 120 Hz and uses unbuffered dispatch.
+  A single finger moves without clicking, double-tap clicks, double-tap-drag drags, and
+  two-finger gestures cover right-click and wheel scrolling; motion is coalesced to 120 Hz
+  and uses unbuffered dispatch. The first Android Back/edge-Back only asks for confirmation.
 - High-rate `DSMI` motion and `DSMC` authoritative cursor feedback share the learned media
-  UDP endpoint. Ordered button transitions use TCP. The server ignores UDP input until the
-  authenticated session negotiates `INPUT_STARTED`.
+  UDP endpoint. A bounded IO sender prevents touch callbacks from doing network operations
+  on Android's main thread; ordered button transitions use a FIFO TCP writer. The server
+  ignores UDP input until the authenticated session negotiates `INPUT_STARTED`.
 - Windows `RemoteMouseManager` injects through `SendInput`, rejects stale sequences, tracks
   held buttons, and releases everything on reset, input stop, stream stop, or disconnect.
 - Keyboard forwarding and on-screen virtual gamepad controls remain unimplemented.

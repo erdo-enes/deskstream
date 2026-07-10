@@ -3,6 +3,7 @@ package com.deskstream.client.input
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import com.deskstream.client.net.ControlClient
 import com.deskstream.client.proto.MousePacket
 import kotlin.math.abs
@@ -27,6 +28,12 @@ class RemoteMouseController(
     private var downX = 0f
     private var downY = 0f
     private var downAt = 0L
+    private val touchSlopPx = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
+    private val doubleTapSlopPx = ViewConfiguration.get(target.context).scaledDoubleTapSlop.toFloat()
+    private var pendingTapAt = 0L
+    private var pendingTapX = 0f
+    private var pendingTapY = 0f
+    private var doubleTapInProgress = false
     private var lastMotionSentAtNanos = 0L
     private var moved = false
     private var leftHeld = false
@@ -46,6 +53,7 @@ class RemoteMouseController(
 
     fun toggleMode(): MouseMode {
         mode = if (mode == MouseMode.TOUCHPAD) MouseMode.DIRECT else MouseMode.TOUCHPAD
+        clearPendingTap()
         resetGestureOnly()
         onModeChanged(mode)
         return mode
@@ -54,16 +62,23 @@ class RemoteMouseController(
     fun currentMode(): MouseMode = mode
 
     fun clickLeft() {
-        if (enabled) sendClick("left")
+        if (enabled) {
+            clearPendingTap()
+            sendClick("left")
+        }
     }
 
     fun clickRight() {
-        if (enabled) sendClick("right")
+        if (enabled) {
+            clearPendingTap()
+            sendClick("right")
+        }
     }
 
     fun reset() {
         if (leftHeld) sendButton("left", false)
         leftHeld = false
+        clearPendingTap()
         ControlClient.resetMouse()
         resetGestureOnly()
     }
@@ -73,7 +88,11 @@ class RemoteMouseController(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 view.requestUnbufferedDispatch(event)
-                downAt = SystemClock.elapsedRealtime()
+                downAt = event.eventTime
+                doubleTapInProgress = isDoubleTapStart(downAt, event.x, event.y)
+                // A second tap owns the pending first tap. An unrelated gesture starts a
+                // fresh sequence instead of allowing a later accidental click.
+                clearPendingTap()
                 downX = event.x
                 downY = event.y
                 lastX = event.x
@@ -86,6 +105,8 @@ class RemoteMouseController(
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
+                doubleTapInProgress = false
+                clearPendingTap()
                 maxPointers = maxOf(maxPointers, event.pointerCount)
                 lastY = averageY(event)
             }
@@ -96,30 +117,32 @@ class RemoteMouseController(
                     val y = averageY(event)
                     val deltaY = lastY - y
                     twoFingerTravel += abs(deltaY)
-                    if (twoFingerTravel >= MOVE_SLOP_PX.toFloat()) moved = true
                     scrollRemainder += deltaY * SCROLL_SCALE
-                    val wheel = scrollRemainder.toInt()
-                    if (wheel != 0) {
-                        send(MousePacket.MODE_RELATIVE, 0, 0, 0, wheel)
-                        scrollRemainder -= wheel
+                    if (twoFingerTravel >= touchSlopPx) {
+                        moved = true
+                        val wheel = scrollRemainder.toInt()
+                        if (wheel != 0) {
+                            send(MousePacket.MODE_RELATIVE, 0, 0, 0, wheel)
+                            scrollRemainder -= wheel
+                        }
                     }
                     lastY = y
                 } else {
                     val dx = event.x - lastX
                     val dy = event.y - lastY
-                    if (hypot((event.x - downX).toDouble(), (event.y - downY).toDouble()) >= MOVE_SLOP_PX)
+                    if (hypot((event.x - downX).toDouble(), (event.y - downY).toDouble()) >= touchSlopPx)
                         moved = true
 
                     if (mode == MouseMode.TOUCHPAD) {
-                        if (!leftHeld && moved && SystemClock.elapsedRealtime() - downAt >= HOLD_TO_DRAG_MS) {
+                        if (!leftHeld && moved && doubleTapInProgress) {
                             sendButton("left", true)
                             leftHeld = true
                         }
                         sendRelative(dx, dy)
                     } else {
-                        // Direct mode moves the pointer under the finger. Movement alone must
-                        // not drag desktop icons; a deliberate hold enables dragging.
-                        if (!leftHeld && moved && SystemClock.elapsedRealtime() - downAt >= HOLD_TO_DRAG_MS) {
+                        // Movement alone never presses a button. A double-tap followed by a
+                        // move is the deliberate drag gesture in either pointer mode.
+                        if (!leftHeld && moved && doubleTapInProgress) {
                             sendButton("left", true)
                             leftHeld = true
                         }
@@ -140,14 +163,24 @@ class RemoteMouseController(
             }
 
             MotionEvent.ACTION_UP -> {
+                val upAt = event.eventTime
                 if (leftHeld) {
                     sendButton("left", false)
                     leftHeld = false
                 } else if (!moved && maxPointers >= 2) {
+                    clearPendingTap()
                     sendClick("right")
-                } else if (!moved) {
+                } else if (!moved && upAt - downAt <= MAX_TAP_DURATION_MS) {
                     if (mode == MouseMode.DIRECT) sendAbsolute(event.x, event.y, view)
-                    sendClick("left")
+                    if (doubleTapInProgress) {
+                        // A single tap is intentionally movement-only. This second tap is
+                        // the first point at which the surface itself may left-click.
+                        sendClick("left")
+                    } else {
+                        rememberTap(upAt, event.x, event.y)
+                    }
+                } else {
+                    clearPendingTap()
                 }
                 resetGestureOnly()
             }
@@ -155,6 +188,7 @@ class RemoteMouseController(
             MotionEvent.ACTION_CANCEL -> {
                 if (leftHeld) sendButton("left", false)
                 leftHeld = false
+                clearPendingTap()
                 ControlClient.resetMouse()
                 resetGestureOnly()
             }
@@ -206,6 +240,23 @@ class RemoteMouseController(
         buttonSequence += 2
     }
 
+    private fun isDoubleTapStart(now: Long, x: Float, y: Float): Boolean {
+        if (pendingTapAt == 0L || now - pendingTapAt > DOUBLE_TAP_TIMEOUT_MS) return false
+        return hypot((x - pendingTapX).toDouble(), (y - pendingTapY).toDouble()) <= doubleTapSlopPx
+    }
+
+    private fun rememberTap(now: Long, x: Float, y: Float) {
+        pendingTapAt = now
+        pendingTapX = x
+        pendingTapY = y
+    }
+
+    private fun clearPendingTap() {
+        pendingTapAt = 0L
+        pendingTapX = 0f
+        pendingTapY = 0f
+    }
+
     private fun resetGestureOnly() {
         moved = false
         maxPointers = 1
@@ -213,6 +264,7 @@ class RemoteMouseController(
         pendingDx = 0f
         pendingDy = 0f
         twoFingerTravel = 0f
+        doubleTapInProgress = false
     }
 
     private fun averageY(event: MotionEvent): Float {
@@ -224,8 +276,8 @@ class RemoteMouseController(
     companion object {
         private const val TOUCHPAD_SENSITIVITY = 1.35f
         private const val SCROLL_SCALE = 4.0f
-        private const val MOVE_SLOP_PX = 12.0
-        private const val HOLD_TO_DRAG_MS = 350L
+        private val DOUBLE_TAP_TIMEOUT_MS = ViewConfiguration.getDoubleTapTimeout().toLong()
+        private val MAX_TAP_DURATION_MS = ViewConfiguration.getLongPressTimeout().toLong()
         private const val MIN_SEND_INTERVAL_NANOS = 1_000_000_000L / 120L
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
@@ -87,6 +88,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var gamepadInventory = GamepadInventory(0, 0, emptyList())
     private var gamepadStatus = "none detected"
     private var gamepadDetail = "Connect a Bluetooth or USB controller to Android"
+    private var lastBackPressedAt = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -133,8 +135,19 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                ControlClient.stopStream()
-                finish()
+                val now = SystemClock.elapsedRealtime()
+                if (lastBackPressedAt != 0L && now - lastBackPressedAt <= EXIT_CONFIRM_WINDOW_MS) {
+                    lastBackPressedAt = 0L
+                    ControlClient.stopStream()
+                    finish()
+                } else {
+                    lastBackPressedAt = now
+                    Snackbar.make(
+                        binding.streamRoot,
+                        "Back again to leave the stream",
+                        Snackbar.LENGTH_SHORT
+                    ).show()
+                }
             }
         })
 
@@ -776,6 +789,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         private const val TAG = "StreamActivity"
         private const val MAX_BITRATE_KBPS = 20000
         private const val TARGET_FPS = 60
+        private const val EXIT_CONFIRM_WINDOW_MS = 2000L
         private const val AUDIO_NEGOTIATION_TIMEOUT_MS = 3500L
         private const val INPUT_NEGOTIATION_TIMEOUT_MS = 2500L
     }

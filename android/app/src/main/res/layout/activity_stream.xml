@@ -99,7 +99,7 @@
             android:layout_height="wrap_content"
             android:enabled="false"
             android:minWidth="72dp"
-            android:text="Click"
+            android:text="Left click"
             android:textColor="@color/white" />
     </LinearLayout>
 
@@ -112,7 +112,7 @@
         android:background="#88000000"
         android:paddingHorizontal="10dp"
         android:paddingVertical="7dp"
-        android:text="Tap LIVE status for diagnostics"
+        android:text="Mouse: move with 1 finger · double-tap to click · 2-finger tap for right click"
         android:textColor="@color/white"
         android:textSize="12sp" />
 

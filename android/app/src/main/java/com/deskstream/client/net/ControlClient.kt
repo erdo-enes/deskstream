@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -64,6 +65,15 @@ object ControlClient {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val writeMutex = Mutex()
+    /** Mouse down/up ordering is observable state on the host. Independent launch calls can
+     * reach [writeMutex] out of order, so all mouse control frames use one FIFO writer. */
+    private val mouseControlFrames = Channel<String>(Channel.UNLIMITED)
+
+    init {
+        scope.launch {
+            for (json in mouseControlFrames) writeFrame(json)
+        }
+    }
 
     // connect()/disconnect() are called directly from the main thread while doConnect(),
     // onSocketClosed() and the ping/watchdog loops mutate the same fields from IO-dispatched
@@ -170,19 +180,16 @@ object ControlClient {
     }
 
     fun resetMouse() {
-        scope.launch { writeFrame(ClientMessages.resetMouse()) }
+        mouseControlFrames.trySend(ClientMessages.resetMouse())
     }
 
     fun sendMouseButton(sequence: Long, button: String, down: Boolean) {
-        scope.launch { writeFrame(ClientMessages.mouseButton(sequence, button, down)) }
+        mouseControlFrames.trySend(ClientMessages.mouseButton(sequence, button, down))
     }
 
     fun sendMouseClick(firstSequence: Long, button: String) {
-        scope.launch {
-            // One coroutine + the write mutex preserves down/up ordering for a tap.
-            writeFrame(ClientMessages.mouseButton(firstSequence, button, true))
-            writeFrame(ClientMessages.mouseButton(firstSequence + 1, button, false))
-        }
+        mouseControlFrames.trySend(ClientMessages.mouseButton(firstSequence, button, true))
+        mouseControlFrames.trySend(ClientMessages.mouseButton(firstSequence + 1, button, false))
     }
 
     /** Client-side rate limit (300 ms) on top of the server's own rate limit, per §2.3. */

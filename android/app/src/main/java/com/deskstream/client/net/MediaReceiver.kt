@@ -11,6 +11,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
@@ -64,6 +66,13 @@ class MediaReceiver(
     private val onCursorPosition: (CursorPosition) -> Unit = {},
     private val onStartupError: (String) -> Unit = {}
 ) {
+    private enum class InputPacketKind { GAMEPAD, MOUSE }
+
+    private data class OutboundInputPacket(
+        val kind: InputPacketKind,
+        val data: ByteArray
+    )
+
     val bufferPool = BufferPool()
 
     private val framesOk = AtomicInteger(0)
@@ -90,7 +99,12 @@ class MediaReceiver(
     private var watchdogJob: Job? = null
     private var socket: DatagramSocket? = null
     private var thread: Thread? = null
-    private val gamepadSendGate = Any()
+    private val inputSendGate = Any()
+    private val inputSendQueue = Channel<OutboundInputPacket>(
+        capacity = INPUT_SEND_QUEUE_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    private var inputSendJob: Job? = null
     private var gamepadDatagram: DatagramPacket? = null
     private var mouseDatagram: DatagramPacket? = null
     @Volatile private var running = false
@@ -152,6 +166,11 @@ class MediaReceiver(
         // route changes. We validate the source endpoint explicitly in receiveLoop instead.
         gamepadDatagram = DatagramPacket(ByteArray(GamepadPacket.SIZE), GamepadPacket.SIZE, address, mediaPort)
         mouseDatagram = DatagramPacket(ByteArray(MousePacket.SIZE), MousePacket.SIZE, address, mediaPort)
+        // Mouse callbacks run on Android's main thread, where DatagramSocket.send() throws
+        // NetworkOnMainThreadException. The controller producer also must not block on the
+        // network. One bounded IO sender keeps both streams ordered and low-latency without
+        // creating an unbounded backlog.
+        inputSendJob = scope.launch(Dispatchers.IO) { inputSendLoop() }
         // TCP announces the bound port reliably; DSMH remains a NAT/firewall fallback.
         ControlClient.mediaReady(sock.localPort)
 
@@ -167,9 +186,12 @@ class MediaReceiver(
         statsJob = null
         watchdogJob?.cancel()
         watchdogJob = null
+        inputSendJob?.cancel()
+        inputSendJob = null
+        inputSendQueue.cancel()
         socket?.close() // unblocks the blocking receive() in the worker thread
         socket = null
-        synchronized(gamepadSendGate) {
+        synchronized(inputSendGate) {
             gamepadDatagram = null
             mouseDatagram = null
         }
@@ -197,28 +219,35 @@ class MediaReceiver(
     /** Sends one already-serialized controller snapshot without allocating a DatagramPacket. */
     fun sendGamepadPacket(data: ByteArray) {
         if (!running || data.size != GamepadPacket.SIZE) return
-        synchronized(gamepadSendGate) {
-            val sock = socket ?: return
-            val packet = gamepadDatagram ?: return
-            try {
-                packet.setData(data, 0, data.size)
-                sock.send(packet)
-            } catch (e: IOException) {
-                if (running) Log.w(TAG, "gamepad packet send failed", e)
-            }
-        }
+        enqueueInput(InputPacketKind.GAMEPAD, data)
     }
 
     fun sendMousePacket(data: ByteArray) {
         if (!running || data.size != MousePacket.SIZE) return
-        synchronized(gamepadSendGate) {
-            val sock = socket ?: return
-            val packet = mouseDatagram ?: return
-            try {
-                packet.setData(data, 0, data.size)
-                sock.send(packet)
-            } catch (e: IOException) {
-                if (running) Log.w(TAG, "mouse packet send failed", e)
+        enqueueInput(InputPacketKind.MOUSE, data)
+    }
+
+    private fun enqueueInput(kind: InputPacketKind, data: ByteArray) {
+        // Both producers reuse their serialization buffer, so the queued snapshot must own
+        // its bytes. The queue is bounded and drops stale input rather than adding latency.
+        inputSendQueue.trySend(OutboundInputPacket(kind, data.copyOf()))
+    }
+
+    private suspend fun inputSendLoop() {
+        for (outbound in inputSendQueue) {
+            if (!running) break
+            synchronized(inputSendGate) {
+                val sock = socket ?: return@synchronized
+                val packet = when (outbound.kind) {
+                    InputPacketKind.GAMEPAD -> gamepadDatagram
+                    InputPacketKind.MOUSE -> mouseDatagram
+                } ?: return@synchronized
+                try {
+                    packet.setData(outbound.data, 0, outbound.data.size)
+                    sock.send(packet)
+                } catch (e: IOException) {
+                    if (running) Log.w(TAG, "input packet send failed", e)
+                }
             }
         }
     }
@@ -364,6 +393,7 @@ class MediaReceiver(
     companion object {
         private const val TAG = "MediaReceiver"
         private const val HOLE_PUNCH_MESSAGE = "DSMH"
+        private const val INPUT_SEND_QUEUE_CAPACITY = 16
         private const val RECV_PACKET_BUFFER_BYTES = 1500
         // IDR access units arrive as a burst. 256 KiB caused a loss -> IDR -> larger burst
         // feedback loop on real Wi-Fi devices.
