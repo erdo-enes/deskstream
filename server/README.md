@@ -1,0 +1,70 @@
+# DeskStreamer.Server
+
+The Windows half of **DeskStream**, a low-latency LAN screen streamer. It captures the
+primary display with DXGI Desktop Duplication, converts BGRA→NV12 on the GPU, hardware-
+encodes H.264 via a Media Foundation encoder MFT, and streams to the Android client per
+[`../docs/PROTOCOL.md`](../docs/PROTOCOL.md).
+
+## Requirements
+
+- Windows 10/11 (x64) with a GPU that exposes a **hardware H.264 encoder MFT**
+  (NVIDIA NVENC, AMD AMF, or Intel QuickSync). There is **no CPU fallback** — the server
+  logs a clear error and exits if none is found.
+- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+
+## Build & run
+
+```powershell
+cd server
+dotnet run -c Release
+```
+
+On start it prints the local IP addresses and ports, then waits for a client. When a new
+device pairs, a **6-digit PIN** is shown in a box — type it into the Android app. Once
+streaming, a 1 Hz status line reports encoded fps, current bitrate, client-side dropped
+frames, and IDR requests per second.
+
+Paired devices are remembered in `paired_clients.json` next to the built executable, so
+subsequent connections auto-authenticate (TOFU). Delete that file to force re-pairing.
+
+## Firewall
+
+Allow these on the **Private** network profile (the first run usually triggers a Windows
+Defender Firewall prompt — approve it for Private networks):
+
+- **UDP 47800** — discovery
+- **TCP 47801** — control
+- **UDP 47802** — media (server → client; also receives the client's `DSMH` hole-punch)
+
+```powershell
+# Optional explicit rules (run in an elevated PowerShell):
+New-NetFirewallRule -DisplayName "DeskStream discovery" -Direction Inbound -Protocol UDP -LocalPort 47800 -Profile Private -Action Allow
+New-NetFirewallRule -DisplayName "DeskStream control"   -Direction Inbound -Protocol TCP -LocalPort 47801 -Profile Private -Action Allow
+New-NetFirewallRule -DisplayName "DeskStream media"     -Direction Inbound -Protocol UDP -LocalPort 47802 -Profile Private -Action Allow
+```
+
+## Architecture
+
+See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md). Source layout:
+
+| Path | Responsibility |
+|------|----------------|
+| `Program.cs` | Wire-up, console UX, GC latency mode, 1 Hz stats |
+| `Capture/DesktopDuplicator.cs` | DXGI Output Duplication + shared D3D11 device |
+| `Capture/Nv12Converter.cs` | GPU BGRA→NV12 via `ID3D11VideoProcessor` |
+| `Encode/H264Encoder.cs` | Async hardware H.264 MFT (D3D-managed input, CODECAPI controls) |
+| `Encode/MfGuids.cs` / `Encode/NalUtil.cs` | MF/CODECAPI GUIDs; Annex-B NAL scanning |
+| `Net/DiscoveryResponder.cs` | UDP 47800 `DSPROBE1` → `DSREPLY` |
+| `Net/ControlServer.cs` | TCP 47801 length-prefixed JSON, keepalive, single client |
+| `Net/MediaSender.cs` | Packetizer (20-byte header, ≤1200 B) + XOR FEC + UDP send |
+| `Session/StreamSession.cs` | Control state machine + adaptation controller (§4) |
+| `Session/PairingManager.cs` | TOFU PIN pairing, `paired_clients.json` persistence |
+| `Protocol/*.cs` | Wire DTOs and big-endian media header helpers |
+
+## Notes
+
+- The hot path (packetize → send) is allocation-free; GC runs in `SustainedLowLatency`.
+- Every pipeline stage holds at most one frame; a stale capture is dropped when the encoder
+  is busy (newest-wins), never queued.
+- `EnableWindowsTargeting` is set so the project compiles on non-Windows CI, but it only
+  **runs** on Windows.
