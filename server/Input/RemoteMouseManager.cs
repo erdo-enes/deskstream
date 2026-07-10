@@ -33,15 +33,26 @@ public sealed class RemoteMouseManager : IDisposable
     private uint _lastButtonSequence;
     private bool _hasMotionSequence;
     private bool _hasButtonSequence;
+    private bool _buttonReleasePending;
+    private bool _disposed;
 
     public CursorPosition? Apply(in MouseMotion motion)
     {
         lock (_gate)
         {
+            if (_disposed)
+                return null;
             if (_hasMotionSequence && unchecked((int)(motion.Sequence - _lastMotionSequence)) <= 0)
                 return null;
             _lastMotionSequence = motion.Sequence;
             _hasMotionSequence = true;
+
+            if (_buttonReleasePending)
+            {
+                ReleasePressedButtons(retainFailures: true);
+                if (_buttonReleasePending)
+                    return null;
+            }
 
             Span<NativeInput> inputs = stackalloc NativeInput[3];
             int count = 0;
@@ -76,19 +87,33 @@ public sealed class RemoteMouseManager : IDisposable
     {
         lock (_gate)
         {
+            if (_disposed)
+                return;
             if (_hasButtonSequence && unchecked((int)(sequence - _lastButtonSequence)) <= 0)
                 return;
             _lastButtonSequence = sequence;
             _hasButtonSequence = true;
 
+            if (_buttonReleasePending)
+            {
+                ReleasePressedButtons(retainFailures: true);
+                if (_buttonReleasePending)
+                    return;
+            }
+
             string normalized = button.ToLowerInvariant();
             if (!TryButtonFlags(normalized, down, out uint flags, out uint data))
                 return;
-            if (down ? !_pressed.Add(normalized) : !_pressed.Remove(normalized))
+            bool isPressed = _pressed.Contains(normalized);
+            if (down == isPressed)
                 return;
             Span<NativeInput> input = stackalloc NativeInput[1];
             input[0] = MouseInput(0, 0, data, flags);
             Send(input);
+            if (down)
+                _pressed.Add(normalized);
+            else
+                _pressed.Remove(normalized);
         }
     }
 
@@ -96,24 +121,41 @@ public sealed class RemoteMouseManager : IDisposable
     {
         lock (_gate)
         {
-            if (_pressed.Count > 0)
-            {
-                Span<NativeInput> releases = stackalloc NativeInput[5];
-                int count = 0;
-                foreach (string button in _pressed)
-                {
-                    if (TryButtonFlags(button, false, out uint flags, out uint data))
-                        releases[count++] = MouseInput(0, 0, data, flags);
-                }
-                if (count > 0)
-                {
-                    try { Send(releases[..count]); } catch { }
-                }
-            }
-            _pressed.Clear();
+            if (_disposed)
+                return;
+            ReleasePressedButtons(retainFailures: true);
             _hasMotionSequence = false;
             _hasButtonSequence = false;
         }
+    }
+
+    private void ReleasePressedButtons(bool retainFailures)
+    {
+        if (_pressed.Count == 0)
+        {
+            _buttonReleasePending = false;
+            return;
+        }
+
+        var buttons = new string[_pressed.Count];
+        var releases = new NativeInput[_pressed.Count];
+        int count = 0;
+        foreach (string button in _pressed)
+        {
+            if (!TryButtonFlags(button, false, out uint flags, out uint data))
+                continue;
+            buttons[count] = button;
+            releases[count++] = MouseInput(0, 0, data, flags);
+        }
+
+        uint sent = count == 0 ? 0 : SendRaw(releases.AsSpan(0, count));
+        int confirmed = Math.Min(count, (int)sent);
+        for (int i = 0; i < confirmed; i++)
+            _pressed.Remove(buttons[i]);
+
+        if (!retainFailures)
+            _pressed.Clear();
+        _buttonReleasePending = retainFailures && _pressed.Count > 0;
     }
 
     private static bool TryButtonFlags(string button, bool down, out uint flags, out uint data)
@@ -150,16 +192,34 @@ public sealed class RemoteMouseManager : IDisposable
 
     private static unsafe void Send(ReadOnlySpan<NativeInput> inputs)
     {
+        uint sent = SendRaw(inputs);
+        if (sent != inputs.Length)
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Windows rejected remote mouse input (elevated apps require an equally elevated server)");
+    }
+
+    private static unsafe uint SendRaw(ReadOnlySpan<NativeInput> inputs)
+    {
         fixed (NativeInput* ptr = inputs)
         {
-            uint sent = SendInput((uint)inputs.Length, ptr, Marshal.SizeOf<NativeInput>());
-            if (sent != inputs.Length)
-                throw new Win32Exception(Marshal.GetLastWin32Error(),
-                    "Windows rejected remote mouse input (elevated apps require an equally elevated server)");
+            return SendInput((uint)inputs.Length, ptr, Marshal.SizeOf<NativeInput>());
         }
     }
 
-    public void Dispose() => Reset();
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            ReleasePressedButtons(retainFailures: false);
+            _pressed.Clear();
+            _buttonReleasePending = false;
+            _hasMotionSequence = false;
+            _hasButtonSequence = false;
+        }
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeInput

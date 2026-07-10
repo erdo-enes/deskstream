@@ -28,6 +28,7 @@ class RemoteMouseController(
     private var downX = 0f
     private var downY = 0f
     private var downAt = 0L
+    private val displayDensity = target.resources.displayMetrics.density.coerceAtLeast(0.1f)
     private val touchSlopPx = ViewConfiguration.get(target.context).scaledTouchSlop.toFloat()
     private val doubleTapSlopPx = ViewConfiguration.get(target.context).scaledDoubleTapSlop.toFloat()
     private var pendingTapAt = 0L
@@ -117,7 +118,10 @@ class RemoteMouseController(
                     val y = averageY(event)
                     val deltaY = lastY - y
                     twoFingerTravel += abs(deltaY)
-                    scrollRemainder += deltaY * SCROLL_SCALE
+                    // MotionEvent coordinates are physical pixels. Convert to dp before
+                    // producing wheel units so scrolling feels the same on phones with
+                    // different display densities.
+                    scrollRemainder += deltaY / displayDensity * SCROLL_UNITS_PER_DP
                     if (twoFingerTravel >= touchSlopPx) {
                         moved = true
                         val wheel = scrollRemainder.toInt()
@@ -164,6 +168,20 @@ class RemoteMouseController(
 
             MotionEvent.ACTION_UP -> {
                 val upAt = event.eventTime
+
+                // A gesture may end inside the 120 Hz coalescing window. Flush the final
+                // position before clearing the accumulators so short swipes do not stop
+                // short and the last part of a drag is not lost.
+                if (moved && maxPointers == 1) {
+                    if (mode == MouseMode.TOUCHPAD) {
+                        sendRelative(event.x - lastX, event.y - lastY, force = true)
+                    } else {
+                        sendAbsolute(event.x, event.y, view, force = true)
+                    }
+                    lastX = event.x
+                    lastY = event.y
+                }
+
                 if (leftHeld) {
                     sendButton("left", false)
                     leftHeld = false
@@ -196,28 +214,47 @@ class RemoteMouseController(
         return true
     }
 
-    private fun sendRelative(dx: Float, dy: Float) {
-        pendingDx += dx * TOUCHPAD_SENSITIVITY
-        pendingDy += dy * TOUCHPAD_SENSITIVITY
+    private fun sendRelative(dx: Float, dy: Float, force: Boolean = false) {
+        val dxDp = dx / displayDensity
+        val dyDp = dy / displayDensity
+        val distanceDp = hypot(dxDp.toDouble(), dyDp.toDouble()).toFloat()
+        val gain = when {
+            distanceDp < PRECISE_MOTION_THRESHOLD_DP -> PRECISE_TOUCHPAD_GAIN
+            distanceDp < FAST_MOTION_THRESHOLD_DP -> NORMAL_TOUCHPAD_GAIN
+            else -> FAST_TOUCHPAD_GAIN
+        }
+        pendingDx += dxDp * gain
+        pendingDy += dyDp * gain
         val now = SystemClock.elapsedRealtimeNanos()
-        if (now - lastMotionSentAtNanos < MIN_SEND_INTERVAL_NANOS) return
+        if (!force && now - lastMotionSentAtNanos < MIN_SEND_INTERVAL_NANOS) return
         val x = pendingDx.roundToInt()
         val y = pendingDy.roundToInt()
         pendingDx -= x
         pendingDy -= y
-        if (x != 0 || y != 0) send(MousePacket.MODE_RELATIVE, x, y, 0, 0)
+        if (x != 0 || y != 0) {
+            send(MousePacket.MODE_RELATIVE, x, y, 0, 0, force = force)
+        }
     }
 
-    private fun sendAbsolute(x: Float, y: Float, view: View) {
+    private fun sendAbsolute(x: Float, y: Float, view: View, force: Boolean = false) {
         if (view.width <= 1 || view.height <= 1) return
         val nx = (x / (view.width - 1) * 65535f).roundToInt().coerceIn(0, 65535)
         val ny = (y / (view.height - 1) * 65535f).roundToInt().coerceIn(0, 65535)
-        send(MousePacket.MODE_ABSOLUTE, nx, ny, 0, 0)
+        send(MousePacket.MODE_ABSOLUTE, nx, ny, 0, 0, force = force)
     }
 
-    private fun send(mode: Int, x: Int, y: Int, horizontalWheel: Int, verticalWheel: Int) {
+    private fun send(
+        mode: Int,
+        x: Int,
+        y: Int,
+        horizontalWheel: Int,
+        verticalWheel: Int,
+        force: Boolean = false
+    ) {
         val now = SystemClock.elapsedRealtimeNanos()
-        if ((x != 0 || y != 0) && now - lastMotionSentAtNanos < MIN_SEND_INTERVAL_NANOS) return
+        if (!force && (x != 0 || y != 0) &&
+            now - lastMotionSentAtNanos < MIN_SEND_INTERVAL_NANOS
+        ) return
         lastMotionSentAtNanos = now
         MousePacket.write(
             packet,
@@ -274,8 +311,12 @@ class RemoteMouseController(
     }
 
     companion object {
-        private const val TOUCHPAD_SENSITIVITY = 1.35f
-        private const val SCROLL_SCALE = 4.0f
+        private const val PRECISE_MOTION_THRESHOLD_DP = 1.0f
+        private const val FAST_MOTION_THRESHOLD_DP = 4.0f
+        private const val PRECISE_TOUCHPAD_GAIN = 1.5f
+        private const val NORMAL_TOUCHPAD_GAIN = 2.5f
+        private const val FAST_TOUCHPAD_GAIN = 3.5f
+        private const val SCROLL_UNITS_PER_DP = 6.0f
         private val DOUBLE_TAP_TIMEOUT_MS = ViewConfiguration.getDoubleTapTimeout().toLong()
         private val MAX_TAP_DURATION_MS = ViewConfiguration.getLongPressTimeout().toLong()
         private const val MIN_SEND_INTERVAL_NANOS = 1_000_000_000L / 120L

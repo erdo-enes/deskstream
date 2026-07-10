@@ -12,18 +12,14 @@
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
-    <TextView
+    <ImageView
         android:id="@+id/tvRemoteCursor"
-        android:layout_width="28dp"
-        android:layout_height="28dp"
-        android:gravity="center"
-        android:shadowColor="#CC000000"
-        android:shadowDx="2"
-        android:shadowDy="2"
-        android:shadowRadius="3"
-        android:text="➤"
-        android:textColor="@color/white"
-        android:textSize="24sp"
+        android:layout_width="12dp"
+        android:layout_height="18dp"
+        android:contentDescription="@null"
+        android:importantForAccessibility="no"
+        android:scaleType="fitXY"
+        android:src="@drawable/ic_remote_cursor"
         android:visibility="gone" />
 
     <TextView
@@ -65,41 +61,48 @@
         tools:visibility="visible" />
 
     <LinearLayout
+        android:id="@+id/mouseToolbar"
         android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_height="48dp"
         android:layout_gravity="top|end"
-        android:layout_margin="12dp"
+        android:layout_margin="8dp"
         android:background="#99000000"
         android:orientation="horizontal">
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnMouseToggle"
             style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_width="56dp"
+            android:layout_height="48dp"
+            android:contentDescription="@string/mouse_toggle_description"
             android:enabled="false"
-            android:minWidth="88dp"
-            android:text="Mouse: On"
+            android:minWidth="0dp"
+            android:paddingHorizontal="2dp"
+            android:text="@string/mouse_toggle_on"
             android:textColor="@color/white" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnPointerMode"
             style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_width="60dp"
+            android:layout_height="48dp"
+            android:contentDescription="@string/mouse_mode_change_description"
             android:enabled="false"
-            android:minWidth="92dp"
-            android:text="Mode: Pad"
+            android:minWidth="0dp"
+            android:paddingHorizontal="2dp"
+            android:text="@string/mouse_mode_pad"
             android:textColor="@color/white" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnMouseClick"
             style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_width="52dp"
+            android:layout_height="48dp"
+            android:contentDescription="@string/mouse_click_description"
             android:enabled="false"
-            android:minWidth="72dp"
-            android:text="Left click"
+            android:minWidth="0dp"
+            android:paddingHorizontal="2dp"
+            android:text="@string/mouse_click"
             android:textColor="@color/white" />
     </LinearLayout>
 
@@ -107,14 +110,18 @@
         android:id="@+id/tvGestureHint"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom|start"
-        android:layout_margin="16dp"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="68dp"
         android:background="#88000000"
+        android:gravity="center"
+        android:maxWidth="520dp"
         android:paddingHorizontal="10dp"
         android:paddingVertical="7dp"
-        android:text="Mouse: move with 1 finger · double-tap to click · 2-finger tap for right click"
+        android:text="@string/mouse_gesture_hint"
         android:textColor="@color/white"
-        android:textSize="12sp" />
+        android:textSize="12sp"
+        android:visibility="gone"
+        tools:visibility="visible" />
 
     <TextView
         android:id="@+id/tvGamepadStatus"

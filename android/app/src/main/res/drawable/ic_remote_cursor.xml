@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="12dp"
+    android:height="18dp"
+    android:viewportWidth="12"
+    android:viewportHeight="18">
+    <!-- The first point is the pointer hotspot. The black silhouette keeps the cursor
+         visible over both light and dark desktop content. -->
+    <path
+        android:fillColor="#E6000000"
+        android:pathData="M0,0 L0,14.2 L3.5,10.9 L6.7,17.4 L9.3,16.1 L6.2,10.1 L11.7,10.1 Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M1,2.1 L1,11.9 L3.8,9.2 L7.1,15.8 L7.9,15.4 L4.7,9.1 L9.3,9.1 Z" />
+</vector>

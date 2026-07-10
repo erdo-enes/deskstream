@@ -1,6 +1,6 @@
 # DeskStream — Architecture
 
-A Windows → Android LAN screen streamer engineered for minimal glass-to-glass latency
+A Windows → Android/macOS LAN screen streamer engineered for minimal glass-to-glass latency
 (target: <50 ms median at 1080p60 on 5 GHz WiFi), designed around the documented failure
 modes of Sunshine/Moonlight, Parsec, spacedesk, Steam Link, Miracast, and Chromecast.
 
@@ -53,6 +53,10 @@ Rules that keep it low:
   receiver feeds 5 ms PCM blocks to a low-latency `AudioTrack` with local mute. Physical
   Android gamepads are reduced to newest-state snapshots and forwarded at up to 120 Hz.
   Touch becomes either relative touchpad motion or direct absolute primary-display motion.
+- `macos/` — native Objective-C/AppKit Apple-silicon app (macOS 13+). Its bounded two-frame
+  FEC assembler feeds H.264 access units directly to AVSampleBufferDisplayLayer with
+  display-immediately semantics; separate bounded PCM output and foreground AppKit/
+  GameController capture forward mouse, physical keyboard, and up to four gamepads.
 - `docs/PROTOCOL.md` — the wire contract both sides implement. **Normative.**
 
 ## Networking model
@@ -72,6 +76,9 @@ Rules that keep it low:
 - **Mouse** — newest-wins motion/scroll datagrams share the authenticated media endpoint;
   ordered button transitions stay on TCP. Windows `SendInput` injects into the interactive
   desktop and every stop/reset path releases held buttons.
+- **Keyboard** — ordered USB HID keyboard-page positions use TCP and become Windows Set-1
+  scan codes. Resets on focus loss, capture release, stream stop, or disconnect prevent
+  retained keys; unsupported usages are ignored for backward compatibility.
 
 ## Adaptation (bitrate → fps → resolution)
 
@@ -84,9 +91,9 @@ Framerate/resolution steps are v1.1 — the control messages already carry the f
 ## Deliberate non-goals (v1)
 
 No WAN/relay/NAT traversal. No accounts. No virtual/extended display. No multi-client,
-no multi-monitor. No iOS/desktop clients. No HEVC/AV1 (multiplies encoder quirk
-surface; H.264 has the widest low-latency Android decoder support). Physical gamepads and
-touch-as-mouse are supported; keyboard forwarding remains out of scope for this version.
+no multi-monitor, and no iOS client. No HEVC/AV1 (multiplies encoder quirk surface;
+H.264 has the widest low-latency hardware decoder support). Physical gamepads, mouse, and
+foreground keyboard forwarding are supported.
 
 ## v2 upgrade path (documented, not built)
 

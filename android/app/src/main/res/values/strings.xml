@@ -1,3 +1,22 @@
 <resources>
     <string name="app_name">DeskStream</string>
+    <string name="mouse_toggle_on">On</string>
+    <string name="mouse_toggle_off">Off</string>
+    <string name="mouse_mode_starting">…</string>
+    <string name="mouse_mode_unavailable">N/A</string>
+    <string name="mouse_mode_pad">Pad</string>
+    <string name="mouse_mode_direct">Direct</string>
+    <string name="mouse_toggle_description">Toggle remote mouse</string>
+    <string name="mouse_enable_description">Enable remote mouse</string>
+    <string name="mouse_disable_description">Disable remote mouse</string>
+    <string name="mouse_mode_change_description">Change pointer mode</string>
+    <string name="mouse_mode_starting_description">Pointer mode is starting</string>
+    <string name="mouse_unavailable_description">Remote mouse unavailable</string>
+    <string name="mouse_mode_pad_description">Touchpad mode; tap to use direct pointer mode</string>
+    <string name="mouse_mode_direct_description">Direct pointer mode; tap to use touchpad mode</string>
+    <string name="mouse_click">Click</string>
+    <string name="mouse_click_description">Left click; touch and hold for right click</string>
+    <string name="mouse_gesture_hint">Move: 1 finger · Click: double-tap · Drag: double-tap + move\nScroll: 2 fingers · Right-click: 2-finger tap</string>
+    <string name="leave_stream_prompt">Leave the stream?</string>
+    <string name="leave_stream_action">LEAVE</string>
 </resources>

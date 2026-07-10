@@ -106,12 +106,20 @@ public sealed class StatsMessage
 public sealed class InputStartMessage
 {
     [JsonPropertyName("mouse")] public bool Mouse { get; set; }
+    [JsonPropertyName("keyboard")] public bool Keyboard { get; set; }
 }
 
 public sealed class MouseButtonMessage
 {
     [JsonPropertyName("sequence")] public uint Sequence { get; set; }
     [JsonPropertyName("button")] public string Button { get; set; } = "";
+    [JsonPropertyName("down")] public bool Down { get; set; }
+}
+
+public sealed class KeyboardKeyMessage
+{
+    [JsonPropertyName("sequence")] public uint Sequence { get; set; }
+    [JsonPropertyName("usage")] public int Usage { get; set; }
     [JsonPropertyName("down")] public bool Down { get; set; }
 }
 
@@ -167,7 +175,8 @@ public static class OutgoingMessages
     public static object GamepadRumble(int controllerId, byte largeMotor, byte smallMotor) =>
         new { type = "GAMEPAD_RUMBLE", controllerId, largeMotor, smallMotor };
 
-    public static object InputStarted() => new { type = "INPUT_STARTED", mouse = true };
+    public static object InputStarted(bool mouse, bool keyboard) =>
+        new { type = "INPUT_STARTED", mouse, keyboard };
 
     public static object InputUnavailable(string message) =>
         new { type = "INPUT_UNAVAILABLE", message };

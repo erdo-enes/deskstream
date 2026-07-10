@@ -4,7 +4,6 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
-import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.KeyEvent
@@ -22,6 +21,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.deskstream.client.R
 import com.deskstream.client.audio.AudioPlaybackState
 import com.deskstream.client.audio.AudioReceiver
 import com.deskstream.client.audio.AudioStats
@@ -69,6 +69,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var audioMuted = false
     private var audioNegotiationJob: Job? = null
     private var inputNegotiationJob: Job? = null
+    private var mouseHintJob: Job? = null
     private var stallRecoveryInProgress = false
     private var streamStartFailed = false
     private var audioStatus = "starting"
@@ -88,7 +89,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var gamepadInventory = GamepadInventory(0, 0, emptyList())
     private var gamepadStatus = "none detected"
     private var gamepadDetail = "Connect a Bluetooth or USB controller to Android"
-    private var lastBackPressedAt = 0L
+    private var exitSnackbar: Snackbar? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -99,7 +100,10 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         remoteMouse = RemoteMouseController(
             binding.surfaceView,
             sendMotion = { packet -> mediaReceiver?.sendMousePacket(packet) },
-            onModeChanged = { updatePointerButton(it) }
+            onModeChanged = {
+                updatePointerButton(it)
+                showMouseGestureHint()
+            }
         )
         createWifiLock()
         applyImmersiveMode()
@@ -116,11 +120,12 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             renderDiagnostics()
         }
         binding.btnPointerMode.setOnClickListener {
-            updatePointerButton(remoteMouse.toggleMode())
+            remoteMouse.toggleMode()
         }
         binding.btnMouseToggle.setOnClickListener {
             mouseEnabledByUser = !mouseEnabledByUser
             applyMouseControls()
+            if (mouseEnabledByUser) showMouseGestureHint()
         }
         binding.btnMouseClick.setOnClickListener { remoteMouse.clickLeft() }
         binding.btnMouseClick.setOnLongClickListener {
@@ -135,19 +140,18 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                val now = SystemClock.elapsedRealtime()
-                if (lastBackPressedAt != 0L && now - lastBackPressedAt <= EXIT_CONFIRM_WINDOW_MS) {
-                    lastBackPressedAt = 0L
+                // Android's edge-back gesture can be triggered while using the touchpad.
+                // Leaving therefore requires an explicit action, never another gesture.
+                if (exitSnackbar?.isShown == true) return
+                exitSnackbar = Snackbar.make(
+                    binding.streamRoot,
+                    getString(R.string.leave_stream_prompt),
+                    Snackbar.LENGTH_LONG
+                ).setAction(R.string.leave_stream_action) {
                     ControlClient.stopStream()
                     finish()
-                } else {
-                    lastBackPressedAt = now
-                    Snackbar.make(
-                        binding.streamRoot,
-                        "Back again to leave the stream",
-                        Snackbar.LENGTH_SHORT
-                    ).show()
                 }
+                exitSnackbar?.show()
             }
         })
 
@@ -177,6 +181,9 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        exitSnackbar?.dismiss()
+        exitSnackbar = null
+        hideMouseGestureHint()
         super.onDestroy()
         gamepadForwarder.stop()
         stopReceivers()
@@ -436,6 +443,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         inputNegotiationJob = null
         mouseStatus = "live"
         applyMouseControls()
+        showMouseGestureHint()
         renderDiagnostics()
     }
 
@@ -449,9 +457,22 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     private fun updatePointerButton(mode: MouseMode) {
         binding.btnPointerMode.text = when (mouseStatus) {
-            "negotiating" -> "Mode: …"
-            "unavailable" -> "No mouse"
-            else -> if (mode == MouseMode.TOUCHPAD) "Mode: Pad" else "Mode: Direct"
+            "negotiating" -> getString(R.string.mouse_mode_starting)
+            "unavailable" -> getString(R.string.mouse_mode_unavailable)
+            else -> if (mode == MouseMode.TOUCHPAD) {
+                getString(R.string.mouse_mode_pad)
+            } else {
+                getString(R.string.mouse_mode_direct)
+            }
+        }
+        binding.btnPointerMode.contentDescription = when (mouseStatus) {
+            "negotiating" -> getString(R.string.mouse_mode_starting_description)
+            "unavailable" -> getString(R.string.mouse_unavailable_description)
+            else -> if (mode == MouseMode.TOUCHPAD) {
+                getString(R.string.mouse_mode_pad_description)
+            } else {
+                getString(R.string.mouse_mode_direct_description)
+            }
         }
     }
 
@@ -460,21 +481,62 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         val active = negotiated && mouseEnabledByUser
         remoteMouse.setEnabled(active)
         binding.btnMouseToggle.isEnabled = negotiated
-        binding.btnMouseToggle.text = if (mouseEnabledByUser) "Mouse: On" else "Mouse: Off"
+        binding.btnMouseToggle.text = if (mouseEnabledByUser) {
+            getString(R.string.mouse_toggle_on)
+        } else {
+            getString(R.string.mouse_toggle_off)
+        }
+        binding.btnMouseToggle.contentDescription = if (mouseEnabledByUser) {
+            getString(R.string.mouse_disable_description)
+        } else {
+            getString(R.string.mouse_enable_description)
+        }
         binding.btnPointerMode.isEnabled = active
         binding.btnMouseClick.isEnabled = active
-        binding.tvRemoteCursor.visibility = if (active) View.VISIBLE else View.GONE
+        // Do not flash an unpositioned cursor in the top-left corner. It becomes visible
+        // only after feedback arrives for the first motion packet.
+        if (!active) binding.tvRemoteCursor.visibility = View.GONE
+        if (!active) hideMouseGestureHint()
         updatePointerButton(remoteMouse.currentMode())
     }
 
     private fun updateRemoteCursor(position: CursorPosition) {
-        if (mouseStatus != "live") return
+        if (mouseStatus != "live" || !mouseEnabledByUser) return
         val surface = binding.surfaceView
         val cursor = binding.tvRemoteCursor
         if (surface.width <= 0 || surface.height <= 0) return
-        cursor.translationX = surface.x + position.x / 65535f * surface.width - cursor.width * 0.25f
-        cursor.translationY = surface.y + position.y / 65535f * surface.height - cursor.height * 0.25f
+        // The vector's top-left point is its hotspot, so no size-based centering offset is
+        // needed. Use width/height - 1 to mirror the absolute-input normalization exactly.
+        cursor.translationX = surface.x + position.x / 65535f * (surface.width - 1)
+        cursor.translationY = surface.y + position.y / 65535f * (surface.height - 1)
         cursor.visibility = View.VISIBLE
+    }
+
+    private fun showMouseGestureHint() {
+        if (mouseStatus != "live" || !mouseEnabledByUser) return
+        mouseHintJob?.cancel()
+        binding.tvGestureHint.animate().cancel()
+        binding.tvGestureHint.alpha = 1f
+        binding.tvGestureHint.visibility = View.VISIBLE
+        mouseHintJob = lifecycleScope.launch {
+            delay(MOUSE_HINT_VISIBLE_MS)
+            binding.tvGestureHint.animate()
+                .alpha(0f)
+                .setDuration(MOUSE_HINT_FADE_MS)
+                .withEndAction {
+                    binding.tvGestureHint.visibility = View.GONE
+                    binding.tvGestureHint.alpha = 1f
+                }
+                .start()
+        }
+    }
+
+    private fun hideMouseGestureHint() {
+        mouseHintJob?.cancel()
+        mouseHintJob = null
+        binding.tvGestureHint.animate().cancel()
+        binding.tvGestureHint.alpha = 1f
+        binding.tvGestureHint.visibility = View.GONE
     }
 
     private fun restartStalledStream() {
@@ -484,6 +546,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         stallRecoveryInProgress = true
         showCenterStatus("Video stalled\nRecovering stream…")
         remoteMouse.setEnabled(false)
+        hideMouseGestureHint()
         streamRequested = false
         // Wait for STREAM_STOPPED/READY before requesting the replacement pipeline. This
         // preserves STOP_STREAM -> START_STREAM ordering on the control connection.
@@ -498,7 +561,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private fun toggleDiagnostics() {
         statsVisible = !statsVisible
         binding.tvStats.visibility = if (statsVisible) View.VISIBLE else View.GONE
-        binding.tvGestureHint.visibility = View.GONE
+        hideMouseGestureHint()
         renderDiagnostics()
     }
 
@@ -636,6 +699,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         audioNegotiationJob = null
         inputNegotiationJob?.cancel()
         inputNegotiationJob = null
+        hideMouseGestureHint()
         remoteMouse.setEnabled(false)
         binding.btnMouseToggle.isEnabled = false
         binding.btnPointerMode.isEnabled = false
@@ -789,7 +853,8 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         private const val TAG = "StreamActivity"
         private const val MAX_BITRATE_KBPS = 20000
         private const val TARGET_FPS = 60
-        private const val EXIT_CONFIRM_WINDOW_MS = 2000L
+        private const val MOUSE_HINT_VISIBLE_MS = 4500L
+        private const val MOUSE_HINT_FADE_MS = 250L
         private const val AUDIO_NEGOTIATION_TIMEOUT_MS = 3500L
         private const val INPUT_NEGOTIATION_TIMEOUT_MS = 2500L
     }

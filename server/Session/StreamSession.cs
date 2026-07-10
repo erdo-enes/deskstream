@@ -53,6 +53,7 @@ public sealed class StreamSession : IDisposable
     private SystemAudioCapture? _audioCapture;
     private VirtualGamepadManager? _gamepads;
     private RemoteMouseManager? _mouse;
+    private RemoteKeyboardManager? _keyboard;
     private DesktopDuplicator? _duplicator;
     private Nv12Converter? _converter;
     private IVideoEncoder? _encoder;
@@ -132,7 +133,9 @@ public sealed class StreamSession : IDisposable
             case "INPUT_START": OnInputStart(payload); break;
             case "MOUSE_BUTTON": OnMouseButton(payload); break;
             case "MOUSE_RESET": _mouse?.Reset(); break;
-            case "INPUT_STOP": StopMouse(); break;
+            case "KEYBOARD_KEY": OnKeyboardKey(payload); break;
+            case "KEYBOARD_RESET": _keyboard?.Reset(); break;
+            case "INPUT_STOP": StopInput(); break;
             case "STOP_STREAM": OnStopStream(); break;
             case "REQUEST_IDR": OnRequestIdr(); break;
             case "STATS": OnStats(payload); break;
@@ -379,7 +382,9 @@ public sealed class StreamSession : IDisposable
             return;
 
         var request = Json.Deserialize<InputStartMessage>(payload);
-        if (request?.Mouse != true)
+        bool mouseRequested = request?.Mouse == true;
+        bool keyboardRequested = request?.Keyboard == true;
+        if (!mouseRequested && !keyboardRequested)
         {
             _send(OutgoingMessages.InputUnavailable("The client did not request a supported input device"));
             return;
@@ -387,31 +392,76 @@ public sealed class StreamSession : IDisposable
 
         try
         {
-            _mouse ??= new RemoteMouseManager();
-            _send(OutgoingMessages.InputStarted());
-            Console.WriteLine("[input] authenticated remote mouse enabled.");
+            if (mouseRequested)
+                _mouse ??= new RemoteMouseManager();
+            else
+                StopMouse();
+
+            if (keyboardRequested)
+                _keyboard ??= new RemoteKeyboardManager();
+            else
+                StopKeyboard();
+
+            // Capture-fault cleanup runs off the control thread. If it won the race after
+            // the initial state check, discard anything this request just created rather
+            // than leaving an input manager alive after the stream ended.
+            if (_state != SessionState.Streaming || !_streaming)
+            {
+                StopInput();
+                return;
+            }
+
+            _send(OutgoingMessages.InputStarted(mouseRequested, keyboardRequested));
+            string capabilities = mouseRequested && keyboardRequested
+                ? "mouse and keyboard"
+                : mouseRequested ? "mouse" : "keyboard";
+            Console.WriteLine($"[input] authenticated remote {capabilities} enabled.");
         }
         catch (Exception ex)
         {
-            StopMouse();
+            StopInput();
             _send(OutgoingMessages.InputUnavailable(ex.Message));
         }
     }
 
     private void OnMouseButton(ReadOnlySpan<byte> payload)
     {
-        if (_state != SessionState.Streaming || _mouse == null)
+        if (_state != SessionState.Streaming || !_streaming)
+            return;
+        var mouse = Volatile.Read(ref _mouse);
+        if (mouse == null)
             return;
         var message = Json.Deserialize<MouseButtonMessage>(payload);
         if (message == null)
             return;
         try
         {
-            _mouse.SetButton(message.Sequence, message.Button, message.Down);
+            mouse.SetButton(message.Sequence, message.Button, message.Down);
         }
         catch (Exception ex)
         {
-            StopMouse();
+            StopInput();
+            _send(OutgoingMessages.InputUnavailable(ex.Message));
+        }
+    }
+
+    private void OnKeyboardKey(ReadOnlySpan<byte> payload)
+    {
+        if (_state != SessionState.Streaming || !_streaming)
+            return;
+        var keyboard = Volatile.Read(ref _keyboard);
+        if (keyboard == null)
+            return;
+        var message = Json.Deserialize<KeyboardKeyMessage>(payload);
+        if (message == null)
+            return;
+        try
+        {
+            keyboard.SetKey(message.Sequence, message.Usage, message.Down);
+        }
+        catch (Exception ex)
+        {
+            StopInput();
             _send(OutgoingMessages.InputUnavailable(ex.Message));
         }
     }
@@ -576,15 +626,20 @@ public sealed class StreamSession : IDisposable
 
     private void OnMouseMotion(MouseMotion motion)
     {
+        if (!_streaming)
+            return;
+        var mouse = Volatile.Read(ref _mouse);
+        if (mouse == null)
+            return;
         try
         {
-            CursorPosition? position = _mouse?.Apply(motion);
+            CursorPosition? position = mouse.Apply(motion);
             if (position.HasValue)
                 _sender?.SendCursorPosition(motion.Sequence, position.Value);
         }
         catch (Exception ex)
         {
-            StopMouse();
+            StopInput();
             _send(OutgoingMessages.InputUnavailable(ex.Message));
         }
     }
@@ -599,7 +654,7 @@ public sealed class StreamSession : IDisposable
     private void StopPipeline()
     {
         _streaming = false;
-        StopMouse();
+        StopInput();
         StopGamepads();
         StopAudio();
         try { _captureCts?.Cancel(); } catch { }
@@ -648,8 +703,20 @@ public sealed class StreamSession : IDisposable
 
     private void StopMouse()
     {
-        try { _mouse?.Dispose(); } catch { }
-        _mouse = null;
+        var mouse = Interlocked.Exchange(ref _mouse, null);
+        try { mouse?.Dispose(); } catch { }
+    }
+
+    private void StopKeyboard()
+    {
+        var keyboard = Interlocked.Exchange(ref _keyboard, null);
+        try { keyboard?.Dispose(); } catch { }
+    }
+
+    private void StopInput()
+    {
+        StopMouse();
+        StopKeyboard();
     }
 
     // ---- Adaptation controller (PROTOCOL.md §4) -------------------------------------------

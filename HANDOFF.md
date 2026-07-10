@@ -7,7 +7,7 @@ implemented yet, and where the extension points are. Read `docs/ARCHITECTURE.md`
 
 ## Project summary
 
-Low-latency Windows → Android screen streamer over LAN WiFi. No cloud, no accounts.
+Low-latency Windows → Android/macOS screen streamer over LAN WiFi. No cloud, no accounts.
 Target: <50 ms glass-to-glass at 1080p60.
 
 - `server/` — C#/.NET 8 (`net8.0-windows`) console app. DXGI Desktop Duplication →
@@ -22,19 +22,23 @@ Target: <50 ms glass-to-glass at 1080p60.
   PCM receiver feeding an adaptively-sized low-latency `AudioTrack` + up to four physical
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
+- `macos/` — native Objective-C/AppKit Apple-silicon client (macOS 13+). It implements
+  discovery, Keychain pairing, reconnect/watchdog behavior, max-two-frame XOR-FEC assembly,
+  immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
+  physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.3.6 released)
+## Current state (v0.4.0 release candidate; v0.3.6 published)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public). `v0.3.6` is the latest published
-  release (tag `v0.3.6`, APK + win-x64 server zip attached). It fixes the real-device crash
-  on first mouse motion: Android had called
-  `DatagramSocket.send()` directly from the UI-thread touch callback. Mouse and gamepad UDP
-  now pass through one bounded IO sender. It also makes single-tap movement-only, double-tap
-  left-click, double-tap-drag intentional drag, and requires Back twice to exit the stream.
-- **Both sides compile clean with audio, gamepad, mouse, telemetry, and recovery support.**
+  release (tag `v0.3.6`, APK + win-x64 server zip attached). The local v0.4.0 candidate adds
+  the first native arm64 macOS client, backward-compatible physical-keyboard negotiation and
+  Windows scan-code injection, plus a second Android mouse-UX pass (small vector cursor,
+  density-normalized movement, compact toolbar, explicit Leave action, final-motion flush).
+- **All three targets compile clean with audio, gamepad, mouse, telemetry, and recovery.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
-  `assembleRelease lintRelease`: successful with JDK 17. The verified v0.3.6 artifacts are
-  attached to the GitHub release.
+  `assembleRelease lintRelease`: successful with JDK 17. macOS `make test` passes protocol,
+  FEC and real loopback UDP/TCP tests; `make app` produces a strictly verified, ad-hoc-signed
+  thin arm64 `DeskStream.app` with `-Wall -Wextra -Werror`.
 - **Real hardware testing is in progress** on Windows plus a Samsung SM-S911B. The supplied
   server logs proved the UDP endpoint and media sender were active, then the TCP control
   socket vanished as soon as touch input began. Static analysis found the matching uncaught
@@ -62,6 +66,10 @@ Target: <50 ms glass-to-glass at 1080p60.
   9. `SendInput` mouse behavior in games, Windows scaling/multi-monitor setups, and UIPI.
      Absolute input intentionally maps the captured primary display only; elevated games
      require the server to run at the same integrity level.
+  10. The new macOS H.264/audio/input paths have compile/static-analysis/loopback coverage but
+      still need a physical Windows-server end-to-end session. Public Mac distribution also
+      needs a Developer ID Application certificate and Apple notarization; local builds are
+      deliberately ad-hoc signed.
 
 ## Feature status
 
@@ -74,9 +82,10 @@ Target: <50 ms glass-to-glass at 1080p60.
 | Reconnect state machine (background/foreground, socket death) | ✅ implemented |
 | Stats overlay on client, 1 Hz stats line on server | ✅ implemented |
 | **Touch → PC mouse** | ✅ movement-only tap, double-tap click/drag, right-click/scroll, safe reset |
-| **Keyboard forwarding** | ❌ NOT implemented |
-| **Game controller / gamepad forwarding** | ✅ implemented (1–4 physical Android pads → Xbox 360 + rumble) |
+| **Keyboard forwarding** | ✅ macOS foreground keyboard → Windows scan codes; fail-safe reset |
+| **Game controller / gamepad forwarding** | ✅ 1–4 Android/macOS pads → Xbox 360 + rumble |
 | **Audio streaming** | ✅ implemented, compile-verified; hardware test pending |
+| **Native Apple-silicon macOS client** | ✅ implemented; arm64 build/tests pass, hardware E2E pending |
 | Encryption (TLS control / AES-GCM media) | ❌ NOT implemented (LAN plaintext) |
 | mDNS advertisement, QR pairing | ❌ NOT implemented |
 | Framerate/resolution adaptation steps | ❌ NOT implemented (bitrate ladder only) |
@@ -87,14 +96,15 @@ Target: <50 ms glass-to-glass at 1080p60.
 - Android `RemoteMouseController` offers relative touchpad and absolute direct modes.
   A single finger moves without clicking, double-tap clicks, double-tap-drag drags, and
   two-finger gestures cover right-click and wheel scrolling; motion is coalesced to 120 Hz
-  and uses unbuffered dispatch. The first Android Back/edge-Back only asks for confirmation.
+  and uses unbuffered dispatch. Back/edge-Back only shows an explicit `LEAVE` action.
 - High-rate `DSMI` motion and `DSMC` authoritative cursor feedback share the learned media
   UDP endpoint. A bounded IO sender prevents touch callbacks from doing network operations
   on Android's main thread; ordered button transitions use a FIFO TCP writer. The server
   ignores UDP input until the authenticated session negotiates `INPUT_STARTED`.
 - Windows `RemoteMouseManager` injects through `SendInput`, rejects stale sequences, tracks
   held buttons, and releases everything on reset, input stop, stream stop, or disconnect.
-- Keyboard forwarding and on-screen virtual gamepad controls remain unimplemented.
+- On-screen virtual gamepad controls remain unimplemented. Physical macOS keyboard positions
+  use ordered TCP and the server converts USB-HID usages to Windows scan codes.
 
 ## Latency and long-session work added for v0.3.0
 
@@ -154,6 +164,8 @@ Target: <50 ms glass-to-glass at 1080p60.
 - Android: `cd android && ./gradlew assembleRelease` (needs Android SDK 34; on this Mac:
   SDK at `~/Library/Android/sdk`, JDK 17 at `/opt/homebrew/opt/openjdk@17`,
   `local.properties` already points at the SDK). Release build is debug-signed on purpose.
+- macOS: `cd macos && make test && make app`. Output is
+  `macos/build/DeskStream.app`, thin arm64, macOS 13+, ad-hoc signed for local testing.
 - Run on Windows: `DeskStreamer.Server.exe` prints IPs/ports/PIN; firewall must allow
   TCP 47801, UDP 47800/47802/47803 (private profile).
 

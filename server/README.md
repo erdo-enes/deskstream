@@ -6,6 +6,8 @@ encodes H.264 through the Windows Media Foundation hardware path (with an option
 NVIDIA NVENC experimental backend), and streams per
 [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md). It also captures the default Windows playback
 device through WASAPI loopback and streams normalized 48 kHz stereo PCM in fixed 5 ms blocks.
+Authenticated clients can also forward mouse, physical keyboard, and game-controller input
+to the interactive Windows desktop.
 
 ## Requirements
 
@@ -76,6 +78,7 @@ See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md). Source layout:
 | `Net/AudioSender.cs` | `DSAH` address learning + fixed 5 ms audio packetizer/UDP send |
 | `Input/VirtualGamepadManager.cs` | Up to four ViGEm-backed virtual Xbox 360 controllers |
 | `Input/RemoteMouseManager.cs` | Authenticated `SendInput` mouse motion/buttons with safe reset |
+| `Input/RemoteKeyboardManager.cs` | Ordered USB HID keyboard usages → `SendInput` scan codes with safe reset |
 | `Session/StreamSession.cs` | Control state machine + adaptation controller (§4) |
 | `Session/PairingManager.cs` | TOFU PIN pairing, `paired_clients.json` persistence |
 | `Protocol/*.cs` | Wire DTOs and big-endian media header helpers |
@@ -88,4 +91,5 @@ See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md). Source layout:
 - `EnableWindowsTargeting` is set so the project compiles on non-Windows CI, but it only
   **runs** on Windows.
 - Windows UIPI blocks a normal process from injecting into an elevated game. Run the server
-  at the same integrity level as the target app when remote mouse input is needed there.
+  at the same integrity level as the target app when remote mouse or keyboard input is needed
+  there.

@@ -97,9 +97,11 @@ Client → server:
 {"type":"AUDIO_READY","port":53125}
 {"type":"GAMEPAD_START","controllers":1}
 {"type":"GAMEPAD_STOP"}
-{"type":"INPUT_START","mouse":true}
+{"type":"INPUT_START","mouse":true,"keyboard":true}
 {"type":"MOUSE_BUTTON","sequence":7,"button":"left","down":true}
 {"type":"MOUSE_RESET"}
+{"type":"KEYBOARD_KEY","sequence":12,"usage":4,"down":true}
+{"type":"KEYBOARD_RESET"}
 {"type":"INPUT_STOP"}
 {"type":"STOP_STREAM"}
 {"type":"REQUEST_IDR"}
@@ -115,7 +117,7 @@ Server → client:
 {"type":"GAMEPAD_STARTED","controllers":1,"controllerType":"xbox360"}
 {"type":"GAMEPAD_UNAVAILABLE","message":"ViGEmBus is not installed","driverUrl":"https://github.com/nefarius/ViGEmBus/releases/latest"}
 {"type":"GAMEPAD_RUMBLE","controllerId":0,"largeMotor":255,"smallMotor":128}
-{"type":"INPUT_STARTED","mouse":true}
+{"type":"INPUT_STARTED","mouse":true,"keyboard":true}
 {"type":"INPUT_UNAVAILABLE","message":"Windows input injection is unavailable"}
 {"type":"STREAM_STOPPED"}
 {"type":"BITRATE","kbps":14000}
@@ -161,13 +163,47 @@ client should stop vibration when both values are zero.
 `STATS` is sent every 1 s during streaming. `REQUEST_IDR` is sent whenever a frame is
 dropped as unrecoverable; server rate-limits IDR generation to at most one per 300 ms.
 
-Mouse input is opt-in and backward-compatible. After `STREAM_STARTED`, the client sends
-`INPUT_START`; the server replies `INPUT_STARTED` or `INPUT_UNAVAILABLE`. High-rate motion
-uses §3C UDP packets. Ordered button transitions use `MOUSE_BUTTON` on TCP. Supported button
-names are `left`, `right`, `middle`, `back`, and `forward`. Duplicate/stale button sequences
-are ignored. `MOUSE_RESET`, `INPUT_STOP`, `STOP_STREAM`, socket death, or session disposal
-releases every injected button so input can never remain stuck. Input is accepted only for
-the authenticated, actively-streaming session.
+Remote input is opt-in and backward-compatible. After `STREAM_STARTED`, the client sends
+`INPUT_START` with the devices it wants. Missing `mouse` or `keyboard` members mean `false`,
+so an older Android client that sends only `{"mouse":true}` continues to work unchanged.
+The server replies with `INPUT_STARTED`; its booleans are the capabilities that are active
+for this session. A client MUST treat a missing response member as `false`. A request with no
+supported device produces `INPUT_UNAVAILABLE`.
+
+High-rate mouse motion uses §3C UDP packets. Ordered button transitions use `MOUSE_BUTTON`
+on TCP. Supported button names are `left`, `right`, `middle`, `back`, and `forward`.
+Duplicate/stale button sequences are ignored. `MOUSE_RESET` releases mouse buttons only.
+
+Keyboard transitions use the ordered TCP messages in §2.4. `KEYBOARD_RESET` releases
+keyboard keys only. `INPUT_STOP`, `STOP_STREAM`, socket death, or session disposal attempts
+to release all injected mouse buttons and keyboard keys. Input is accepted only for the
+authenticated, actively-streaming session.
+
+### 2.4 Keyboard input
+
+`KEYBOARD_KEY.usage` is an unsigned usage ID from the USB HID Usage Tables **Keyboard/Keypad
+page (0x07)**. It describes the physical key position, not a Unicode character; for example,
+usage `4` (`0x04`) is the Keyboard A position. The Windows host applies the position through
+`SendInput` scan codes, so the host's active keyboard layout determines the resulting text.
+Pause and the keyboard-page mute/volume usages are Windows-specific exceptions sent by
+virtual-key value because they do not have a single official Set 1 scan-code translation.
+
+The server supports the standard desktop keyboard/keypad set (`0x04..0x73`), the keyboard
+page mute/volume keys (`0x7f..0x81`), and left/right modifiers (`0xe0..0xe7`). Unknown,
+reserved, or error usages MUST be ignored without closing the session. The standard set
+includes letters, number row, punctuation, Enter/Escape/Backspace/Tab, Caps Lock, F1..F24,
+Print Screen/Scroll Lock/Pause, navigation, arrows, the numeric keypad, Application, and
+Power where Windows exposes a corresponding scan code.
+
+`sequence` is a per-keyboard uint32 counter. The server uses wrap-safe ordering and ignores
+duplicate or stale values. A repeated `down:true` for an already-held usage and a repeated
+`down:false` for an already-released usage are idempotent; clients SHOULD send physical
+transitions rather than OS key-repeat events. A client MUST send `KEYBOARD_RESET` when its
+stream view loses focus or keyboard capture is released. The server independently performs
+the same reset on every input/session teardown path. If Windows temporarily rejects a live
+reset, the server retains the unreleased key state and retries before accepting more keyboard
+input. Final process/session teardown remains best-effort because Windows can reject all
+injection across integrity-level or desktop boundaries.
 
 ## 3. Media channel (UDP, server → client)
 

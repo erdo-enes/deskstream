@@ -1,8 +1,8 @@
 # DeskStream
 
-Low-latency Windows → Android screen streaming over LAN WiFi. No cloud, no account,
-no virtual display drivers — the PC mirrors its screen to your phone/tablet at
-1080p60 with a target glass-to-glass latency under 50 ms.
+Low-latency Windows → Android and Apple-silicon macOS screen streaming over LAN WiFi.
+No cloud, no account, no virtual display drivers — the PC mirrors its screen to your
+phone, tablet, or Mac at 1080p60 with a target glass-to-glass latency under 50 ms.
 
 Built by studying what breaks in Sunshine/Moonlight, Parsec, spacedesk, Steam Link,
 Miracast, and Chromecast, and designing those failure modes out. See
@@ -18,6 +18,9 @@ Miracast, and Chromecast, and designing those failure modes out. See
   async low-latency decode → SurfaceView; PCM audio → low-latency AudioTrack. No network
   jitter buffer. Touch controls the PC mouse, while Bluetooth/USB gamepads forward as
   virtual Xbox 360 controllers on the PC.
+- `macos/` — native AppKit client for Apple silicon (macOS 13+). Hardware H.264 display,
+  bounded PCM playback, Keychain pairing, LAN discovery, reconnect/stall recovery, and
+  foreground mouse, full physical-keyboard, and up-to-four-gamepad forwarding with rumble.
 - `docs/` — architecture and normative protocol spec.
 
 ## Quick start
@@ -36,6 +39,12 @@ Miracast, and Chromecast, and designing those failure modes out. See
 3. Your PC appears in the list — tap it, type the 6-digit PIN shown in the PC console
    once. After that it auto-connects.
 
+**macOS (13+, Apple silicon):**
+1. `cd macos && make app` using Apple's Command Line Tools.
+2. Open `build/DeskStream.app`; select the discovered PC or enter its LAN address.
+3. Pair once with the server PIN. Click the video for direct pointer control, or choose
+   **Capture Input** for relative game input. `Control-Option-Escape` releases capture.
+
 ## Why it's fast
 
 - Present-driven GPU capture; the frame never touches the CPU before the encoder.
@@ -53,6 +62,9 @@ Miracast, and Chromecast, and designing those failure modes out. See
   appear to Windows games as Xbox 360 controllers, and receive rumble feedback.
 - Android touch offers touchpad and direct-pointer modes. Motion/scroll use newest-wins UDP;
   ordered mouse buttons use the authenticated TCP control channel and are released on stop.
+- The native macOS client displays H.264 immediately through AVFoundation's hardware path,
+  forwards window-focused USB-HID keyboard positions as Windows scan codes, and reuses the
+  same authenticated mouse/gamepad transports without system-wide input permissions.
 - Clock-synchronized p95 pipeline telemetry, a media heartbeat, UDP re-punching, bounded
   pools/queues, and automatic stream restart keep long sessions from accumulating delay.
 - Closed-loop bitrate adaptation so WiFi congestion degrades quality, not latency.
