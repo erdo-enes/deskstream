@@ -61,6 +61,19 @@ public sealed class DesktopDuplicator : IDisposable
         Device = device;
         Context = context;
 
+        // Request high GPU thread priority to avoid capture/encode starvation under 100% GPU game load.
+        using (var dxgiDevice = Device.QueryInterface<IDXGIDevice>())
+        {
+            try
+            {
+                dxgiDevice.GPUThreadPriority = 5;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[capture] failed to set DXGI GPU priority: {ex.Message}");
+            }
+        }
+
         // Media Foundation and the video pipeline touch this device from multiple threads.
         using (var mt = Device.QueryInterface<ID3D11Multithread>())
             mt.SetMultithreadProtected(true);

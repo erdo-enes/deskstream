@@ -624,6 +624,7 @@ public sealed class StreamSession : IDisposable
         {
             IsBackground = true,
             Name = "capture",
+            Priority = ThreadPriority.Highest,
         };
         _streaming = true;
         _captureThread.Start();
@@ -910,6 +911,11 @@ public sealed class StreamSession : IDisposable
             return;
 
         LastClientFramesDropped = s.FramesDropped;
+
+        // Skip adaptation during the first 5 seconds to avoid startup transient triggers.
+        if (_clock == null || _clock.ElapsedMilliseconds < 5000)
+            return;
+
         int total = s.FramesOk + s.FramesDropped;
         double dropRate = total > 0 ? (double)s.FramesDropped / total : 0.0;
 
@@ -977,6 +983,10 @@ public sealed class StreamSession : IDisposable
             _currentBitrateKbps = kbps;
             _send(OutgoingMessages.Bitrate(kbps));
             AsyncLogger.Info($"[encoder] Bitrate reconfigured successfully to {kbps} kbps");
+
+            // Reset the best-latency baselines when the bitrate changes
+            _bestCaptureToReceiveMs = int.MaxValue;
+            _bestDecodeToSurfaceMs = int.MaxValue;
         }
         catch (Exception ex)
         {
