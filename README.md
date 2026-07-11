@@ -21,6 +21,7 @@ Miracast, and Chromecast, and designing those failure modes out. See
 - `macos/` — native AppKit client for Apple silicon (macOS 13+). Hardware H.264 display,
   bounded PCM playback, Keychain pairing, LAN discovery, reconnect/stall recovery, and
   foreground mouse, full physical-keyboard, and up-to-four-gamepad forwarding with rumble.
+- `switch/` — Nintendo Switch homebrew client (C++, SDL2, libnx). UDP receive + FEC -> FFmpeg low-latency H.264 software decode -> SDL2 YUV Texture; PCM audio -> low-latency SDL2 Queued Audio; Joy-Con / Pro Controllers are mapped and forwarded as virtual Xbox 360 controllers.
 - `docs/` — architecture and normative protocol spec.
 
 ## Quick start
@@ -56,6 +57,13 @@ Miracast, and Chromecast, and designing those failure modes out. See
 2. Open `build/DeskStream.app`; select the discovered PC or enter its LAN address.
 3. Pair once with the server PIN. Click the video for direct pointer control, or choose
    **Capture Input** for relative game input. `Control-Option-Escape` releases capture.
+
+**Nintendo Switch (Homebrew-enabled console):**
+1. Make sure you have the official `devkitPro` toolchain and the `switch-dev` packages installed.
+2. `cd switch && make` to compile the app.
+3. Copy `DeskStream.nro` to the `/switch/DeskStream/` folder on your SD card.
+4. Launch the Switch homebrew menu, start the DeskStream client, and select/pair your server.
+
 
 ## Why it's fast
 
