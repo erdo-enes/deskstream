@@ -273,14 +273,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         surfaceReady = true
         frameRendered = false
         videoDecoder?.release()
-        videoDecoder = VideoDecoder(
-            onDropOrError = { mediaReceiver?.notifyExternalDrop() },
-            onBufferRelease = { buf -> mediaReceiver?.bufferPool?.release(buf) },
-            onFrameRendered = { latencyMs ->
-                frameRendered = true
-                mediaReceiver?.recordDecoderSurfaceLatency(latencyMs)
-            }
-        )
+        videoDecoder = null
         maybeStartStream()
     }
 
@@ -428,19 +421,40 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         applyAspectRatio(msg.width, msg.height)
         updateStatusChip()
 
-        val decoder = videoDecoder
         val holder = binding.surfaceView.holder
-        if (decoder == null || holder.surface == null || !holder.surface.isValid) {
-            // Surface went away in the tiny window between us requesting the stream and the
-            // server answering; the next surfaceCreated -> maybeStartStream cycle recovers.
+        if (holder.surface == null || !holder.surface.isValid) {
+            // The server has already entered STREAMING, while maybeStartStream only sends from
+            // READY. Explicitly stop this receiver-less epoch so STREAM_STOPPED -> READY and a
+            // later surfaceCreated can negotiate a fresh stream instead of staying black.
+            streamRequested = false
+            ControlClient.stopStream()
             return
         }
 
         // Always release + recreate on STREAM_STARTED: dimensions may differ, and frameId
         // numbering restarts server-side even if they don't (protocol §5).
-        mediaReceiver?.stop()
+        stopReceivers()
         frameRendered = false
-        decoder.resetForNewStream(holder.surface, msg.width, msg.height)
+
+        // Bind every callback to this exact stream epoch. A stale codec/receiver callback from
+        // a prior restart can then only return its own buffer; it cannot poison the new epoch's
+        // telemetry or force the new assembler back into IDR recovery.
+        lateinit var receiver: MediaReceiver
+        lateinit var decoder: VideoDecoder
+        decoder = VideoDecoder(
+            onDropOrError = {
+                if (mediaReceiver === receiver && videoDecoder === decoder) {
+                    receiver.notifyExternalDrop()
+                }
+            },
+            onBufferRelease = { buffer -> receiver.bufferPool.release(buffer) },
+            onFrameRendered = { latencyMs ->
+                if (mediaReceiver === receiver && videoDecoder === decoder) {
+                    frameRendered = true
+                    receiver.recordDecodedFrame(latencyMs)
+                }
+            }
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
                 holder.surface.setFrameRate(
@@ -451,18 +465,44 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
 
         var mediaStartupError = "Media socket could not start"
-        val receiver = MediaReceiver(
+        receiver = MediaReceiver(
             onFrame = { data, length, keyframe, frameId, _ ->
-                decoder.submitFrame(data, length, keyframe, frameId)
+                if (mediaReceiver === receiver && videoDecoder === decoder) {
+                    decoder.submitFrame(data, length, keyframe, frameId)
+                } else {
+                    receiver.bufferPool.release(data)
+                }
             },
-            onStats = { stats -> runOnUiThread { updateStatsOverlay(stats) } },
-            onStalled = { runOnUiThread { restartStalledStream() } },
-            onCursorPosition = { position -> runOnUiThread { updateRemoteCursor(position) } },
+            onStats = { stats ->
+                runOnUiThread {
+                    if (mediaReceiver === receiver && videoDecoder === decoder) {
+                        updateStatsOverlay(stats)
+                    }
+                }
+            },
+            onStalled = {
+                runOnUiThread {
+                    if (mediaReceiver === receiver && videoDecoder === decoder) {
+                        restartStalledStream()
+                    }
+                }
+            },
+            onCursorPosition = { position ->
+                runOnUiThread {
+                    if (mediaReceiver === receiver && videoDecoder === decoder) {
+                        updateRemoteCursor(position)
+                    }
+                }
+            },
             onStartupError = { detail -> mediaStartupError = detail }
         )
         mediaReceiver = receiver
+        videoDecoder = decoder
+        decoder.resetForNewStream(holder.surface, msg.width, msg.height, msg.fps)
         if (!receiver.start(ControlClient.serverIp, msg.mediaPort, msg.clockBaseUs)) {
             mediaReceiver = null
+            videoDecoder = null
+            decoder.release()
             streamStartFailed = true
             streamRequested = true
             showCenterStatus("Client media setup failed: $mediaStartupError")
@@ -937,8 +977,12 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         binding.btnMouseClick.isEnabled = false
         binding.btnMouseRight.isEnabled = false
         binding.tvRemoteCursor.visibility = View.GONE
-        mediaReceiver?.stop()
+        val stoppedReceiver = mediaReceiver
         mediaReceiver = null
+        stoppedReceiver?.stop()
+        val stoppedDecoder = videoDecoder
+        videoDecoder = null
+        stoppedDecoder?.release()
         audioReceiver?.stop()
         audioReceiver = null
         gamepadForwardingEnabled = false
@@ -985,7 +1029,10 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             append('\n')
             if (video != null) {
                 append("NET    ${video.kbps} kbps · ${"%.1f".format(video.lossPercent)}% loss\n")
-                append("DROPS  ${video.framesDropped}/s · ${video.fps} fps received\n")
+                append(
+                    "VIDEO  ${video.fps} fps decoded · ${video.assembledFps} assembled · " +
+                        "${video.framesDropped} drops/s\n"
+                )
                 if (video.serverPipelineP95Ms >= 0 || video.captureToReceiveP95Ms >= 0 ||
                     video.decodeToSurfaceP95Ms >= 0
                 ) {

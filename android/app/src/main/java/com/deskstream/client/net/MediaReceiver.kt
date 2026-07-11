@@ -1,5 +1,6 @@
 package com.deskstream.client.net
 
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.deskstream.client.proto.MediaPacketHeader
@@ -23,6 +24,8 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
+import java.util.TreeMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -39,6 +42,7 @@ import java.util.concurrent.atomic.AtomicLong
  */
 data class StreamStats(
     val fps: Int,
+    val assembledFps: Int,
     val kbps: Int,
     val framesDropped: Int,
     val lossPercent: Float,
@@ -75,22 +79,24 @@ class MediaReceiver(
 
     val bufferPool = BufferPool()
 
-    private val framesOk = AtomicInteger(0)
+    private val framesAssembled = AtomicInteger(0)
+    private val framesDecoded = AtomicInteger(0)
     private val framesDropped = AtomicInteger(0)
     private val bytesReceived = AtomicLong(0)
 
     private val frameAssembler = FrameAssembler(
         bufferPool = bufferPool,
         onFrameComplete = { buf, len, keyframe, frameId, ptsMs, pipelineDelayMs ->
-            framesOk.incrementAndGet()
+            framesAssembled.incrementAndGet()
+            lastCompletedFrameAt = SystemClock.elapsedRealtime()
             val latencyMs = captureToReceiveLatencyMs(ptsMs)
             if (latencyMs >= 0) captureLatency.add(latencyMs)
             encoderLatency.add(pipelineDelayMs)
             onFrame(buf, len, keyframe, frameId, latencyMs)
         },
-        onFrameDropped = {
-            framesDropped.incrementAndGet()
-            ControlClient.requestIdr()
+        onFrameDropped = { requestIdr, droppedFrames ->
+            framesDropped.addAndGet(droppedFrames)
+            if (requestIdr) ControlClient.requestIdr()
         }
     )
 
@@ -115,8 +121,8 @@ class MediaReceiver(
     private var ptsEpochMs = 0L
     /** Any packet, including DSHB, proves the UDP mapping/server socket is still alive. */
     @Volatile private var lastPacketAt = 0L
-    /** Valid media only; used to request an IDR without restarting a genuinely static desktop. */
-    @Volatile private var lastVideoPacketAt = 0L
+    /** Complete access units, unlike raw packets, prove reassembly/keyframe recovery is healthy. */
+    @Volatile private var lastCompletedFrameAt = 0L
     private val captureLatency = LatencyWindow()
     private val decoderLatency = LatencyWindow()
     private val encoderLatency = LatencyWindow()
@@ -130,7 +136,7 @@ class MediaReceiver(
         running = true
         val now = SystemClock.elapsedRealtime()
         lastPacketAt = now
-        lastVideoPacketAt = now
+        lastCompletedFrameAt = now
 
         val sock = try {
             DatagramSocket(null).apply {
@@ -172,8 +178,11 @@ class MediaReceiver(
         // creating an unbounded backlog.
         inputSendJob = scope.launch(Dispatchers.IO) { inputSendLoop() }
         // TCP announces the bound port reliably; DSMH remains a NAT/firewall fallback.
+        ControlClient.prepareForMediaEpoch()
         ControlClient.mediaReady(sock.localPort)
 
+        val actualReceiveBuffer = try { sock.receiveBufferSize } catch (_: Exception) { -1 }
+        Log.i(TAG, "media UDP receive buffer: requested=${RECV_SOCKET_BUFFER_BYTES}B actual=${actualReceiveBuffer}B")
         thread = Thread({ receiveLoop(sock, address) }, "MediaReceiver").apply { start() }
         statsJob = scope.launch { statsLoop() }
         watchdogJob = scope.launch { watchdogLoop(sock, address) }
@@ -252,13 +261,18 @@ class MediaReceiver(
         }
     }
 
-    fun recordDecoderSurfaceLatency(latencyMs: Int) {
+    fun recordDecodedFrame(latencyMs: Int) {
+        framesDecoded.incrementAndGet()
         if (latencyMs >= 0) decoderLatency.add(latencyMs)
     }
 
     private fun receiveLoop(sock: DatagramSocket, serverAddress: InetAddress) {
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND)
+        } catch (_: Exception) { }
         val buf = ByteArray(RECV_PACKET_BUFFER_BYTES)
         val packet = DatagramPacket(buf, buf.size)
+        val mediaHeader = MediaPacketHeader()
         var receivedAny = false
         var lastHolePunchAt = SystemClock.elapsedRealtime()
         sendHolePunch(sock, serverAddress)
@@ -293,22 +307,25 @@ class MediaReceiver(
             }
 
             val length = packet.length
-            lastPacketAt = SystemClock.elapsedRealtime()
+            val receivedAt = SystemClock.elapsedRealtime()
+            lastPacketAt = receivedAt
             bytesReceived.addAndGet(length.toLong())
 
             val cursor = CursorPacket.parse(buf, length)
             if (cursor != null) {
                 onCursorPosition(cursor)
+                frameAssembler.onTick(receivedAt)
                 continue
             }
 
-            val header = MediaPacketHeader.parse(buf, length) ?: continue
-            if (header.version != 1) continue
-            // Only valid video proves the encode/media path is alive. Heartbeats and cursor
-            // feedback must not mask a frozen picture from the stall watchdog.
-            lastVideoPacketAt = SystemClock.elapsedRealtime()
-
-            frameAssembler.onPacket(header, buf, MediaPacketHeader.HEADER_SIZE)
+            if (!mediaHeader.parseFrom(buf, length)) {
+                frameAssembler.onTick(receivedAt)
+                continue
+            }
+            if (mediaHeader.version != 1) continue
+            // Completion, not mere packet arrival, advances the recovery watchdog. This catches
+            // a lost startup IDR even while unusable P-frame packets continue arriving.
+            frameAssembler.onPacket(mediaHeader, buf, MediaPacketHeader.HEADER_SIZE, receivedAt)
         }
     }
 
@@ -328,7 +345,8 @@ class MediaReceiver(
             val now = SystemClock.elapsedRealtime()
             val intervalMs = now - lastFlush
             lastFlush = now
-            val ok = framesOk.getAndSet(0)
+            val assembled = framesAssembled.getAndSet(0)
+            val ok = framesDecoded.getAndSet(0)
             val dropped = framesDropped.getAndSet(0)
             val bytes = bytesReceived.getAndSet(0)
             val captureP95 = captureLatency.drainP95()
@@ -340,9 +358,10 @@ class MediaReceiver(
             val lossPercent = if (total > 0) dropped * 100f / total else 0f
             val kbps = if (intervalMs > 0) (bytes * 8 / intervalMs).toInt() else 0
             onStats(StreamStats(
-                fps = ok,
+                fps = normalizeRate(ok, intervalMs),
+                assembledFps = normalizeRate(assembled, intervalMs),
                 kbps = kbps,
-                framesDropped = dropped,
+                framesDropped = normalizeRate(dropped, intervalMs),
                 lossPercent = lossPercent,
                 serverPipelineP95Ms = encoderP95,
                 captureToReceiveP95Ms = captureP95,
@@ -353,13 +372,20 @@ class MediaReceiver(
 
     private suspend fun watchdogLoop(sock: DatagramSocket, serverAddress: InetAddress) {
         var stallReported = false
+        var lastVideoRecoveryAt = 0L
         while (currentCoroutineContext().isActive) {
             delay(500)
             val now = SystemClock.elapsedRealtime()
-            val videoSilenceMs = now - lastVideoPacketAt
-            if (videoSilenceMs >= VIDEO_REPUNCH_MS) {
+            val completedFrameSilenceMs = now - lastCompletedFrameAt
+            // A heartbeat with no video is normally a static desktop. Re-request an IDR only
+            // occasionally so an actually wedged encoder can recover without accidentally
+            // satisfying the server's "two IDRs in one second" congestion trigger forever.
+            if (completedFrameSilenceMs >= VIDEO_REPUNCH_MS &&
+                now - lastVideoRecoveryAt >= VIDEO_RECOVERY_INTERVAL_MS
+            ) {
                 sendHolePunch(sock, serverAddress)
                 ControlClient.requestIdr()
+                lastVideoRecoveryAt = now
             }
             // DSHB is deliberately sent when the desktop is static. It should keep a still
             // image stable rather than causing an endless stop/start loop, but it must not
@@ -390,6 +416,9 @@ class MediaReceiver(
         return ptsEpochMs + raw
     }
 
+    private fun normalizeRate(count: Int, intervalMs: Long): Int =
+        if (intervalMs > 0) ((count * 1000L + intervalMs / 2) / intervalMs).toInt() else 0
+
     companion object {
         private const val TAG = "MediaReceiver"
         private const val HOLE_PUNCH_MESSAGE = "DSMH"
@@ -400,6 +429,7 @@ class MediaReceiver(
         private const val RECV_SOCKET_BUFFER_BYTES = 1024 * 1024
         private const val SOCKET_TIMEOUT_MS = 1000
         private const val VIDEO_REPUNCH_MS = 1500L
+        private const val VIDEO_RECOVERY_INTERVAL_MS = 5000L
         private const val VIDEO_STALL_MS = 4000L
     }
 }
@@ -431,6 +461,7 @@ private const val PACKET_PAYLOAD_MAX = 1200
 // Tolerates Wi-Fi packet reordering without adding a render queue: completed frames still
 // go directly to the separately bounded decoder input queue.
 private const val MAX_INFLIGHT_FRAMES = 4
+private const val REORDER_GRACE_MS = 20L
 /** Sanity ceiling on packetCount to refuse to allocate absurd buffers for a corrupt header. */
 private const val MAX_REASONABLE_PACKET_COUNT = 4096
 
@@ -444,7 +475,7 @@ private const val MAX_REASONABLE_PACKET_COUNT = 4096
  * MediaReceiver's dedicated receive thread). [requestDiscardUntilKeyframe] may be called from
  * any thread (it just sets a volatile flag).
  */
-private class FrameAssembler(
+internal class FrameAssembler(
     private val bufferPool: BufferPool,
     private val onFrameComplete: (
         buf: ByteArray,
@@ -454,34 +485,67 @@ private class FrameAssembler(
         ptsMs: Long,
         pipelineDelayMs: Int
     ) -> Unit,
-    private val onFrameDropped: () -> Unit
+    private val onFrameDropped: (requestIdr: Boolean, droppedFrames: Int) -> Unit
 ) {
     private val inFlight = LinkedHashMap<Long, InFlightFrame>()
+    private val ready = TreeMap<Long, InFlightFrame>()
     private var dropWatermark = -1L
-    @Volatile private var discardingUntilKeyframe = false
+    private var nextFrameId = -1L
+    private var latestExtendedFrameId = -1L
+    // A new stream has no valid H.264 reference state until its first IDR completes.
+    private var discardingUntilKeyframe = true
+    private val externalDiscardRequested = AtomicBoolean(false)
 
     fun requestDiscardUntilKeyframe() {
-        discardingUntilKeyframe = true
+        // Decoder callbacks run on a different thread. The receive thread owns all maps and
+        // applies the reset before processing the next media packet/tick.
+        externalDiscardRequested.set(true)
     }
 
     fun reset() {
-        for (f in inFlight.values) releaseFrame(f)
-        inFlight.clear()
+        clearBufferedFrames()
         dropWatermark = -1L
-        discardingUntilKeyframe = false
+        nextFrameId = -1L
+        latestExtendedFrameId = -1L
+        discardingUntilKeyframe = true
+        externalDiscardRequested.set(false)
     }
 
-    fun onPacket(header: MediaPacketHeader, buf: ByteArray, payloadOffset: Int) {
-        if (header.frameId <= dropWatermark) return // stale/duplicate/late
+    fun onTick(nowMs: Long) {
+        applyExternalDiscardIfNeeded()
+        drainReady(nowMs)
+    }
+
+    fun onPacket(
+        header: MediaPacketHeader,
+        buf: ByteArray,
+        payloadOffset: Int,
+        nowMs: Long
+    ) {
+        applyExternalDiscardIfNeeded()
         if (header.packetCount <= 0 || header.packetCount > MAX_REASONABLE_PACKET_COUNT) return
         // fecCount is attacker/corruption-controlled independent of packetCount; bound it too
         // so a bogus header can't force a huge array allocation.
         if (header.fecCount < 0 || header.fecCount > MAX_REASONABLE_PACKET_COUNT) return
-        if (header.fec && (header.packetIndex < 0)) return
+        if (header.fecCount != (header.packetCount + 7) / 8) return
+        if (header.fec && header.packetIndex >= header.fecCount) return
+        if (!header.fec && header.packetIndex >= header.packetCount) return
         // Every media datagram's payload is <=1200 bytes per §3; a larger declared payloadLen
         // (corrupt header or non-conformant sender) would overflow into the next packet's slot
         // in the assembly buffer, since slots are fixed at PACKET_PAYLOAD_MAX apart.
-        if (header.payloadLen < 0 || header.payloadLen > PACKET_PAYLOAD_MAX) return
+        if (header.payloadLen <= 0 || header.payloadLen > PACKET_PAYLOAD_MAX) return
+        if (!header.fec && header.packetIndex < header.packetCount - 1 &&
+            header.payloadLen != PACKET_PAYLOAD_MAX
+        ) return
+        if (header.fec) {
+            val groupStart = header.packetIndex * 8
+            val groupMembers = minOf(groupStart + 8, header.packetCount) - groupStart
+            if (groupStart >= header.packetCount ||
+                (groupMembers > 1 && header.payloadLen != PACKET_PAYLOAD_MAX)
+            ) return
+        }
+        val frameId = extendFrameId(header.frameId)
+        if (frameId <= dropWatermark) return // stale/duplicate/late
 
         if (discardingUntilKeyframe) {
             // Ignore non-keyframe packets, but do NOT advance dropWatermark for them: a
@@ -489,40 +553,46 @@ private class FrameAssembler(
             // raising the watermark past it would reject that keyframe's remaining packets
             // and stall recovery. The watermark only advances when a frame completes or is
             // definitively dropped from assembly.
-            if (!header.keyframe) return
+            // P-frames that arrive while an IDR is actively assembling may be held in the tiny
+            // reorder window; they become valid if that IDR completes. Without an active IDR,
+            // predictive frames are unusable and are ignored allocation-free.
+            if (!header.keyframe && inFlight.values.none { it.keyframe }) return
             // A keyframe packet arrived; fall through to normal processing. The
             // discardingUntilKeyframe flag itself is cleared once the frame *completes*
             // (see completeFrame), not on the first packet, in case this keyframe is itself
             // incomplete and needs to be dropped too.
         }
 
-        var frame = inFlight[header.frameId]
+        if (ready.containsKey(frameId)) return // duplicate packet for an already-ready AU
+
+        var frame = inFlight[frameId]
         if (frame == null) {
-            if (inFlight.size >= MAX_INFLIGHT_FRAMES) {
-                val oldestId = inFlight.keys.minOrNull()
-                if (oldestId != null) {
-                    val f = inFlight.remove(oldestId)
-                    if (f != null) releaseFrame(f)
-                    dropWatermark = maxOf(dropWatermark, oldestId)
-                    triggerDrop()
-                }
-                // If dropping just put us into discard mode and this packet isn't a keyframe,
-                // don't bother starting assembly for it. (No watermark advance -- see the
-                // discard-mode comment above.)
-                if (discardingUntilKeyframe && !header.keyframe) return
+            // First give a delayed packet its grace-window opportunity, then enforce the hard
+            // four-frame state bound. This is a reorder window, not a render/jitter queue.
+            drainReady(nowMs)
+            if (discardingUntilKeyframe && !header.keyframe &&
+                inFlight.values.none { it.keyframe }
+            ) return
+            if (bufferedFrameCount() >= MAX_INFLIGHT_FRAMES) {
+                triggerDrop()
+                if (!header.keyframe) return
             }
             val assemblyBuf = bufferPool.acquire(header.packetCount * PACKET_PAYLOAD_MAX)
             frame = InFlightFrame(
-                header.frameId,
+                frameId,
                 header.packetCount,
                 header.fecCount,
                 header.keyframe,
                 header.ptsMs,
                 header.pipelineDelayMs,
                 assemblyBuf,
-                bufferPool
+                bufferPool,
+                nowMs
             )
-            inFlight[header.frameId] = frame
+            inFlight[frameId] = frame
+            if (nextFrameId < 0L || (dropWatermark < 0L && frameId < nextFrameId)) {
+                nextFrameId = frameId
+            }
         } else if (frame.packetCount != header.packetCount || frame.fecCount != header.fecCount) {
             // Inconsistent header for a frameId we're already assembling -- ignore the packet.
             return
@@ -536,53 +606,158 @@ private class FrameAssembler(
 
         if (frame.isComplete) {
             inFlight.remove(frame.frameId)
-            dropWatermark = maxOf(dropWatermark, frame.frameId)
-            completeFrame(frame)
+            frame.completedAtMs = nowMs
+            frame.releaseFecBuffers()
+            ready[frame.frameId] = frame
+            drainReady(nowMs)
         }
     }
 
-    private fun completeFrame(frame: InFlightFrame) {
-        // A newer frame just became ready while older ones are still incomplete: those older
-        // frames can never be usefully decoded now (their reference chain is about to be
-        // skipped), so drop them.
-        val olderIncomplete = inFlight.keys.filter { it < frame.frameId }
-        if (olderIncomplete.isNotEmpty()) {
-            for (fid in olderIncomplete) {
-                val f = inFlight.remove(fid) ?: continue
-                releaseFrame(f)
-                dropWatermark = maxOf(dropWatermark, fid)
-            }
-            triggerDrop()
-        }
-
-        if (discardingUntilKeyframe) {
-            if (frame.keyframe) {
-                discardingUntilKeyframe = false
-            } else {
+    private fun drainReady(nowMs: Long) {
+        while (nextFrameId >= 0L) {
+            // onFrameComplete enters VideoDecoder synchronously. If that reports an overflow,
+            // consume its cross-thread recovery request before delivering another ready AU.
+            if (externalDiscardRequested.get()) applyExternalDiscardIfNeeded()
+            val frame = ready.remove(nextFrameId) ?: break
+            if (discardingUntilKeyframe && !frame.keyframe) {
                 bufferPool.release(frame.assemblyBuf)
-                return
+                nextFrameId = nextFrameId(nextFrameId)
+                continue
             }
+
+            if (discardingUntilKeyframe) {
+                discardingUntilKeyframe = false
+            }
+            dropWatermark = maxOf(dropWatermark, frame.frameId)
+            nextFrameId = nextFrameId(frame.frameId)
+            onFrameComplete(
+                frame.assemblyBuf,
+                frame.totalLength,
+                frame.keyframe,
+                frame.frameId,
+                frame.ptsMs,
+                frame.pipelineDelayMs
+            )
         }
 
-        val totalLen = (frame.packetCount - 1) * PACKET_PAYLOAD_MAX + frame.lastPacketLen
-        onFrameComplete(
-            frame.assemblyBuf,
-            totalLen,
-            frame.keyframe,
-            frame.frameId,
-            frame.ptsMs,
-            frame.pipelineDelayMs
-        )
+        if (ready.isEmpty() || nextFrameId < 0L) return
+
+        // A later AU may complete before the expected AU because UDP datagrams/FEC can reorder.
+        // Wait one frame period before declaring a reference gap. This fixes false loss under
+        // large game-frame bursts while adding at most 20 ms and never buffering for rendering.
+        // The grace begins only when a *newer completed* AU proves there is a gap. Starting at
+        // the expected AU's first packet would consume almost the full allowance during a normal
+        // 16.7 ms frame interval and still false-drop at 60 fps.
+        val waitStartedAt = ready.firstEntry()?.value?.completedAtMs ?: return
+        if (nowMs - waitStartedAt >= REORDER_GRACE_MS ||
+            bufferedFrameCount() >= MAX_INFLIGHT_FRAMES
+        ) {
+            recoverGap()
+        }
+    }
+
+    private fun recoverGap() {
+        // If a later complete IDR is already buffered, it is the clean reference boundary we
+        // need. Keep it (and any subsequent frames), count the skipped gap, and avoid asking the
+        // server for a redundant IDR that would feed the bitrate-down loop.
+        val readyKeyframeId = ready.entries.firstOrNull { it.value.keyframe }?.key
+        if (readyKeyframeId != null) {
+            val droppedFrames = discardBeforeReadyKeyframe(readyKeyframeId)
+            onFrameDropped(false, maxOf(1, droppedFrames))
+            drainReady(ready[readyKeyframeId]?.completedAtMs ?: 0L)
+            return
+        }
+        triggerDrop()
     }
 
     private fun triggerDrop() {
+        val droppedFrames = maxOf(1, bufferedFrameCount())
+        val highestBufferedId = sequenceOf(inFlight.keys.maxOrNull(), ready.keys.maxOrNull())
+            .filterNotNull()
+            .maxOrNull()
+        if (highestBufferedId != null) dropWatermark = maxOf(dropWatermark, highestBufferedId)
+        clearBufferedFrames()
+        nextFrameId = -1L
         discardingUntilKeyframe = true
-        onFrameDropped()
+        // A partial recovery/startup IDR needs a replacement too. ControlClient rate-limits
+        // duplicate requests, while suppressing this callback could leave a black screen until
+        // the slower completed-frame watchdog fires.
+        onFrameDropped(true, droppedFrames)
+    }
+
+    private fun applyExternalDiscardIfNeeded() {
+        if (!externalDiscardRequested.getAndSet(false)) return
+        val readyKeyframeId = ready.entries.firstOrNull { it.value.keyframe }?.key
+        if (readyKeyframeId != null) {
+            discardBeforeReadyKeyframe(readyKeyframeId)
+            return
+        }
+        val highestBufferedId = sequenceOf(inFlight.keys.maxOrNull(), ready.keys.maxOrNull())
+            .filterNotNull()
+            .maxOrNull()
+        if (highestBufferedId != null) dropWatermark = maxOf(dropWatermark, highestBufferedId)
+        clearBufferedFrames()
+        nextFrameId = -1L
+        discardingUntilKeyframe = true
+    }
+
+    private fun discardBeforeReadyKeyframe(keyframeId: Long): Int {
+        var droppedFrames = 0
+        val inFlightIterator = inFlight.entries.iterator()
+        while (inFlightIterator.hasNext()) {
+            val entry = inFlightIterator.next()
+            if (entry.key < keyframeId) {
+                releaseFrame(entry.value)
+                inFlightIterator.remove()
+                droppedFrames++
+            }
+        }
+        val readyIterator = ready.entries.iterator()
+        while (readyIterator.hasNext()) {
+            val entry = readyIterator.next()
+            if (entry.key < keyframeId) {
+                releaseFrame(entry.value)
+                readyIterator.remove()
+                droppedFrames++
+            }
+        }
+        dropWatermark = maxOf(dropWatermark, keyframeId - 1L)
+        nextFrameId = keyframeId
+        discardingUntilKeyframe = true
+        return droppedFrames
+    }
+
+    private fun clearBufferedFrames() {
+        for (frame in inFlight.values) releaseFrame(frame)
+        for (frame in ready.values) releaseFrame(frame)
+        inFlight.clear()
+        ready.clear()
     }
 
     private fun releaseFrame(frame: InFlightFrame) {
         bufferPool.release(frame.assemblyBuf)
         frame.releaseFecBuffers()
+    }
+
+    private fun bufferedFrameCount(): Int = inFlight.size + ready.size
+
+    private fun nextFrameId(id: Long): Long = id + 1L
+
+    /** Extends uint32 wire IDs into a monotonic long so a multi-day session survives wrap. */
+    private fun extendFrameId(rawId: Long): Long {
+        if (latestExtendedFrameId < 0L) {
+            latestExtendedFrameId = rawId
+            return rawId
+        }
+        val epoch = latestExtendedFrameId and -0x1_0000_0000L
+        var candidate = epoch or rawId
+        if (candidate - latestExtendedFrameId > 0x8000_0000L) {
+            candidate -= 0x1_0000_0000L
+        } else if (latestExtendedFrameId - candidate > 0x8000_0000L) {
+            candidate += 0x1_0000_0000L
+        }
+        if (candidate > latestExtendedFrameId) latestExtendedFrameId = candidate
+        return candidate
     }
 }
 
@@ -595,12 +770,17 @@ private class InFlightFrame(
     val ptsMs: Long,
     val pipelineDelayMs: Int,
     val assemblyBuf: ByteArray,
-    private val pool: BufferPool
+    private val pool: BufferPool,
+    val firstPacketAtMs: Long
 ) {
     private val dataPresent = BooleanArray(packetCount)
     private var dataPresentCount = 0
     var lastPacketLen = -1
         private set
+    var completedAtMs = 0L
+
+    val totalLength: Int
+        get() = (packetCount - 1) * PACKET_PAYLOAD_MAX + lastPacketLen
 
     private val fecPayload = arrayOfNulls<ByteArray>(fecCount)
     private val fecLen = IntArray(fecCount) { -1 }

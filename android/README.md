@@ -64,12 +64,12 @@ app/src/main/java/com/deskstream/client/
                           PING keepalive, 6 s silence watchdog, reconnect backoff,
                           state machine per §5
   net/MediaReceiver.kt    dedicated UDP receive thread, 20-byte header parse (big-endian),
-                          frame assembly per §3.1, XOR-FEC recovery per §3.2, DSMH hole
-                          punch, 1 s STATS
+                          20 ms bounded reorder repair, XOR-FEC recovery, DSMH hole punch,
+                          decoded/assembled 1 s STATS
   net/BufferPool.kt       size-bucketed byte[] pool for frame assembly buffers
   video/VideoDecoder.kt   MediaCodec video/avc async mode → Surface, KEY_LOW_LATENCY when
-                          supported, immediate render, tiny bounded input queue with
-                          drop + REQUEST_IDR + discard-until-keyframe on overflow/error
+                          supported, hardware/FPS validation, 4.9 MiB AU capacity, serial
+                          lifecycle, and a six-frame bounded producer queue
   audio/AudioReceiver.kt  DSAH audio UDP receiver, sequence-gap handling, immediate
                           non-blocking AudioTrack playback, local mute + audio stats
   input/GamepadForwarder.kt
@@ -78,7 +78,7 @@ app/src/main/java/com/deskstream/client/
   input/RemoteMouseController.kt
                           touchpad/direct gestures, 120 Hz motion coalescing, safe reset
   proto/Messages.kt       control JSON models (org.json)
-  proto/MediaPacket.kt    media header parser
+  proto/MediaPacket.kt    allocation-free reusable media-header parser
   proto/AudioPacket.kt    allocation-free reusable audio-header parser
   data/Prefs.kt           clientId (UUID, generated once) + paired server {ip, token, name}
 ```
@@ -91,11 +91,13 @@ app/src/main/java/com/deskstream/client/
 - If discovery finds nothing (some APs filter broadcast even with the multicast lock), use
   manual IP entry — it is always shown.
 - Decoder latency knobs applied: async mode, `KEY_LOW_LATENCY` (API 30+ where supported),
-  `KEY_PRIORITY=0`, `KEY_OPERATING_RATE=240`, render-on-arrival (never paced by PTS).
+  realtime priority, the negotiated `KEY_FRAME_RATE` / `KEY_OPERATING_RATE` (normally 60),
+  bounded maximum input size, and render-on-arrival (never paced by wire PTS).
 - While foreground streaming, Android requests the Wi-Fi low-latency lock and a matching
   surface frame rate. Backgrounding stops video/audio/input but leaves control reconnectable.
-- The client re-punches a silent media path, requests an IDR, and restarts a stream that does
-  not recover. Buffer pools, frame assembly, codec input, and AudioTrack tuning are bounded.
+- The client re-punches a silent media path, coalesces IDR recovery across stream epochs, and
+  resets a decoder that stops producing output. Packet parsing is allocation-free; frame/FEC
+  pools, reorder state, codec input, and AudioTrack tuning remain bounded.
 - Pairing tokens are stored per server IP in SharedPreferences; a `PAIR_REQUIRED` in response
   to a non-empty token clears it and re-pairs automatically.
 - Audio is optional and backward-compatible. If an older server ignores `AUDIO_START`, the

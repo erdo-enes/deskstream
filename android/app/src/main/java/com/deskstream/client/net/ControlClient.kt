@@ -90,7 +90,8 @@ object ControlClient {
     @Volatile var serverPort: Int = 0
         private set
     @Volatile private var lastReceivedAt = 0L
-    @Volatile private var lastIdrRequestAt = 0L
+    private val idrGate = Any()
+    private var lastIdrRequestAt = 0L
     @Volatile private var explicitlyDisconnected = false
     @Volatile private var lastSentToken = ""
     @Volatile private var backoffMs = INITIAL_BACKOFF_MS
@@ -118,6 +119,7 @@ object ControlClient {
         bestClockRttUs = Long.MAX_VALUE
         serverClockOffsetUs = 0L
         clockSynchronized = false
+        resetIdrLimiter()
         _state.value = State.CONNECTING
         connectionJob = scope.launch { doConnect(ip, port, isReconnect = false) }
     }
@@ -127,6 +129,7 @@ object ControlClient {
         connectionJob?.cancel()
         stopPingAndWatchdog()
         closeSocketQuietly()
+        resetIdrLimiter()
         _state.value = State.DISCONNECTED
     }
 
@@ -195,9 +198,19 @@ object ControlClient {
     /** Client-side rate limit (300 ms) on top of the server's own rate limit, per §2.3. */
     fun requestIdr() {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastIdrRequestAt < IDR_MIN_INTERVAL_MS) return
-        lastIdrRequestAt = now
-        scope.launch { writeFrame(ClientMessages.requestIdr()) }
+        val shouldSend = synchronized(idrGate) {
+            if (now - lastIdrRequestAt < IDR_MIN_INTERVAL_MS) false
+            else {
+                lastIdrRequestAt = now
+                true
+            }
+        }
+        if (shouldSend) scope.launch { writeFrame(ClientMessages.requestIdr()) }
+    }
+
+    /** A stream restart must never inherit a rate-limit window from the previous media epoch. */
+    fun prepareForMediaEpoch() {
+        resetIdrLimiter()
     }
 
     fun sendStats(
@@ -416,6 +429,10 @@ object ControlClient {
     }
 
     private fun nowUs(): Long = SystemClock.elapsedRealtimeNanos() / 1000L
+
+    private fun resetIdrLimiter() = synchronized(idrGate) {
+        lastIdrRequestAt = 0L
+    }
 
     private fun stopPingAndWatchdog() {
         pingJob?.cancel(); pingJob = null

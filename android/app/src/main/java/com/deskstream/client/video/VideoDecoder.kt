@@ -2,281 +2,602 @@ package com.deskstream.client.video
 
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import java.util.ArrayDeque
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * H.264 decoding via MediaCodec in **async mode**, rendering straight to a [Surface]. No
- * MediaExtractor/MediaPlayer -- we build Annex-B access units ourselves from the media
- * channel (see MediaReceiver/FrameAssembler) and feed them directly.
+ * Bounded asynchronous H.264 decoder that renders directly to a [Surface].
  *
- * Latency rules (see docs/ARCHITECTURE.md):
- *  - Every pipeline stage holds at most one (or two, briefly) frames; we never build a
- *    jitter buffer. [submitFrame] keeps at most 2 frames queued; a 3rd arriving forces the
- *    oldest queued ones out, counted as dropped, and asks the caller to request a fresh IDR
- *    and discard until the next keyframe (since we just created a reference gap).
- *  - Output buffers are released with render=true immediately on arrival; we never pace by
- *    presentation time.
- *
- * Not started until the first complete keyframe access unit is submitted (SPS/PPS are
- * in-band in that access unit per protocol §3, so no explicit CSD buffer is needed).
- *
- * Thread-safety: [submitFrame] is expected to be called from the media receive thread;
- * MediaCodec async callbacks run on their own dedicated [HandlerThread]. All shared state is
- * guarded by [lock].
+ * The UDP thread only takes a tiny queue lock and transfers buffer ownership. MediaCodec
+ * enumeration/configuration, complete-AU copies, queueing, output, and teardown are serialized on
+ * one foreground-priority codec worker. This prevents large game frames from blocking UDP receive
+ * and guarantees an old hardware codec is fully released before a replacement is configured.
  */
 class VideoDecoder(
-    /** Called (off the UI thread) whenever a queued frame had to be dropped or the codec hit
-     * an error -- the caller should request an IDR and tell the media receiver to discard
-     * until the next keyframe. */
+    /** One coalesced recovery signal per broken reference chain. */
     private val onDropOrError: () -> Unit,
-    /** Called to return a frame buffer to its pool once this decoder is done with it (either
-     * fed to the codec, or dropped without ever being fed). */
+    /** Returns an access-unit buffer to its originating MediaReceiver pool. */
     private val onBufferRelease: (ByteArray) -> Unit,
+    /** Called when a decoded frame is released toward the Surface. */
     private val onFrameRendered: (latencyMs: Int) -> Unit = {}
 ) {
-    private data class PendingFrame(val data: ByteArray, val length: Int, val frameId: Long)
+    private data class PendingFrame(
+        val data: ByteArray,
+        val length: Int,
+        val keyframe: Boolean,
+        val frameId: Long,
+        val generation: Long,
+        val enqueuedAtUs: Long
+    )
 
-    private val lock = Any()
-    private val handlerThread = HandlerThread("VideoDecoderCallback").apply { start() }
+    private data class StreamConfig(
+        val generation: Long,
+        val surface: Surface,
+        val width: Int,
+        val height: Int,
+        val fps: Int
+    )
+
+    // Producer queue: the UDP thread never acquires any codec-state lock.
+    private val queueLock = Any()
+    private val pendingFrames = ArrayDeque<PendingFrame>()
+    private var drainPosted = false
+    @Volatile private var acceptingFrames = false
+    @Volatile private var waitingForKeyframe = true
+    @Volatile private var streamGeneration = 0L
+    private val recoverySignaled = AtomicBoolean(false)
+    private val released = AtomicBoolean(false)
+
+    private val handlerThread = HandlerThread(
+        "VideoDecoderCallback",
+        Process.THREAD_PRIORITY_FOREGROUND
+    ).apply { start() }
     private val handler = Handler(handlerThread.looper)
 
+    // Worker-owned state. Only codec callbacks/runnables on [handler] touch these fields.
+    private var workerGeneration = -1L
+    private var streamConfig: StreamConfig? = null
     private var codec: MediaCodec? = null
-    private var surface: Surface? = null
-    private var width = 0
-    private var height = 0
-    private var started = false
-
-    private val pendingFrames = ArrayDeque<PendingFrame>()
+    private var codecReleasePending = false
     private val pendingInputIndices = ArrayDeque<Int>()
     private val submitTimesUs = HashMap<Long, Long>()
+    private var codecStartedAtUs = 0L
+    private var lastInputQueuedAtUs = 0L
+    private var lastOutputAtUs = 0L
 
     private val callback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(mc: MediaCodec, index: Int) {
-            synchronized(lock) {
-                if (mc !== codec) return
-                pendingInputIndices.addLast(index)
-                drainLocked()
-            }
+            if (mc !== codec) return
+            pendingInputIndices.addLast(index)
+            drainOnWorker()
         }
 
-        override fun onOutputBufferAvailable(mc: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
-            val submittedUs = synchronized(lock) {
-                if (mc === codec) submitTimesUs.remove(info.presentationTimeUs) else null
-            }
-            // Render immediately, never pace by PTS -- lowest latency to glass.
+        override fun onOutputBufferAvailable(
+            mc: MediaCodec,
+            index: Int,
+            info: MediaCodec.BufferInfo
+        ) {
+            if (mc !== codec) return
+            val submittedUs = submitTimesUs.remove(info.presentationTimeUs)
+            var sentToSurface = false
             try {
                 mc.releaseOutputBuffer(index, true)
-            } catch (e: IllegalStateException) {
-                // codec was torn down concurrently (e.g. surface destroyed); safe to ignore
+                sentToSurface = true
+            } catch (_: IllegalStateException) {
+                // A queued stale callback can race a normal stream reset.
             }
-            if (submittedUs != null) {
-                val latencyMs = ((SystemClock.elapsedRealtimeNanos() / 1000L - submittedUs) / 1000L)
-                    .coerceIn(0L, 60_000L).toInt()
+            if (sentToSurface && submittedUs != null) {
+                val nowUs = nowUs()
+                lastOutputAtUs = nowUs
+                val latencyMs = ((nowUs - submittedUs) / 1000L)
+                    .coerceIn(0L, 60_000L)
+                    .toInt()
                 onFrameRendered(latencyMs)
             }
         }
 
-        override fun onError(mc: MediaCodec, e: MediaCodec.CodecException) {
-            Log.e(TAG, "decoder error (recoverable=${e.isRecoverable}): ${e.diagnosticInfo}", e)
-            val old = synchronized(lock) {
-                if (mc === codec) detachCodecLocked() else null
-            }
-            if (old != null) {
-                // We are ON the codec's own callback thread here; stop()/release() can block,
-                // and blocking the callback thread risks wedging the codec teardown itself.
-                // Destroy on a throwaway thread instead -- stale callbacks for the old codec
-                // are already ignored via the `mc !== codec` identity checks.
-                Thread({ destroyCodec(old) }, "VideoDecoderErrRelease").start()
-                onDropOrError()
-            }
+        override fun onError(mc: MediaCodec, error: MediaCodec.CodecException) {
+            if (mc !== codec) return
+            Log.e(
+                TAG,
+                "decoder error (recoverable=${error.isRecoverable}): ${error.diagnosticInfo}",
+                error
+            )
+            scheduleCodecRecoveryOnWorker("codec callback error", notify = true)
         }
 
         override fun onOutputFormatChanged(mc: MediaCodec, format: MediaFormat) {
-            Log.i(TAG, "decoder output format changed: $format")
+            if (mc === codec) Log.i(TAG, "decoder output format changed: $format")
+        }
+    }
+
+    private val drainRunnable = Runnable {
+        synchronized(queueLock) { drainPosted = false }
+        val config = streamConfig ?: return@Runnable
+        if (released.get() || codecReleasePending || config.generation != streamGeneration) return@Runnable
+
+        if (codec == null) {
+            val first = synchronized(queueLock) {
+                discardStalePendingLocked(config.generation)
+                pendingFrames.peekFirst()
+            } ?: return@Runnable
+            if (!first.keyframe) {
+                signalQueueRecovery()
+                return@Runnable
+            }
+            if (!configureCodecOnWorker(config)) {
+                signalQueueRecovery()
+                return@Runnable
+            }
+        }
+        drainOnWorker()
+    }
+
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            val config = streamConfig ?: return
+            if (released.get() || config.generation != streamGeneration) return
+
+            val now = nowUs()
+            val oldestPendingAgeUs = synchronized(queueLock) {
+                pendingFrames.peekFirst()?.let { now - it.enqueuedAtUs } ?: 0L
+            }
+            val outputAnchor = maxOf(codecStartedAtUs, lastOutputAtUs)
+            val watchdogArmed = codec != null &&
+                now - codecStartedAtUs >= CODEC_STARTUP_GRACE_US
+            val decodeStalled = watchdogArmed && lastInputQueuedAtUs > outputAnchor &&
+                now - outputAnchor >= CODEC_OUTPUT_STALL_US
+            val inputStalled = watchdogArmed && oldestPendingAgeUs >= CODEC_INPUT_STALL_US
+
+            if (!codecReleasePending && (decodeStalled || inputStalled)) {
+                val reason = if (decodeStalled) "no decoded output" else "no codec input slot"
+                Log.w(TAG, "decoder watchdog recovery: $reason")
+                scheduleCodecRecoveryOnWorker(reason, notify = true)
+            }
+            handler.postDelayed(this, WATCHDOG_INTERVAL_MS)
         }
     }
 
     /**
-     * Targets a new stream session (fresh call after every STREAM_STARTED, per protocol §5 --
-     * dimensions may differ, and even if they don't, frameId numbering restarts on the server
-     * so any in-flight decoder state must not carry over). Always releases the current codec
-     * (if any); a new one is created lazily on the next keyframe submitted.
+     * Begins a new stream epoch. Reset is posted before MediaReceiver starts, so any later drain
+     * message is ordered after old-codec teardown and new surface/dimension setup.
      */
-    fun resetForNewStream(surface: Surface, width: Int, height: Int) {
-        val old = synchronized(lock) {
-            val c = detachCodecLocked()
-            this.surface = surface
-            this.width = width
-            this.height = height
-            c
+    fun resetForNewStream(surface: Surface, width: Int, height: Int, fps: Int) {
+        if (released.get()) return
+        val generation = synchronized(queueLock) {
+            streamGeneration += 1L
+            acceptingFrames = true
+            waitingForKeyframe = true
+            recoverySignaled.set(false)
+            clearPendingLocked()
+            drainPosted = false
+            streamGeneration
         }
-        old?.let { destroyCodec(it) }
+        val config = StreamConfig(
+            generation,
+            surface,
+            width,
+            height,
+            fps.coerceIn(MIN_FPS, MAX_FPS)
+        )
+        if (!handler.post { resetOnWorker(config) }) {
+            synchronized(queueLock) {
+                acceptingFrames = false
+                clearPendingLocked()
+            }
+        }
     }
 
     /**
-     * Feeds one complete, ordered Annex-B access unit. Takes ownership of [data]; it is
-     * always eventually returned via [onBufferRelease], whether it's fed to the codec,
-     * dropped for being stale, or dropped while waiting for a keyframe.
+     * Transfers one complete Annex-B access unit to the codec queue. No MediaCodec API and no
+     * access-unit copy runs on this caller (the UDP receive thread).
      */
     fun submitFrame(data: ByteArray, length: Int, keyframe: Boolean, frameId: Long) {
-        synchronized(lock) {
-            if (!started) {
-                if (!keyframe || surface == null || width <= 0 || height <= 0) {
-                    onBufferRelease(data)
-                    return
+        if (length <= 0 || length > data.size || length > MAX_ACCESS_UNIT_BYTES) {
+            Log.w(TAG, "rejecting invalid AU frame=$frameId length=$length buffer=${data.size}")
+            onBufferRelease(data)
+            signalQueueRecovery()
+            return
+        }
+
+        val now = nowUs()
+        var releaseIncoming = false
+        var notifyRecovery = false
+        var postDrain = false
+
+        synchronized(queueLock) {
+            val generation = streamGeneration
+            if (!acceptingFrames || released.get()) {
+                releaseIncoming = true
+            } else if (waitingForKeyframe && !keyframe) {
+                releaseIncoming = true
+                notifyRecovery = recoverySignaled.compareAndSet(false, true)
+            } else {
+                val oldestAgeUs = pendingFrames.peekFirst()?.let { now - it.enqueuedAtUs } ?: 0L
+                val overflow = pendingFrames.size >= MAX_PENDING_FRAMES ||
+                    oldestAgeUs >= MAX_PENDING_AGE_US
+
+                if (overflow) {
+                    clearPendingLocked()
+                    waitingForKeyframe = true
+                    if (!keyframe) {
+                        releaseIncoming = true
+                        notifyRecovery = recoverySignaled.compareAndSet(false, true)
+                    }
                 }
-                if (!configureAndStartLocked()) {
-                    onBufferRelease(data)
-                    return
+
+                if (!releaseIncoming) {
+                    if (keyframe) {
+                        waitingForKeyframe = false
+                        recoverySignaled.set(false)
+                    }
+                    pendingFrames.addLast(
+                        PendingFrame(data, length, keyframe, frameId, generation, now)
+                    )
+                    if (!drainPosted) {
+                        drainPosted = true
+                        postDrain = true
+                    }
                 }
             }
-            enqueueFrameLocked(PendingFrame(data, length, frameId))
+        }
+
+        if (releaseIncoming) onBufferRelease(data)
+        if (notifyRecovery) onDropOrError()
+        if (postDrain && !handler.post(drainRunnable)) {
+            synchronized(queueLock) {
+                drainPosted = false
+                clearPendingLocked()
+            }
         }
     }
 
-    /** Full teardown -- call when the owning Surface is destroyed or the activity is
-     * finishing. This instance must not be used afterward; create a new one for a new
-     * surface. */
+    /**
+     * Stops and releases the codec in order on its worker and waits briefly for completion.
+     * Stream changes are rare; bounded UI waiting here prevents a new hardware decoder from
+     * racing an old instance that still owns the Surface/vendor component.
+     */
     fun release() {
-        val old = synchronized(lock) {
-            val c = detachCodecLocked()
-            surface = null
-            c
+        if (!released.compareAndSet(false, true)) return
+        synchronized(queueLock) {
+            acceptingFrames = false
+            streamGeneration += 1L
+            waitingForKeyframe = true
+            clearPendingLocked()
+            drainPosted = false
         }
-        old?.let { destroyCodec(it) }
-        handlerThread.quitSafely()
+
+        if (Looper.myLooper() === handlerThread.looper) {
+            releaseOnWorker()
+            handlerThread.quitSafely()
+            return
+        }
+
+        val done = CountDownLatch(1)
+        val posted = handler.post {
+            try {
+                releaseOnWorker()
+            } finally {
+                done.countDown()
+                handlerThread.quitSafely()
+            }
+        }
+        if (posted) {
+            try {
+                if (!done.await(RELEASE_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    Log.w(TAG, "timed out waiting for decoder release")
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
     }
 
-    // ---- must hold `lock` -------------------------------------------------------------
+    // ---- codec worker ------------------------------------------------------------------
 
-    private fun enqueueFrameLocked(frame: PendingFrame) {
-        pendingFrames.addLast(frame)
-        var dropped = false
-        while (pendingFrames.size > MAX_PENDING_FRAMES) {
-            val old = pendingFrames.removeFirst()
-            onBufferRelease(old.data)
-            dropped = true
-        }
-        if (dropped) {
-            // Notify outside the lock to avoid any re-entrancy surprises from the caller.
-            handler.post { onDropOrError() }
-        }
-        drainLocked()
+    private fun resetOnWorker(config: StreamConfig) {
+        destroyCodecOnWorker(codec)
+        codec = null
+        codecReleasePending = false
+        pendingInputIndices.clear()
+        submitTimesUs.clear()
+        workerGeneration = config.generation
+        streamConfig = config
+        codecStartedAtUs = 0L
+        lastInputQueuedAtUs = 0L
+        lastOutputAtUs = 0L
+        handler.removeCallbacks(watchdogRunnable)
+        handler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
+        scheduleDrain()
     }
 
-    private fun drainLocked() {
-        // MediaCodec owns the number of frames it needs in flight. Several OEM H.264
-        // decoders do not emit their first output until they have accepted 2-3 inputs, so an
-        // application-side one-frame gate can deadlock permanently on the first keyframe.
-        while (pendingFrames.isNotEmpty() && pendingInputIndices.isNotEmpty()) {
-            val frame = pendingFrames.removeFirst()
+    private fun drainOnWorker() {
+        val activeCodec = codec ?: return
+        val config = streamConfig ?: return
+        while (!codecReleasePending && pendingInputIndices.isNotEmpty()) {
+            val frame = synchronized(queueLock) {
+                discardStalePendingLocked(config.generation)
+                pendingFrames.pollFirst()
+            } ?: return
             val index = pendingInputIndices.removeFirst()
-            feedInputBufferLocked(index, frame)
+            if (!feedInputOnWorker(activeCodec, index, frame)) return
         }
     }
 
-    private fun feedInputBufferLocked(index: Int, frame: PendingFrame) {
-        // `finally` is the single release point for frame.data -- every branch below just
-        // falls through to it rather than releasing early, to avoid a double-release (which
-        // would let two frames alias the same pooled buffer).
-        val c = codec
+    private fun feedInputOnWorker(
+        activeCodec: MediaCodec,
+        index: Int,
+        frame: PendingFrame
+    ): Boolean {
+        var queued = false
         try {
-            if (c == null) return
-            val inputBuffer = c.getInputBuffer(index) ?: return
-            inputBuffer.clear()
-            inputBuffer.put(frame.data, 0, frame.length)
-            // Monotonic local clock for PTS; the wire ptsMs is stats-only per protocol §3 and
-            // must never be used to pace rendering.
-            var ptsUs = SystemClock.elapsedRealtimeNanos() / 1000
+            if (activeCodec !== codec || frame.generation != workerGeneration) return false
+            val input = activeCodec.getInputBuffer(index)
+                ?: throw IllegalStateException("decoder returned a null input buffer")
+            input.clear()
+            if (frame.length > input.remaining()) {
+                Log.e(
+                    TAG,
+                    "AU exceeds codec input capacity: frame=${frame.frameId} " +
+                        "length=${frame.length} capacity=${input.capacity()} codec=${activeCodec.name}"
+                )
+                throw IllegalArgumentException("H.264 access unit exceeds codec input capacity")
+            }
+            input.put(frame.data, 0, frame.length)
+            var ptsUs = nowUs()
             while (submitTimesUs.containsKey(ptsUs)) ptsUs++
-            c.queueInputBuffer(index, 0, frame.length, ptsUs, 0)
-            submitTimesUs[ptsUs] = ptsUs
-        } catch (e: Exception) {
-            Log.w(TAG, "queueInputBuffer failed", e)
-            handler.post { onDropOrError() }
+            activeCodec.queueInputBuffer(index, 0, frame.length, ptsUs, 0)
+            submitTimesUs[ptsUs] = frame.enqueuedAtUs
+            lastInputQueuedAtUs = ptsUs
+            if (frame.keyframe) recoverySignaled.set(false)
+            queued = true
+        } catch (error: Exception) {
+            Log.w(TAG, "queueInputBuffer failed for frame=${frame.frameId}", error)
         } finally {
             onBufferRelease(frame.data)
         }
+
+        if (!queued && activeCodec === codec) {
+            // Destroying the codec returns the owned input index. Leaving it unqueued would
+            // progressively exhaust every input slot after large-AU failures on OEM codecs.
+            scheduleCodecRecoveryOnWorker("input feed failure", notify = true)
+        }
+        return queued
     }
 
-    private fun configureAndStartLocked(): Boolean {
-        var c: MediaCodec? = null
+    private fun configureCodecOnWorker(config: StreamConfig): Boolean {
+        var candidate: MediaCodec? = null
         return try {
-            c = MediaCodec.createDecoderByType(MIME_TYPE)
-            c.setCallback(callback, handler) // must precede configure() for async mode
-            val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                try {
-                    val caps = c.codecInfo.getCapabilitiesForType(MIME_TYPE)
-                    if (caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)) {
-                        format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "low-latency capability query failed", e)
-                }
+            val format = MediaFormat.createVideoFormat(MIME_TYPE, config.width, config.height).apply {
+                setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, config.fps)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_ACCESS_UNIT_BYTES)
             }
-            format.setInteger(MediaFormat.KEY_PRIORITY, 0) // realtime
-            // Hints the codec to run flat-out. Short.MAX_VALUE misbehaves on some devices;
-            // 240 is a safe "faster than any real content" value.
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
+            val decoderName = chooseDecoderName(format, config)
+            candidate = if (decoderName != null) {
+                MediaCodec.createByCodecName(decoderName)
+            } else {
+                MediaCodec.createDecoderByType(MIME_TYPE)
+            }
 
-            c.configure(format, surface, null, 0)
-            c.start()
-            codec = c
-            started = true
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "failed to configure/start decoder", e)
+            val capabilities = candidate.codecInfo.getCapabilitiesForType(MIME_TYPE)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                capabilities.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+            ) {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
+
+            candidate.setCallback(callback, handler)
+            candidate.configure(format, config.surface, null, 0)
+            candidate.start()
+            if (released.get() || config.generation != streamGeneration) {
+                destroyCodecOnWorker(candidate)
+                return false
+            }
+            codec = candidate
+            codecStartedAtUs = nowUs()
+            lastOutputAtUs = codecStartedAtUs
             try {
-                c?.release()
-            } catch (e2: Exception) {
-                // ignore
+                Log.i(TAG, decoderDescription(candidate, capabilities, config))
+            } catch (diagnosticError: Exception) {
+                Log.w(TAG, "decoder capability diagnostics unavailable", diagnosticError)
             }
+            true
+        } catch (error: Exception) {
+            Log.e(TAG, "failed to configure/start decoder", error)
+            if (codec === candidate) codec = null
+            destroyCodecOnWorker(candidate)
             false
         }
     }
 
-    /** Detaches the current codec from this decoder's state (so all subsequent calls and
-     * stale callbacks see "no codec") and drains the pending queues, WITHOUT the potentially
-     * blocking stop()/release() -- callers do that outside the lock via [destroyCodec]. */
-    private fun detachCodecLocked(): MediaCodec? {
-        val c = codec
+    private fun scheduleCodecRecoveryOnWorker(reason: String, notify: Boolean) {
+        val old = codec
         codec = null
-        started = false
+        pendingInputIndices.clear()
+        submitTimesUs.clear()
+        signalQueueRecovery(notify)
+        if (old == null) return
+
+        codecReleasePending = true
+        // Recovery may originate inside a MediaCodec callback. Post teardown so the callback
+        // returns first; the same serial worker guarantees release finishes before reconfigure.
+        handler.post {
+            Log.w(TAG, "releasing decoder for recovery: $reason")
+            destroyCodecOnWorker(old)
+            codecReleasePending = false
+            scheduleDrain()
+        }
+    }
+
+    private fun signalQueueRecovery(notify: Boolean = true) {
+        var shouldNotify = false
+        synchronized(queueLock) {
+            clearPendingLocked()
+            waitingForKeyframe = true
+            if (notify) shouldNotify = recoverySignaled.compareAndSet(false, true)
+        }
+        if (shouldNotify) onDropOrError()
+    }
+
+    private fun releaseOnWorker() {
+        handler.removeCallbacks(watchdogRunnable)
+        destroyCodecOnWorker(codec)
+        codec = null
+        codecReleasePending = false
+        pendingInputIndices.clear()
+        submitTimesUs.clear()
+        streamConfig = null
+        workerGeneration = -1L
+    }
+
+    private fun destroyCodecOnWorker(value: MediaCodec?) {
+        if (value == null) return
+        try { value.stop() } catch (_: Exception) { }
+        try { value.release() } catch (_: Exception) { }
+    }
+
+    // ---- queue helpers -----------------------------------------------------------------
+
+    private fun scheduleDrain() {
+        val shouldPost = synchronized(queueLock) {
+            if (!acceptingFrames || released.get() || drainPosted) {
+                false
+            } else {
+                drainPosted = true
+                true
+            }
+        }
+        if (shouldPost && !handler.post(drainRunnable)) {
+            synchronized(queueLock) {
+                drainPosted = false
+                clearPendingLocked()
+            }
+        }
+    }
+
+    private fun discardStalePendingLocked(generation: Long) {
+        while (true) {
+            val first = pendingFrames.peekFirst() ?: return
+            if (first.generation == generation) return
+            onBufferRelease(pendingFrames.removeFirst().data)
+        }
+    }
+
+    private fun clearPendingLocked() {
         while (pendingFrames.isNotEmpty()) {
             onBufferRelease(pendingFrames.removeFirst().data)
         }
-        pendingInputIndices.clear()
-        submitTimesUs.clear()
-        return c
     }
 
-    /** Must be called OUTSIDE [lock]: stop() and release() may block, and holding the lock
-     * across them would stall the receive thread (submitFrame) and codec callbacks. */
-    private fun destroyCodec(c: MediaCodec) {
-        try {
-            c.stop()
-        } catch (e: Exception) {
-            // ignore
-        }
-        try {
-            c.release()
-        } catch (e: Exception) {
-            // ignore
+    // ---- codec selection/diagnostics ----------------------------------------------------
+
+    private fun chooseDecoderName(format: MediaFormat, config: StreamConfig): String? {
+        return try {
+            val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+            val preferredName = list.findDecoderForFormat(format)
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return preferredName
+
+            val preferredInfo = list.codecInfos.firstOrNull { it.name == preferredName }
+            if (preferredInfo != null && isAcceleratedCompatible(preferredInfo, format, config)) {
+                return preferredName
+            }
+            list.codecInfos.firstOrNull {
+                isAcceleratedCompatible(it, format, config)
+            }?.name ?: preferredName
+        } catch (error: Exception) {
+            Log.w(TAG, "format-based decoder selection failed; using MIME preference", error)
+            null
         }
     }
+
+    private fun isAcceleratedCompatible(
+        info: MediaCodecInfo,
+        format: MediaFormat,
+        config: StreamConfig
+    ): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+        if (info.isEncoder || info.isAlias || !info.isHardwareAccelerated || info.isSoftwareOnly) {
+            return false
+        }
+        if (info.supportedTypes.none { it.equals(MIME_TYPE, ignoreCase = true) }) return false
+        return try {
+            val capabilities = info.getCapabilitiesForType(MIME_TYPE)
+            capabilities.isFormatSupported(format) &&
+                capabilities.videoCapabilities.areSizeAndRateSupported(
+                    config.width,
+                    config.height,
+                    config.fps.toDouble()
+                )
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun decoderDescription(
+        selected: MediaCodec,
+        capabilities: MediaCodecInfo.CodecCapabilities,
+        config: StreamConfig
+    ): String {
+        val info = selected.codecInfo
+        val hardware = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            info.isHardwareAccelerated && !info.isSoftwareOnly
+        } else {
+            !info.name.startsWith("OMX.google.") && !info.name.startsWith("c2.android.")
+        }
+        val performance = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val requested = MediaCodecInfo.VideoCapabilities.PerformancePoint(
+                config.width,
+                config.height,
+                config.fps
+            )
+            val points = capabilities.videoCapabilities.supportedPerformancePoints
+            when {
+                points == null -> "unknown"
+                points.any { it.covers(requested) } -> "covered"
+                else -> "not-advertised"
+            }
+        } else {
+            "unavailable"
+        }
+        val canonical = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            selected.canonicalName
+        } else {
+            selected.name
+        }
+        return "decoder ready: name=${selected.name} canonical=$canonical hardware=$hardware " +
+            "${config.width}x${config.height}@${config.fps} performance=$performance " +
+            "maxAu=$MAX_ACCESS_UNIT_BYTES"
+    }
+
+    private fun nowUs(): Long = SystemClock.elapsedRealtimeNanos() / 1000L
 
     companion object {
         private const val TAG = "VideoDecoder"
         private const val MIME_TYPE = "video/avc"
-        private const val MAX_PENDING_FRAMES = 2
+        private const val MIN_FPS = 24
+        private const val MAX_FPS = 240
+        private const val MAX_PENDING_FRAMES = 6
+        private const val MAX_PENDING_AGE_US = 120_000L
+        private const val CODEC_STARTUP_GRACE_US = 1_000_000L
+        private const val CODEC_INPUT_STALL_US = 500_000L
+        private const val CODEC_OUTPUT_STALL_US = 1_500_000L
+        private const val WATCHDOG_INTERVAL_MS = 500L
+        private const val RELEASE_WAIT_MS = 1_500L
+        // Matches the Android protocol sanity ceiling: 4096 packets * 1200-byte payload.
+        private const val MAX_ACCESS_UNIT_BYTES = 4096 * 1200
     }
 }

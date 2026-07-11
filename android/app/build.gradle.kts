@@ -11,8 +11,8 @@ android {
         applicationId = "com.deskstream.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 11
-        versionName = "0.5.3"
+        versionCode = 12
+        versionName = "0.5.6"
     }
 
     buildTypes {
@@ -51,4 +51,5 @@ dependencies {
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+    testImplementation("junit:junit:4.13.2")
 }
