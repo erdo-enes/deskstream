@@ -2,7 +2,9 @@
 
 #import "DSProtocol.h"
 
-static const NSUInteger DSMaximumInflightFrames = 2;
+// Assembly state is not a render/jitter queue. Four frames tolerates ordinary Wi-Fi datagram
+// reordering without adding presentation latency (completed frames still leave immediately).
+static const NSUInteger DSMaximumInflightFrames = 4;
 static const uint16_t DSMaximumPacketCount = 4096;
 static const uint16_t DSFECGroupSize = 8;
 

@@ -35,17 +35,22 @@ and video latency still needs validation against a Windows host.
    async decoder rendering straight to the SurfaceView. It then negotiates system audio on
    a separate UDP socket, hole-punches with `DSAH`, and writes fixed 5 ms PCM blocks to a
    low-latency AudioTrack. Tap the LIVE status chip for detailed video/network/audio/latency
-   diagnostics; the audio button locally mutes without stopping reception. Back sends
-   `STOP_STREAM` and exits;
+   diagnostics; the audio button locally mutes without stopping reception. Back opens an
+   explicit Leave action (and only restores controls while clean-screen mode is active);
    backgrounding sends `STOP_STREAM` but keeps the control socket (protocol §5), then sends
    `START_STREAM` again on return.
 4. A connected Bluetooth/USB gamepad is detected automatically. Buttons, D-pad, sticks,
    analog triggers, hot-plug events, and up to four controller slots are forwarded to the
    PC over UDP. The PC exposes Xbox 360 controllers and returns rumble to Android.
-5. Touch input is negotiated after video starts. The top-right control switches between a
-   relative **Touchpad** and absolute **Direct** pointer. Tap = left-click, hold + move =
-   drag, two-finger move = scroll, and two-finger tap = right-click. Mouse buttons are reset
-   whenever the stream stops or the app backgrounds.
+5. Touch input is negotiated after video starts. The compact top-right **Mouse** pill expands
+   Enable/Disable, **Touchpad**/**Direct**, **Left**, and **Right** actions for five seconds.
+   A single surface tap only positions/moves; double-tap = left-click, double-tap + move = drag,
+   two-finger move = scroll, and a short stationary two-finger tap = right-click. Mouse buttons
+   are reset whenever the stream stops or the app backgrounds.
+6. The toolbar selects Native (20 Mbps ceiling) / 720p (10 Mbps ceiling) quality, saves a
+   local screenshot, and offers **Hide** for a video-only clean screen. Hold three fingers for
+   600 ms, press Back, or press F11 on a hardware keyboard to restore every control without
+   sending an accidental mouse click to the PC.
 
 ## Code map
 

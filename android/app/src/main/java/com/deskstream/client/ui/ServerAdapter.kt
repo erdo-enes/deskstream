@@ -1,12 +1,15 @@
 package com.deskstream.client.ui
 
 import android.view.LayoutInflater
+import android.view.View
 import android.view.ViewGroup
 import androidx.recyclerview.widget.RecyclerView
 import com.deskstream.client.databinding.ItemServerBinding
 import com.deskstream.client.net.DiscoveredServer
 
 class ServerAdapter(
+    /** Whether this server IP has a previously-paired token, shown as a small badge. */
+    private val isPaired: (String) -> Boolean,
     private val onClick: (DiscoveredServer) -> Unit
 ) : RecyclerView.Adapter<ServerAdapter.ViewHolder>() {
 
@@ -44,6 +47,7 @@ class ServerAdapter(
         val item = items[position]
         holder.binding.tvServerName.text = item.name
         holder.binding.tvServerIp.text = "${item.ip}:${item.controlPort}"
+        holder.binding.tvPairedBadge.visibility = if (isPaired(item.ip)) View.VISIBLE else View.GONE
         holder.binding.itemRoot.setOnClickListener { onClick(item) }
     }
 

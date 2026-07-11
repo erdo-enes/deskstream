@@ -1,6 +1,7 @@
 package com.deskstream.client.ui
 
 import android.content.Context
+import android.content.res.ColorStateList
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
@@ -12,9 +13,12 @@ import android.view.SurfaceHolder
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
+import android.view.accessibility.AccessibilityManager
 import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -25,6 +29,7 @@ import com.deskstream.client.R
 import com.deskstream.client.audio.AudioPlaybackState
 import com.deskstream.client.audio.AudioReceiver
 import com.deskstream.client.audio.AudioStats
+import com.deskstream.client.data.Prefs
 import com.deskstream.client.databinding.ActivityStreamBinding
 import com.deskstream.client.input.GamepadForwarder
 import com.deskstream.client.input.GamepadInventory
@@ -56,10 +61,18 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     @Volatile private var mediaReceiver: MediaReceiver? = null
     @Volatile private var audioReceiver: AudioReceiver? = null
     @Volatile private var gamepadForwardingEnabled = false
+    /** Set from the decoder's own callback thread the first time a frame is actually rendered
+     * to the surface; screenshots must not fire PixelCopy before this, since a never-drawn
+     * surface reads back as solid black. */
+    @Volatile private var frameRendered = false
 
     private lateinit var gamepadForwarder: GamepadForwarder
     private lateinit var remoteMouse: RemoteMouseController
+    private lateinit var prefs: Prefs
     private var wifiLock: WifiManager.WifiLock? = null
+    /** Preferred stream quality ("native" or "720p"), persisted via [Prefs.streamQuality] and
+     * sent as START_STREAM.quality. Servers before v0.5.0 ignore the field and stream native. */
+    private var streamQuality: String = Prefs.QUALITY_NATIVE
 
     private var surfaceReady = false
     /** True once START_STREAM has been sent for the current READY session; reset whenever we
@@ -70,6 +83,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var audioNegotiationJob: Job? = null
     private var inputNegotiationJob: Job? = null
     private var mouseHintJob: Job? = null
+    private var mouseToolbarCollapseJob: Job? = null
     private var stallRecoveryInProgress = false
     private var streamStartFailed = false
     private var audioStatus = "starting"
@@ -86,16 +100,30 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var lastEncoderBackend = "media-foundation"
     private var mouseStatus = "negotiating"
     private var mouseEnabledByUser = true
+    /** The persistent mouse affordance is one compact pill. Its full action strip is revealed
+     * only on demand and automatically collapses after a short idle period. */
+    private var mouseToolbarExpanded = false
     private var gamepadInventory = GamepadInventory(0, 0, emptyList())
     private var gamepadStatus = "none detected"
     private var gamepadDetail = "Connect a Bluetooth or USB controller to Android"
     private var exitSnackbar: Snackbar? = null
+    /** Snackbars are outside the XML overlay hierarchy, so keep track of them explicitly. Clean
+     * screen dismisses existing bars and suppresses new ones until controls are restored. */
+    private val activeSnackbars = mutableSetOf<Snackbar>()
+    /** "Clean screen" mode hides the single overlay layer, leaving only the video surface.
+     * Child status and cursor callbacks may continue updating safely because a visible child
+     * cannot escape its hidden parent. */
+    private var controlsHidden = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         binding = ActivityStreamBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        controlsHidden = savedInstanceState?.getBoolean(STATE_CONTROLS_HIDDEN) == true
+        prefs = Prefs(applicationContext)
+        streamQuality = prefs.streamQuality
+        updateQualityButton()
         gamepadForwarder = GamepadForwarder(applicationContext, ::onGamepadInventoryChanged)
         remoteMouse = RemoteMouseController(
             binding.surfaceView,
@@ -103,7 +131,9 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             onModeChanged = {
                 updatePointerButton(it)
                 showMouseGestureHint()
-            }
+            },
+            shouldHandleCleanScreenGesture = { controlsHidden },
+            onCleanScreenReveal = { showControls() }
         )
         createWifiLock()
         applyImmersiveMode()
@@ -121,17 +151,33 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
         binding.btnPointerMode.setOnClickListener {
             remoteMouse.toggleMode()
+            scheduleMouseToolbarCollapse()
         }
         binding.btnMouseToggle.setOnClickListener {
             mouseEnabledByUser = !mouseEnabledByUser
             applyMouseControls()
             if (mouseEnabledByUser) showMouseGestureHint()
+            scheduleMouseToolbarCollapse()
         }
-        binding.btnMouseClick.setOnClickListener { remoteMouse.clickLeft() }
-        binding.btnMouseClick.setOnLongClickListener {
+        binding.btnMouseClick.setOnClickListener {
+            remoteMouse.clickLeft()
+            scheduleMouseToolbarCollapse()
+        }
+        binding.btnMouseRight.setOnClickListener {
             remoteMouse.clickRight()
-            true
+            scheduleMouseToolbarCollapse()
         }
+        binding.btnMouseMenu.setOnClickListener {
+            if (mouseToolbarExpanded) collapseMouseToolbar() else expandMouseToolbar()
+        }
+        binding.btnStats.setOnClickListener { toggleDiagnostics() }
+        binding.btnQuality.setOnClickListener {
+            val next = if (streamQuality == Prefs.QUALITY_720P) Prefs.QUALITY_NATIVE else Prefs.QUALITY_720P
+            setStreamQuality(next)
+        }
+        binding.btnScreenshot.setOnClickListener { takeScreenshot() }
+        binding.btnHideControls.setOnClickListener { hideControls() }
+        binding.btnLeave.setOnClickListener { confirmLeave() }
         binding.streamRoot.addOnLayoutChangeListener { _, l, t, r, b, oldL, oldT, oldR, oldB ->
             if ((r - l) != (oldR - oldL) || (b - t) != (oldB - oldT)) {
                 applyAspectRatio(lastStreamWidth, lastStreamHeight)
@@ -140,22 +186,23 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
+                if (controlsHidden) {
+                    showControls()
+                    return
+                }
                 // Android's edge-back gesture can be triggered while using the touchpad.
                 // Leaving therefore requires an explicit action, never another gesture.
-                if (exitSnackbar?.isShown == true) return
-                exitSnackbar = Snackbar.make(
-                    binding.streamRoot,
-                    getString(R.string.leave_stream_prompt),
-                    Snackbar.LENGTH_LONG
-                ).setAction(R.string.leave_stream_action) {
-                    ControlClient.stopStream()
-                    finish()
-                }
-                exitSnackbar?.show()
+                confirmLeave()
             }
         })
 
+        applyControlsVisibility()
         observeControlClient()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(STATE_CONTROLS_HIDDEN, controlsHidden)
+        super.onSaveInstanceState(outState)
     }
 
     override fun onStart() {
@@ -181,9 +228,10 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
-        exitSnackbar?.dismiss()
-        exitSnackbar = null
+        dismissActiveSnackbars()
         hideMouseGestureHint()
+        mouseToolbarCollapseJob?.cancel()
+        mouseToolbarCollapseJob = null
         super.onDestroy()
         gamepadForwarder.stop()
         stopReceivers()
@@ -197,6 +245,14 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // F11 is a hardware-keyboard fallback for clean screen. Consume both key edges so a
+        // connected keyboard/gamepad can never receive a mismatched down/up pair.
+        if (event.keyCode == KeyEvent.KEYCODE_F11) {
+            if (event.action == KeyEvent.ACTION_UP && event.repeatCount == 0) {
+                if (controlsHidden) showControls() else hideControls()
+            }
+            return true
+        }
         return if (gamepadForwarder.handleKeyEvent(event)) true else super.dispatchKeyEvent(event)
     }
 
@@ -215,11 +271,15 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         surfaceReady = true
+        frameRendered = false
         videoDecoder?.release()
         videoDecoder = VideoDecoder(
             onDropOrError = { mediaReceiver?.notifyExternalDrop() },
             onBufferRelease = { buf -> mediaReceiver?.bufferPool?.release(buf) },
-            onFrameRendered = { latencyMs -> mediaReceiver?.recordDecoderSurfaceLatency(latencyMs) }
+            onFrameRendered = { latencyMs ->
+                frameRendered = true
+                mediaReceiver?.recordDecoderSurfaceLatency(latencyMs)
+            }
         )
         maybeStartStream()
     }
@@ -251,6 +311,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun handleState(state: ControlClient.State) {
+        updateStatusChip()
         when (state) {
             ControlClient.State.READY -> {
                 // Either a fresh session, or we just silently reconnected while this Activity
@@ -319,7 +380,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     }
                     val description = describeStreamError(msg)
                     showCenterStatus(description)
-                    Snackbar.make(binding.streamRoot, description, Snackbar.LENGTH_LONG).show()
+                    showSnackbar(description, Snackbar.LENGTH_LONG)
                 }
                 else -> {}
             }
@@ -332,7 +393,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             try { stopReceivers() } catch (_: Exception) { }
             val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
             showCenterStatus("Client setup failed: $detail")
-            Snackbar.make(binding.streamRoot, "Client setup failed; see logcat", Snackbar.LENGTH_LONG).show()
+            showSnackbar("Client setup failed; see logcat", Snackbar.LENGTH_LONG)
             ControlClient.stopStream()
         }
     }
@@ -341,7 +402,12 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         if (surfaceReady && !streamRequested && ControlClient.state.value == ControlClient.State.READY) {
             streamRequested = true
             showCenterStatus("Connected to ${ControlClient.serverIp}\nStarting video…")
-            ControlClient.startStream(MAX_BITRATE_KBPS, TARGET_FPS)
+            val maxBitrateKbps = if (streamQuality == Prefs.QUALITY_720P) {
+                MAX_720P_BITRATE_KBPS
+            } else {
+                MAX_NATIVE_BITRATE_KBPS
+            }
+            ControlClient.startStream(maxBitrateKbps, TARGET_FPS, streamQuality)
         }
     }
 
@@ -360,6 +426,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         audioStatus = "starting"
         audioDetail = "Negotiating with the PC"
         applyAspectRatio(msg.width, msg.height)
+        updateStatusChip()
 
         val decoder = videoDecoder
         val holder = binding.surfaceView.holder
@@ -372,6 +439,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         // Always release + recreate on STREAM_STARTED: dimensions may differ, and frameId
         // numbering restarts server-side even if they don't (protocol §5).
         mediaReceiver?.stop()
+        frameRendered = false
         decoder.resetForNewStream(holder.surface, msg.width, msg.height)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
@@ -398,7 +466,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             streamStartFailed = true
             streamRequested = true
             showCenterStatus("Client media setup failed: $mediaStartupError")
-            Snackbar.make(binding.streamRoot, mediaStartupError, Snackbar.LENGTH_LONG).show()
+            showSnackbar(mediaStartupError, Snackbar.LENGTH_LONG)
             ControlClient.stopStream()
             return
         }
@@ -452,7 +520,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         inputNegotiationJob = null
         mouseStatus = "unavailable"
         applyMouseControls()
-        Snackbar.make(binding.streamRoot, "Remote mouse unavailable: $message", Snackbar.LENGTH_LONG).show()
+        showSnackbar("Remote mouse unavailable: $message", Snackbar.LENGTH_LONG)
     }
 
     private fun updatePointerButton(mode: MouseMode) {
@@ -460,7 +528,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             "negotiating" -> getString(R.string.mouse_mode_starting)
             "unavailable" -> getString(R.string.mouse_mode_unavailable)
             else -> if (mode == MouseMode.TOUCHPAD) {
-                getString(R.string.mouse_mode_pad)
+                getString(R.string.mouse_mode_touchpad)
             } else {
                 getString(R.string.mouse_mode_direct)
             }
@@ -482,9 +550,9 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         remoteMouse.setEnabled(active)
         binding.btnMouseToggle.isEnabled = negotiated
         binding.btnMouseToggle.text = if (mouseEnabledByUser) {
-            getString(R.string.mouse_toggle_on)
+            getString(R.string.mouse_disable)
         } else {
-            getString(R.string.mouse_toggle_off)
+            getString(R.string.mouse_enable)
         }
         binding.btnMouseToggle.contentDescription = if (mouseEnabledByUser) {
             getString(R.string.mouse_disable_description)
@@ -493,6 +561,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         }
         binding.btnPointerMode.isEnabled = active
         binding.btnMouseClick.isEnabled = active
+        binding.btnMouseRight.isEnabled = active
         // Do not flash an unpositioned cursor in the top-left corner. It becomes visible
         // only after feedback arrives for the first motion packet.
         if (!active) binding.tvRemoteCursor.visibility = View.GONE
@@ -539,18 +608,183 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         binding.tvGestureHint.visibility = View.GONE
     }
 
+    private fun expandMouseToolbar() {
+        if (controlsHidden || mouseToolbarExpanded) return
+        mouseToolbarExpanded = true
+        binding.mouseActions.visibility = View.VISIBLE
+        binding.btnMouseMenu.contentDescription = getString(R.string.mouse_menu_hide_description)
+        binding.mouseActions.announceForAccessibility(getString(R.string.mouse_controls_shown))
+        scheduleMouseToolbarCollapse()
+    }
+
+    private fun collapseMouseToolbar() {
+        mouseToolbarCollapseJob?.cancel()
+        mouseToolbarCollapseJob = null
+        mouseToolbarExpanded = false
+        binding.mouseActions.visibility = View.GONE
+        binding.btnMouseMenu.contentDescription = getString(R.string.mouse_menu_show_description)
+    }
+
+    private fun scheduleMouseToolbarCollapse() {
+        mouseToolbarCollapseJob?.cancel()
+        mouseToolbarCollapseJob = null
+        if (!mouseToolbarExpanded) return
+
+        // Auto-collapsing while TalkBack is traversing the newly revealed actions can strand
+        // accessibility focus. Touch-exploration users close the anchored Mouse button
+        // explicitly; everyone else gets the low-obstruction five-second idle behavior.
+        val accessibility = getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+        if (accessibility?.isTouchExplorationEnabled == true) return
+
+        mouseToolbarCollapseJob = lifecycleScope.launch {
+            delay(MOUSE_TOOLBAR_EXPANDED_MS)
+            collapseMouseToolbar()
+        }
+    }
+
     private fun restartStalledStream() {
+        restartStream("Video stalled\nRecovering stream…")
+    }
+
+    /**
+     * Shared stop -> STREAM_STOPPED -> READY -> start restart path. [handleState] restarts the
+     * pipeline as soon as the control channel reports READY again (the same reconnect-driven
+     * restart used after a background/foreground cycle), so quality changes reuse exactly the
+     * mechanism stall recovery already relies on instead of inventing a second state machine.
+     */
+    private fun restartStream(statusMessage: String) {
         if (stallRecoveryInProgress || !surfaceReady ||
             ControlClient.state.value != ControlClient.State.STREAMING
         ) return
         stallRecoveryInProgress = true
-        showCenterStatus("Video stalled\nRecovering stream…")
+        showCenterStatus(statusMessage)
         remoteMouse.setEnabled(false)
         hideMouseGestureHint()
         streamRequested = false
         // Wait for STREAM_STOPPED/READY before requesting the replacement pipeline. This
         // preserves STOP_STREAM -> START_STREAM ordering on the control connection.
         ControlClient.stopStream()
+    }
+
+    /** Persists the chosen quality and, if currently streaming, restarts the stream through
+     * [restartStream] so the new value takes effect immediately. If not yet streaming, the
+     * next [maybeStartStream] call picks it up naturally. */
+    private fun setStreamQuality(newQuality: String) {
+        if (newQuality == streamQuality) return
+        streamQuality = newQuality
+        prefs.streamQuality = newQuality
+        updateQualityButton()
+        if (ControlClient.state.value == ControlClient.State.STREAMING) {
+            restartStream(getString(R.string.quality_switching, qualityLabel(newQuality)))
+        }
+    }
+
+    private fun qualityLabel(quality: String): String =
+        if (quality == Prefs.QUALITY_720P) getString(R.string.quality_720p) else getString(R.string.quality_native)
+
+    private fun updateQualityButton() {
+        val label = qualityLabel(streamQuality)
+        binding.btnQuality.text = label
+        binding.btnQuality.contentDescription = getString(R.string.cd_quality_button, label)
+    }
+
+    private fun takeScreenshot() {
+        if (ControlClient.state.value != ControlClient.State.STREAMING || !frameRendered) {
+            showSnackbar(getString(R.string.screenshot_no_frame), Snackbar.LENGTH_SHORT)
+            return
+        }
+        ScreenshotSaver.capture(
+            applicationContext,
+            binding.surfaceView,
+            lastStreamWidth,
+            lastStreamHeight,
+            frameRendered
+        ) { success, message ->
+            runOnUiThread {
+                val text = if (success) getString(R.string.screenshot_saved, message) else message
+                showSnackbar(text, Snackbar.LENGTH_LONG)
+            }
+        }
+    }
+
+    private fun confirmLeave() {
+        if (exitSnackbar?.isShown == true) return
+        exitSnackbar = createSnackbar(
+            getString(R.string.leave_stream_prompt),
+            Snackbar.LENGTH_LONG
+        )?.setAction(R.string.leave_stream_action) {
+            ControlClient.stopStream()
+            finish()
+        }
+        exitSnackbar?.show()
+    }
+
+    /** Hides every non-video view. Three-finger hold, Back, or F11 restores the overlay without
+     * sharing a gesture with remote mouse click/drag input. */
+    private fun hideControls() {
+        if (controlsHidden) return
+        dismissActiveSnackbars()
+        controlsHidden = true
+        applyControlsVisibility()
+        Toast.makeText(this, R.string.controls_hidden_hint, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showControls() {
+        if (!controlsHidden) return
+        controlsHidden = false
+        applyControlsVisibility()
+    }
+
+    private fun showSnackbar(message: CharSequence, duration: Int) {
+        createSnackbar(message, duration)?.show()
+    }
+
+    private fun createSnackbar(message: CharSequence, duration: Int): Snackbar? {
+        if (controlsHidden) return null
+        val snackbar = Snackbar.make(binding.streamRoot, message, duration)
+        activeSnackbars += snackbar
+        snackbar.addCallback(object : Snackbar.Callback() {
+            override fun onDismissed(transientBottomBar: Snackbar?, event: Int) {
+                activeSnackbars -= snackbar
+                if (exitSnackbar === snackbar) exitSnackbar = null
+            }
+        })
+        return snackbar
+    }
+
+    private fun dismissActiveSnackbars() {
+        activeSnackbars.toList().forEach { it.dismiss() }
+        activeSnackbars.clear()
+        exitSnackbar = null
+    }
+
+    /** Hiding the parent layer is intentional: asynchronous reconnect, stats, and cursor updates
+     * can change child visibility without breaking clean-screen mode. */
+    private fun applyControlsVisibility() {
+        binding.overlayLayer.visibility = if (controlsHidden) View.GONE else View.VISIBLE
+        if (controlsHidden) {
+            hideMouseGestureHint()
+            collapseMouseToolbar()
+        }
+        // The activity is already sticky-immersive at all times (see applyImmersiveMode()); a
+        // system-bar swipe-reveal while controls are hidden should still auto-hide again, so
+        // re-assert it here rather than introducing a second immersive mode.
+        applyImmersiveMode()
+    }
+
+    private fun updateStatusChip() {
+        val state = ControlClient.state.value
+        val streaming = state == ControlClient.State.STREAMING && lastStreamWidth > 0 && lastStreamHeight > 0
+        val (text, colorRes) = when {
+            streaming ->
+                getString(R.string.status_streaming, lastStreamWidth, lastStreamHeight, lastStreamFps) to R.color.status_green
+            state == ControlClient.State.RECONNECTING -> getString(R.string.status_reconnecting) to R.color.status_red
+            state == ControlClient.State.DISCONNECTED -> getString(R.string.status_disconnected) to R.color.status_red
+            else -> getString(R.string.status_connecting) to R.color.status_amber
+        }
+        binding.tvStreamStatus.text = text
+        binding.viewStatusDot.backgroundTintList =
+            ColorStateList.valueOf(ContextCompat.getColor(this, colorRes))
     }
 
     private fun updateStatsOverlay(stats: StreamStats) {
@@ -624,7 +858,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         binding.btnAudio.isEnabled = false
         updateAudioButton()
         renderDiagnostics()
-        Snackbar.make(binding.streamRoot, "Video is live, but audio is unavailable: $audioDetail", Snackbar.LENGTH_LONG).show()
+        showSnackbar("Video is live, but audio is unavailable: $audioDetail", Snackbar.LENGTH_LONG)
     }
 
     private fun onGamepadInventoryChanged(inventory: GamepadInventory) {
@@ -683,11 +917,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         gamepadDetail = message.message.ifEmpty { "Install ViGEmBus 1.22 on the PC" }
         updateGamepadStatus()
         renderDiagnostics()
-        Snackbar.make(
-            binding.streamRoot,
-            "Controller unavailable: $gamepadDetail",
-            Snackbar.LENGTH_LONG
-        ).show()
+        showSnackbar("Controller unavailable: $gamepadDetail", Snackbar.LENGTH_LONG)
     }
 
     private fun updateGamepadStatus() {
@@ -695,6 +925,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     }
 
     private fun stopReceivers() {
+        frameRendered = false
         audioNegotiationJob?.cancel()
         audioNegotiationJob = null
         inputNegotiationJob?.cancel()
@@ -704,6 +935,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         binding.btnMouseToggle.isEnabled = false
         binding.btnPointerMode.isEnabled = false
         binding.btnMouseClick.isEnabled = false
+        binding.btnMouseRight.isEnabled = false
         binding.tvRemoteCursor.visibility = View.GONE
         mediaReceiver?.stop()
         mediaReceiver = null
@@ -721,29 +953,27 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private fun showCenterStatus(message: String) {
         binding.tvConnecting.text = message
         binding.tvConnecting.visibility = View.VISIBLE
-        binding.tvStreamStatus.visibility = View.GONE
+        // The connection-state chip (tvStreamStatus/viewStatusDot) is intentionally left alone
+        // here: it now reflects Connecting/Streaming/Reconnecting continuously (see
+        // updateStatusChip()), independent of this large center-screen message.
     }
 
     private fun updateAudioButton() {
         binding.btnAudio.text = when (audioStatus) {
             "starting" -> "Audio…"
             "unavailable" -> "No audio"
-            else -> if (audioMuted) "Unmute" else "Mute"
+            else -> if (audioMuted) getString(R.string.toolbar_unmute) else getString(R.string.toolbar_mute)
+        }
+        binding.btnAudio.contentDescription = if (audioMuted) {
+            getString(R.string.cd_unmute_button)
+        } else {
+            getString(R.string.cd_mute_button)
         }
     }
 
     private fun renderDiagnostics() {
         if (lastStreamWidth <= 0 || lastStreamHeight <= 0) return
-
-        val audioLabel = when {
-            audioStatus == "unavailable" -> "audio unavailable"
-            audioStatus == "starting" -> "audio starting"
-            audioMuted -> "audio muted"
-            audioStatus == "live" -> "audio on"
-            else -> "audio ready"
-        }
-        binding.tvStreamStatus.text =
-            "LIVE · ${lastStreamWidth}×${lastStreamHeight} @ $lastStreamFps · $audioLabel"
+        updateStatusChip()
 
         val video = lastVideoStats
         val audio = lastAudioStats
@@ -778,6 +1008,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
             }
             append("\nPAD    $gamepadDetail")
             append("\nMOUSE  $mouseStatus · ${remoteMouse.currentMode().name.lowercase()}")
+            append("\nQUAL   ${qualityLabel(streamQuality)}")
         }
     }
 
@@ -851,10 +1082,13 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     companion object {
         private const val TAG = "StreamActivity"
-        private const val MAX_BITRATE_KBPS = 20000
+        private const val STATE_CONTROLS_HIDDEN = "controls_hidden"
+        private const val MAX_NATIVE_BITRATE_KBPS = 20000
+        private const val MAX_720P_BITRATE_KBPS = 10000
         private const val TARGET_FPS = 60
         private const val MOUSE_HINT_VISIBLE_MS = 4500L
         private const val MOUSE_HINT_FADE_MS = 250L
+        private const val MOUSE_TOOLBAR_EXPANDED_MS = 5000L
         private const val AUDIO_NEGOTIATION_TIMEOUT_MS = 3500L
         private const val INPUT_NEGOTIATION_TIMEOUT_MS = 2500L
     }

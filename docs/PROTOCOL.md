@@ -91,7 +91,7 @@ with the token and proceeds. `PAIR_FAIL` with `attemptsLeft` on wrong PIN.
 Client → server:
 
 ```json
-{"type":"START_STREAM","maxBitrateKbps":20000,"fps":60}
+{"type":"START_STREAM","maxBitrateKbps":10000,"fps":60,"quality":"720p"}
 {"type":"MEDIA_READY","port":53124}
 {"type":"AUDIO_START"}
 {"type":"AUDIO_READY","port":53125}
@@ -122,6 +122,19 @@ Server → client:
 {"type":"STREAM_STOPPED"}
 {"type":"BITRATE","kbps":14000}
 ```
+
+`START_STREAM.quality` is an OPTIONAL string selecting the streamed resolution. Allowed values
+are `"native"` and `"720p"`; an unrecognized value becomes `"native"`. When the field is absent,
+the server uses its configured default (`"native"` unless the operator selected otherwise).
+`"720p"` downscales to 720 lines preserving aspect ratio: the streamed height is
+`min(720, srcHeight)` and the streamed width is the source width scaled by that height ratio,
+rounded to the nearest even value, clamped to at most the source width (never upscaled) and to a
+minimum of 2; both dimensions are always even (NV12 requires it). When the client omits `quality`,
+the server applies its configured server-wide default, so a v0.4.0 client that never sends the
+field remains fully compatible. Quality is fixed for the lifetime of a stream; to change it the
+client stops and restarts the stream (`STOP_STREAM` then `START_STREAM`). The authoritative
+streamed dimensions are always those reported in `STREAM_STARTED.width`/`height`, regardless of
+the `HELLO_OK` primary-display size.
 
 After binding its media socket, the client sends `MEDIA_READY` over the authenticated TCP
 connection with that socket's local UDP port. The server combines this port with the TCP peer
@@ -379,6 +392,8 @@ for its cursor overlay; clients that do not recognize it ignore it.
 ## 4. Adaptation (server-side controller)
 
 Inputs: `STATS` messages and IDR request rate.
+- The effective session ceiling is the smaller of `START_STREAM.maxBitrateKbps` and the
+  operator-configured server ceiling (20,000 kbps by default, never below 2,000 kbps).
 - **Down:** if `framesDropped / (framesOk+framesDropped) > 1%` in a stats interval, latency
   grows materially above the session's best observed baseline, or
   ≥2 `REQUEST_IDR` in 1 s → new bitrate = max(2000, current × 0.7), apply to encoder,

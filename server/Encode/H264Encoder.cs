@@ -143,6 +143,8 @@ public sealed class H264Encoder : IVideoEncoder
 
     private void Configure(IMFTransform transform, int width, int height, int bitrateKbps)
     {
+        uint bitrate = checked((uint)((long)bitrateKbps * 1000));
+
         // 1) Unlock async use.
         using (var attrs = transform.Attributes)
         {
@@ -159,7 +161,7 @@ public sealed class H264Encoder : IVideoEncoder
         {
             outType.Set(MfGuids.MF_MT_MAJOR_TYPE, MfGuids.MFMediaType_Video);
             outType.Set(MfGuids.MF_MT_SUBTYPE, MfGuids.MFVideoFormat_H264);
-            outType.Set(MfGuids.MF_MT_AVG_BITRATE, (uint)(bitrateKbps * 1000));
+            outType.Set(MfGuids.MF_MT_AVG_BITRATE, bitrate);
             outType.Set(MfGuids.MF_MT_INTERLACE_MODE, MfGuids.Interlace_Progressive);
             outType.Set(MfGuids.MF_MT_MPEG2_PROFILE, MfGuids.H264Profile_High);
             SetFrameSize(outType, width, height);
@@ -186,11 +188,11 @@ public sealed class H264Encoder : IVideoEncoder
             Console.Error.WriteLine("[encoder] ICodecAPI unavailable; using defaults");
         TrySetCodecBool(MfGuids.CODECAPI_AVLowLatencyMode, true);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonRateControlMode, MfGuids.RateControlMode_CBR);
-        TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonMeanBitRate, (uint)(bitrateKbps * 1000));
+        TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonMeanBitRate, bitrate);
         // H.264 expresses HRD/VBV size in bytes. One frame prevents the rate controller from
         // hiding a deep leaky-bucket queue while still allowing normal frame-size variation.
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonBufferSize,
-            (uint)Math.Max(4096, bitrateKbps * 1000L / 8 / _fps));
+            (uint)Math.Max(4096, (long)bitrate / 8 / _fps));
         // 33 is the fastest edge of Microsoft's documented low-complexity range (0..33).
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonQualityVsSpeed, 33);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncMPVDefaultBPictureCount, 0);
@@ -236,18 +238,32 @@ public sealed class H264Encoder : IVideoEncoder
     public void RequestIdr() => TrySetCodecU32(MfGuids.CODECAPI_AVEncVideoForceKeyFrame, 1);
 
     /// <summary>Adjusts the CBR target mid-stream (adaptation controller, PROTOCOL.md §4).</summary>
-    public void SetBitrate(int kbps)
+    public bool SetBitrate(int kbps)
     {
-        TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonMeanBitRate, (uint)(kbps * 1000));
+        uint bitrate = checked((uint)((long)kbps * 1000));
+        if (!TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonMeanBitRate, bitrate))
+            return false;
+
+        // Some MFTs accept the target bitrate but expose a fixed VBV. That does not invalidate
+        // the bitrate change, so log a buffer-size rejection without reporting total failure.
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonBufferSize,
-            (uint)Math.Max(4096, kbps * 1000L / 8 / _fps));
+            (uint)Math.Max(4096, (long)bitrate / 8 / _fps));
+        return true;
     }
 
-    private void TrySetCodecU32(Guid key, uint value)
+    private bool TrySetCodecU32(Guid key, uint value)
     {
-        int hr = _codecApi?.SetUInt32(key, value) ?? 0;
+        if (_codecApi == null)
+            return false;
+
+        int hr = _codecApi.SetUInt32(key, value);
         if (hr < 0)
+        {
             Console.Error.WriteLine($"[encoder] CODECAPI set {key} failed: 0x{hr:X8}");
+            return false;
+        }
+
+        return true;
     }
 
     private void TrySetCodecBool(Guid key, bool value)

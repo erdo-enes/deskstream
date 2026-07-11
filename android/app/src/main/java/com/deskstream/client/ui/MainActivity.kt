@@ -9,6 +9,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.deskstream.client.R
+import com.deskstream.client.data.Prefs
 import com.deskstream.client.databinding.ActivityMainBinding
 import com.deskstream.client.databinding.DialogPairBinding
 import com.deskstream.client.net.ControlClient
@@ -31,6 +33,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var discoveryClient: DiscoveryClient
     private lateinit var serverAdapter: ServerAdapter
+    private val prefs: Prefs by lazy { Prefs(applicationContext) }
 
     private var pairDialog: AlertDialog? = null
     private var pairDialogPinField: TextInputEditText? = null
@@ -51,7 +54,10 @@ class MainActivity : AppCompatActivity() {
         ControlClient.init(applicationContext)
         discoveryClient = DiscoveryClient(applicationContext)
 
-        serverAdapter = ServerAdapter { server -> onServerTapped(server) }
+        serverAdapter = ServerAdapter(
+            isPaired = { ip -> prefs.tokenForServer(ip).isNotEmpty() },
+            onClick = { server -> onServerTapped(server) }
+        )
         binding.rvServers.layoutManager = LinearLayoutManager(this)
         binding.rvServers.adapter = serverAdapter
         updateEmptyState()
@@ -92,7 +98,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateEmptyState() {
-        binding.tvEmptyHint.visibility = if (serverAdapter.isEmpty()) View.VISIBLE else View.GONE
+        val empty = serverAdapter.isEmpty()
+        binding.emptyStateContainer.visibility = if (empty) View.VISIBLE else View.GONE
     }
 
     private fun onServerTapped(server: DiscoveredServer) {
@@ -209,8 +216,8 @@ class MainActivity : AppCompatActivity() {
         val dialog = MaterialAlertDialogBuilder(this)
             .setTitle("Pair with ${connectingServerName.ifEmpty { "server" }}")
             .setView(dialogBinding.root)
-            .setPositiveButton("Pair", null)
-            .setNegativeButton("Cancel") { _, _ ->
+            .setPositiveButton(R.string.pair_dialog_positive, null)
+            .setNegativeButton(R.string.pair_dialog_negative) { _, _ ->
                 ControlClient.disconnect()
                 binding.progressDiscovering.visibility = View.GONE
             }
@@ -223,7 +230,7 @@ class MainActivity : AppCompatActivity() {
                     dialogBinding.etPin.error = null
                     ControlClient.sendPairCode(pin)
                 } else {
-                    dialogBinding.etPin.error = "Enter the 6-digit PIN"
+                    dialogBinding.etPin.error = getString(R.string.pair_dialog_body)
                 }
             }
         }

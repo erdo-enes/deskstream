@@ -81,6 +81,9 @@ public sealed class StartStreamMessage
 {
     [JsonPropertyName("maxBitrateKbps")] public int MaxBitrateKbps { get; set; }
     [JsonPropertyName("fps")] public int Fps { get; set; }
+
+    /// <summary>Optional per-stream quality: "native" (default) or "720p". Absent = server default.</summary>
+    [JsonPropertyName("quality")] public string? Quality { get; set; }
 }
 
 public sealed class EndpointReadyMessage

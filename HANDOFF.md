@@ -23,19 +23,44 @@ Target: <50 ms glass-to-glass at 1080p60.
   Android gamepads forwarded as virtual Xbox 360 controllers with rumble + touchpad/direct
   mouse input, long-session recovery, and p95 latency telemetry.
 - `macos/` — native Objective-C/AppKit Apple-silicon client (macOS 13+). It implements
-  discovery, Keychain pairing, reconnect/watchdog behavior, max-two-frame XOR-FEC assembly,
+  discovery, Keychain pairing, reconnect/watchdog behavior, max-four-frame XOR-FEC assembly,
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.4.0 published)
+## Current state (v0.5.0 release candidate; v0.4.0 published)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public). `v0.4.0` is the latest published
-  release (tag `v0.4.0`, July 11 2026) with three assets: the debug-signed APK, the
-  self-contained win-x64 server zip, and — new in this release — the ad-hoc-signed arm64
-  `DeskStream-0.4.0-macos-arm64.zip`. v0.4.0 adds the first native arm64 macOS client,
-  backward-compatible physical-keyboard negotiation and Windows scan-code injection, plus a
-  second Android mouse-UX pass (small vector cursor, density-normalized movement, compact
-  toolbar, explicit Leave action, final-motion flush).
+  release (tag `v0.4.0`, July 11 2026; APK + win-x64 server zip + ad-hoc-signed arm64 macOS app).
+- The local v0.5.0 candidate adds, all backward-compatible with v0.4.0 peers:
+  1. **Quality selection** — optional `"quality"` field in `START_STREAM` (`"native"` default,
+     `"720p"` = server-side downscale to 720 lines in the existing D3D11 VideoProcessor,
+     aspect preserved, even dims, never upscaled; encoder created at the scaled size).
+     Official clients request a 10,000 kbps ceiling for 720p and 20,000 kbps for Native.
+     Quality is fixed per stream; both clients change it via the existing STOP→START restart
+     path. `STREAM_STARTED.width/height` remain authoritative. `--quality` sets the server
+     default for clients that don't ask.
+  2. **Server web dashboard** — `server/Web/WebDashboard.cs`, a bounded `TcpListener` HTTP/1.1
+     loop with zero new dependencies and no HTTP.sys/URLACL requirement,
+     default `http://127.0.0.1:47810/` (localhost-only because it shows the pairing PIN;
+     `--web-lan` opts into unauthenticated LAN exposure, `--web-port N`, `--no-web`).
+     `GET /api/status` JSON + `POST /api/restart|quality`. Dashboard restart is
+     marshalled onto the control-session thread via a ConcurrentQueue drained each control-loop
+     iteration (worst-case ~2 s via the client keepalive cadence — never called cross-thread).
+  3. **Headless/autostart ("service") mode** — deliberately NOT a session-0 Windows service
+     (DXGI duplication cannot capture from session 0). `--install-autostart` creates a
+     logon-triggered Scheduled Task running `--headless` in the user session (`--elevated`
+     variant uses /RL HIGHEST); `--uninstall-autostart` removes it. `--headless` redirects
+     lifecycle/pairing/error output (including the PIN box) to `deskstream.log` next to the exe,
+     rotates one `deskstream.previous.log`, and suppresses the otherwise-unbounded 1 Hz stats log.
+  4. **Client screenshots** (local-only, no protocol change) — Android: PixelCopy →
+     MediaStore `Pictures/DeskStream` (API 29+) or app-specific Pictures dir (26–28).
+     macOS: Cmd+S / Save Frame; macOS 14.4+ copies the displayed pixel buffer directly, while
+     older supported systems decode one IDR through a temporary VTDecompressionSession and tear
+     it down after the first pixel, PNG to `~/Pictures/DeskStream-<timestamp>.png`.
+  5. **Client UI pass** — Android: connection-state chip, labeled toolbar buttons, compact
+     expandable Mouse pill, video-only clean-screen mode, dark server-card list with PAIRED
+     badge, empty state, manual-IP card, bigger PIN dialog.
+     macOS: full menu bar, connection-state dot, stats overlay, quality popup, tooltips.
 - **All three targets compile clean with audio, gamepad, mouse, telemetry, and recovery.**
   Server `dotnet build -c Release --no-restore`: zero errors/warnings. Android
   `assembleRelease lintRelease`: successful with JDK 17. macOS `make test` passes protocol,
@@ -72,6 +97,12 @@ Target: <50 ms glass-to-glass at 1080p60.
       still need a physical Windows-server end-to-end session. Public Mac distribution also
       needs a Developer ID Application certificate and Apple notarization; local builds are
       deliberately ad-hoc signed.
+  11. (v0.5.0) `--install-autostart` schtasks quoting/interactive-task behavior has not yet run
+      on real Windows. `--web-lan` is unauthenticated and shows the PIN — localhost-only is the
+      default.
+  12. (v0.5.0) 720p downscale quality depends on the vendor's D3D11 VideoProcessor scaler;
+      verify visually on NVIDIA/AMD/Intel, and test a non-16:9 display (e.g. 2560×1600 →
+      1152×720) for the even-width rounding path.
 
 ## Feature status
 
@@ -88,6 +119,10 @@ Target: <50 ms glass-to-glass at 1080p60.
 | **Game controller / gamepad forwarding** | ✅ 1–4 Android/macOS pads → Xbox 360 + rumble |
 | **Audio streaming** | ✅ implemented, compile-verified; hardware test pending |
 | **Native Apple-silicon macOS client** | ✅ implemented; arm64 build/tests pass, hardware E2E pending |
+| **Quality selection (native / 720p60 downscale)** | ✅ implemented v0.5.0; compile-verified |
+| **Client screenshots (Android + macOS)** | ✅ implemented v0.5.0; compile-verified |
+| **Server web dashboard (localhost:47810)** | ✅ implemented v0.5.0; compile-verified |
+| **Headless + logon-autostart "service" mode** | ✅ implemented v0.5.0; schtasks/Windows untested |
 | Encryption (TLS control / AES-GCM media) | ❌ NOT implemented (LAN plaintext) |
 | mDNS advertisement, QR pairing | ❌ NOT implemented |
 | Framerate/resolution adaptation steps | ❌ NOT implemented (bitrate ladder only) |
@@ -169,7 +204,8 @@ Target: <50 ms glass-to-glass at 1080p60.
 - macOS: `cd macos && make test && make app`. Output is
   `macos/build/DeskStream.app`, thin arm64, macOS 13+, ad-hoc signed for local testing.
 - Run on Windows: `DeskStreamer.Server.exe` prints IPs/ports/PIN; firewall must allow
-  TCP 47801, UDP 47800/47802/47803 (private profile).
+  TCP 47801, UDP 47800/47802/47803 (private profile), plus the chosen dashboard TCP port
+  (47810 by default) only when `--web-lan` is enabled.
 
 ## Ground rules for continuing agents
 

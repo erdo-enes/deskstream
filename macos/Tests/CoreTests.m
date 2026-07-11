@@ -216,7 +216,8 @@ static void TestMediaHeaderAndAssembly(void) {
     DSAssert(outputCount == 1 && [assembled isEqualToData:threeExpected],
              @"Later real packet enables XOR recovery");
 
-    // Two incomplete frames are allowed; a third non-keyframe drops the oldest and enters
+    // Four incomplete frames are allowed for Wi-Fi reordering; a fifth non-keyframe drops the
+    // oldest and enters
     // discard mode. A complete keyframe then removes the older remainder and recovers.
     assembled = nil;
     outputCount = 0;
@@ -225,12 +226,14 @@ static void TestMediaHeaderAndAssembly(void) {
     [assembler consumeDatagram:DSMediaDatagram(10, 0, 2, NO, NO, first)];
     [assembler consumeDatagram:DSMediaDatagram(11, 0, 2, NO, NO, first)];
     [assembler consumeDatagram:DSMediaDatagram(12, 0, 2, NO, NO, first)];
+    [assembler consumeDatagram:DSMediaDatagram(13, 0, 2, NO, NO, first)];
+    [assembler consumeDatagram:DSMediaDatagram(14, 0, 2, NO, NO, first)];
     DSAssert(dropCount == 1 && assembler.discardingUntilKeyframe,
-             @"Third incomplete frame triggers IDR/discard");
-    [assembler consumeDatagram:DSMediaDatagram(13, 0, 1, NO, NO, last)];
+             @"Fifth incomplete frame triggers IDR/discard");
+    [assembler consumeDatagram:DSMediaDatagram(15, 0, 1, NO, NO, last)];
     DSAssert(outputCount == 0, @"Non-keyframe suppressed after reference loss");
-    [assembler consumeDatagram:DSMediaDatagram(14, 0, 1, NO, YES, last)];
-    DSAssert(outputCount == 1 && outputFrameID == 14 && [assembled isEqualToData:last],
+    [assembler consumeDatagram:DSMediaDatagram(16, 0, 1, NO, YES, last)];
+    DSAssert(outputCount == 1 && outputFrameID == 16 && [assembled isEqualToData:last],
              @"Complete keyframe resumes output");
     DSAssert(dropCount == 2 && !assembler.discardingUntilKeyframe,
              @"Older incomplete frame dropped before keyframe output");
@@ -323,8 +326,32 @@ static void TestUDPSocket(void) {
     long wait = dispatch_semaphore_wait(received,
                                         dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
     DSAssert(wait == 0 && [receivedData isEqualToData:expected], @"Receive validated UDP packet");
-    [wrongSender stop];
     [receiver stop];
+
+    dispatch_semaphore_t rawReceived = dispatch_semaphore_create(0);
+    __block NSData *rawReceivedData = nil;
+    DSUDPSocket *rawReceiver = [[DSUDPSocket alloc]
+        initWithExpectedHost:@"127.0.0.1"
+        expectedPort:sender.localPort
+        queue:queue
+        rawHandler:^(const void *bytes, size_t length) {
+            // The production media path parses synchronously. Copy here only so the test can
+            // compare after the callback returns and prove the ephemeral-byte contract works.
+            rawReceivedData = [NSData dataWithBytes:bytes length:length];
+            dispatch_semaphore_signal(rawReceived);
+        }
+        error:&error];
+    DSAssert([rawReceiver bindToPort:0 receiveBufferSize:65536 error:&error],
+             @"Bind raw UDP receiver: %@", error);
+    DSAssert([rawReceiver start:&error], @"Start raw UDP receiver: %@", error);
+    DSAssert([sender sendData:expected toHost:@"127.0.0.1" port:rawReceiver.localPort error:&error],
+             @"Send raw UDP packet: %@", error);
+    wait = dispatch_semaphore_wait(rawReceived,
+                                   dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+    DSAssert(wait == 0 && [rawReceivedData isEqualToData:expected], @"Receive raw UDP packet");
+
+    [rawReceiver stop];
+    [wrongSender stop];
     [sender stop];
 }
 

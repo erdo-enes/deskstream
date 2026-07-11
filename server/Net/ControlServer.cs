@@ -18,18 +18,21 @@ public sealed class ControlServer : IDisposable
 
     private readonly PairingManager _pairing;
     private readonly string _serverName;
+    private readonly ServerOptions _options;
     private readonly TcpListener _listener;
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
     private int _busy;
+    private StreamSession? _current;
 
-    /// <summary>The active session, if any (read by the console stats printer).</summary>
-    public StreamSession? Current { get; private set; }
+    /// <summary>The active session, if any (read by the console stats printer and web dashboard).</summary>
+    public StreamSession? Current => Volatile.Read(ref _current);
 
-    public ControlServer(PairingManager pairing, string serverName)
+    public ControlServer(PairingManager pairing, string serverName, ServerOptions options)
     {
         _pairing = pairing;
         _serverName = serverName;
+        _options = options;
         _listener = new TcpListener(IPAddress.Any, Ports.Control);
     }
 
@@ -101,8 +104,9 @@ public sealed class ControlServer : IDisposable
             () => { try { tcp.Close(); } catch { } },
             _pairing,
             _serverName,
-            clientAddress);
-        Current = session;
+            clientAddress,
+            _options);
+        Volatile.Write(ref _current, session);
 
         try
         {
@@ -111,6 +115,12 @@ public sealed class ControlServer : IDisposable
                 byte[]? frame = await ReadFrameAsync(stream, ct);
                 if (frame == null)
                     break; // clean close or timeout
+
+                // Drain any dashboard commands on this (control) thread before handling the
+                // frame, so session start/stop stays serialized with control-message handling.
+                // Bounded latency: the client PINGs every 2 s, so a queued command runs within
+                // one keepalive interval even on an otherwise idle control channel.
+                session.DrainCommands();
 
                 string? type = ReadType(frame);
                 if (type == null)
@@ -137,7 +147,7 @@ public sealed class ControlServer : IDisposable
         }
         finally
         {
-            Current = null;
+            Volatile.Write(ref _current, null);
             session.Dispose();
             try { tcp.Close(); } catch { }
             Console.WriteLine($"[control] client {remote} disconnected.");

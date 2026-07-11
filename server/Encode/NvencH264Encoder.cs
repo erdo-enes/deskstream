@@ -242,7 +242,7 @@ public sealed class NvencH264Encoder : IVideoEncoder
         }
     }
 
-    public unsafe void SetBitrate(int kbps)
+    public unsafe bool SetBitrate(int kbps)
     {
         lock (_gate)
         {
@@ -259,6 +259,7 @@ public sealed class NvencH264Encoder : IVideoEncoder
                 };
                 _encoder.ReconfigureEncoder(ref reconfigure);
             }
+            return true;
         }
     }
 

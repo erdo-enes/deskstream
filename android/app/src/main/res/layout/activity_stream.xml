@@ -12,6 +12,13 @@
         android:layout_height="match_parent"
         android:layout_gravity="center" />
 
+    <!-- Every non-video element lives in this layer so clean-screen mode can guarantee that
+         later status/cursor callbacks cannot make an overlay visible over the stream. -->
+    <FrameLayout
+        android:id="@+id/overlayLayer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
     <ImageView
         android:id="@+id/tvRemoteCursor"
         android:layout_width="12dp"
@@ -27,8 +34,13 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="center"
+        android:background="@drawable/bg_status_chip"
+        android:gravity="center"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="12dp"
         android:text="Connecting..."
-        android:textColor="@color/white"
+        android:textAlignment="center"
+        android:textColor="@color/text_primary_dark"
         android:textSize="16sp" />
 
     <TextView
@@ -36,74 +48,234 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|start"
-        android:layout_margin="16dp"
-        android:background="#88000000"
+        android:layout_marginTop="64dp"
+        android:layout_marginStart="16dp"
+        android:background="@drawable/bg_status_chip"
         android:fontFamily="monospace"
         android:padding="8dp"
-        android:textColor="@color/white"
+        android:textColor="@color/text_primary_dark"
         android:textSize="12sp"
         android:visibility="gone"
         tools:text="LIVE · 192.168.1.20\nVIDEO  1920×1080 @ 60 · H.264\nNET    14000 kbps · loss 0.0%\nAUDIO  48 kHz stereo · 1536 kbps" />
 
-    <TextView
-        android:id="@+id/tvStreamStatus"
-        android:layout_width="wrap_content"
+    <!-- Top bar: connection-state chip (dot + short text) at start, labeled action buttons at
+         end. Replaces the previous plain top-center status line and bottom-end audio button. -->
+    <LinearLayout
+        android:id="@+id/topBar"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|center_horizontal"
-        android:layout_marginTop="16dp"
-        android:background="#99000000"
+        android:layout_gravity="top"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
         android:paddingHorizontal="12dp"
-        android:paddingVertical="7dp"
-        android:textColor="@color/white"
-        android:textSize="12sp"
-        android:visibility="gone"
-        tools:text="LIVE · 1920×1080 @ 60 · audio on"
-        tools:visibility="visible" />
+        android:paddingTop="10dp">
+
+        <LinearLayout
+            android:id="@+id/statusChip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_status_chip"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="6dp">
+
+            <View
+                android:id="@+id/viewStatusDot"
+                android:layout_width="9dp"
+                android:layout_height="9dp"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/bg_status_dot" />
+
+            <TextView
+                android:id="@+id/tvStreamStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                tools:text="Streaming 1920×1080@60" />
+
+        </LinearLayout>
+
+        <View
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <LinearLayout
+            android:id="@+id/toolbarButtons"
+            android:layout_width="wrap_content"
+            android:layout_height="44dp"
+            android:background="@drawable/bg_toolbar_pill"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnAudio"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="56dp"
+                android:layout_height="44dp"
+                android:contentDescription="@string/cd_mute_button"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/toolbar_mute"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnStats"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="56dp"
+                android:layout_height="44dp"
+                android:contentDescription="@string/cd_stats_button"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/toolbar_stats"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnQuality"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="60dp"
+                android:layout_height="44dp"
+                android:contentDescription="@string/cd_quality_button"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/quality_native"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp"
+                tools:text="720p" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnScreenshot"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="56dp"
+                android:layout_height="44dp"
+                android:contentDescription="@string/cd_screenshot_button"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/toolbar_screenshot"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnHideControls"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="56dp"
+                android:layout_height="44dp"
+                android:contentDescription="@string/cd_hide_button"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/toolbar_hide"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnLeave"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="56dp"
+                android:layout_height="44dp"
+                android:contentDescription="@string/cd_leave_button"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/toolbar_leave"
+                android:textColor="@color/status_red"
+                android:textSize="11sp" />
+
+        </LinearLayout>
+
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/mouseToolbar"
         android:layout_width="wrap_content"
         android:layout_height="48dp"
         android:layout_gravity="top|end"
-        android:layout_margin="8dp"
-        android:background="#99000000"
+        android:layout_marginTop="64dp"
+        android:layout_marginEnd="8dp"
+        android:background="@drawable/bg_toolbar_pill"
+        android:gravity="center_vertical"
         android:orientation="horizontal">
 
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnMouseToggle"
-            style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="56dp"
-            android:layout_height="48dp"
-            android:contentDescription="@string/mouse_toggle_description"
-            android:enabled="false"
-            android:minWidth="0dp"
-            android:paddingHorizontal="2dp"
-            android:text="@string/mouse_toggle_on"
-            android:textColor="@color/white" />
+        <!-- The action strip is transient. Keeping the Mouse button last anchors it at the
+             top-end edge while the actions expand toward the center instead of jumping under
+             the user's finger. -->
+        <LinearLayout
+            android:id="@+id/mouseActions"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnMouseToggle"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="72dp"
+                android:layout_height="48dp"
+                android:contentDescription="@string/mouse_disable_description"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/mouse_disable"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnPointerMode"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="84dp"
+                android:layout_height="48dp"
+                android:contentDescription="@string/mouse_mode_change_description"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/mouse_mode_touchpad"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnMouseClick"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="52dp"
+                android:layout_height="48dp"
+                android:contentDescription="@string/mouse_left_click_description"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/mouse_left"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnMouseRight"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="56dp"
+                android:layout_height="48dp"
+                android:contentDescription="@string/mouse_right_click_description"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="2dp"
+                android:text="@string/mouse_right"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="11sp" />
+
+        </LinearLayout>
 
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnPointerMode"
+            android:id="@+id/btnMouseMenu"
             style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="60dp"
+            android:layout_width="68dp"
             android:layout_height="48dp"
-            android:contentDescription="@string/mouse_mode_change_description"
-            android:enabled="false"
+            android:contentDescription="@string/mouse_menu_show_description"
             android:minWidth="0dp"
-            android:paddingHorizontal="2dp"
-            android:text="@string/mouse_mode_pad"
-            android:textColor="@color/white" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/btnMouseClick"
-            style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="52dp"
-            android:layout_height="48dp"
-            android:contentDescription="@string/mouse_click_description"
-            android:enabled="false"
-            android:minWidth="0dp"
-            android:paddingHorizontal="2dp"
-            android:text="@string/mouse_click"
-            android:textColor="@color/white" />
+            android:paddingHorizontal="4dp"
+            android:text="@string/mouse_menu"
+            android:textColor="@color/text_primary_dark"
+            android:textSize="11sp"
+            android:textStyle="bold" />
     </LinearLayout>
 
     <TextView
@@ -112,13 +284,13 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|center_horizontal"
         android:layout_marginBottom="68dp"
-        android:background="#88000000"
+        android:background="@drawable/bg_status_chip"
         android:gravity="center"
         android:maxWidth="520dp"
         android:paddingHorizontal="10dp"
         android:paddingVertical="7dp"
         android:text="@string/mouse_gesture_hint"
-        android:textColor="@color/white"
+        android:textColor="@color/text_primary_dark"
         android:textSize="12sp"
         android:visibility="gone"
         tools:visibility="visible" />
@@ -129,24 +301,13 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|center_horizontal"
         android:layout_margin="16dp"
-        android:background="#88000000"
+        android:background="@drawable/bg_status_chip"
         android:paddingHorizontal="10dp"
         android:paddingVertical="7dp"
         android:text="Controller: none detected"
-        android:textColor="@color/white"
+        android:textColor="@color/text_primary_dark"
         android:textSize="12sp" />
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/btnAudio"
-        style="@style/Widget.MaterialComponents.Button.TextButton"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom|end"
-        android:layout_margin="12dp"
-        android:backgroundTint="#99000000"
-        android:enabled="false"
-        android:minWidth="96dp"
-        android:text="Audio…"
-        android:textColor="@color/white" />
+    </FrameLayout>
 
 </FrameLayout>

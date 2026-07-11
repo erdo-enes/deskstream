@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using DeskStreamer.Server.Audio;
@@ -33,9 +34,15 @@ public sealed class StreamSession : IDisposable
     private readonly PairingManager _pairing;
     private readonly string _serverName;
     private readonly IPAddress? _clientAddress;
+    private readonly ServerOptions _options;
+
+    // Dashboard commands are enqueued from dashboard connection threads and drained on the control
+    // read loop (see DrainCommands / ControlServer) so session start/stop stays single-threaded.
+    private readonly ConcurrentQueue<Action> _commands = new();
 
     private SessionState _state = SessionState.AwaitingHello;
     private string _clientId = "";
+    private string _clientName = "";
 
     // Pairing
     private string? _pin;
@@ -67,8 +74,13 @@ public sealed class StreamSession : IDisposable
     private volatile bool _streaming;
     private volatile bool _audioStreaming;
 
+    // Quality / authoritative streamed dimensions (PROTOCOL.md §2.3).
+    private string _quality = "native";
+    private int _streamWidth;
+    private int _streamHeight;
+
     // Adaptation
-    private int _maxBitrateKbps = 20000;
+    private int _maxBitrateKbps = ServerOptions.DefaultMaxBitrateKbps;
     private int _currentBitrateKbps;
     private int _cleanStreak;
     private int _idrSinceLastStats;
@@ -89,6 +101,17 @@ public sealed class StreamSession : IDisposable
     public int Fps { get; private set; } = 60;
     public int CurrentBitrateKbps => _currentBitrateKbps;
     public int LastClientFramesDropped { get; private set; }
+
+    // Surfaced to the web dashboard.
+    public string ClientName => _clientName;
+    public string? ClientIp => _clientAddress?.ToString();
+    public string Quality => _quality;
+    public int StreamWidth => _streamWidth;
+    public int StreamHeight => _streamHeight;
+    public string EncoderBackend => _encoder?.BackendName ?? "";
+
+    /// <summary>The pending pairing PIN while awaiting a PAIR_CODE, otherwise null.</summary>
+    public string? PendingPin => _state == SessionState.AwaitingPairCode ? _pin : null;
     public long EncodedFrames => Interlocked.Read(ref _encodedFrames);
     public long IdrRequestTotal => Interlocked.Read(ref _idrRequestTotal);
     public long AudioPacketsSent => _audioSender?.PacketsSent ?? 0;
@@ -102,13 +125,15 @@ public sealed class StreamSession : IDisposable
         Action requestClose,
         PairingManager pairing,
         string serverName,
-        IPAddress? clientAddress)
+        IPAddress? clientAddress,
+        ServerOptions options)
     {
         _send = send;
         _requestClose = requestClose;
         _pairing = pairing;
         _serverName = serverName;
         _clientAddress = clientAddress;
+        _options = options;
     }
 
     private static long NowMs() => MonotonicClock.NowMs;
@@ -161,6 +186,7 @@ public sealed class StreamSession : IDisposable
         }
 
         _clientId = hello.ClientId;
+        _clientName = hello.ClientName;
         ResolveDisplay();
 
         if (!string.IsNullOrEmpty(hello.Token) && _pairing.Verify(hello.ClientId, hello.Token))
@@ -238,22 +264,34 @@ public sealed class StreamSession : IDisposable
             return;
 
         var msg = Json.Deserialize<StartStreamMessage>(payload);
-        _maxBitrateKbps = msg is { MaxBitrateKbps: > 0 } ? msg.MaxBitrateKbps : 20000;
+        _maxBitrateKbps = _options.ClampClientBitrateKbps(msg?.MaxBitrateKbps ?? 0);
         Fps = msg is { Fps: >= 15 and <= 240 } ? msg.Fps : 60;
+        // Quality is fixed per stream: honor an explicit "720p"/"native", but fall back to the
+        // server-wide default when the client sends no quality field (old v0.4.0 clients).
+        _quality = ResolveRequestedQuality(msg?.Quality);
 
+        BeginStream();
+    }
+
+    /// <summary>
+    /// Starts the pipeline for the already-selected parameters and reports STREAM_STARTED. Shared
+    /// by client START_STREAM and the dashboard Restart command so both paths behave identically.
+    /// </summary>
+    private void BeginStream()
+    {
         try
         {
             StartPipeline();
             _send(OutgoingMessages.StreamStarted(
                 _sender!.Port,
-                _duplicator!.Width,
-                _duplicator.Height,
+                _streamWidth,
+                _streamHeight,
                 Fps,
                 _encoder!.BackendName,
                 _clockBaseUs));
             _state = SessionState.Streaming;
-            Console.WriteLine($"[session] streaming started: {_duplicator.Width}x{_duplicator.Height}@{Fps}, " +
-                              $"start bitrate {_currentBitrateKbps} kbps, media port {_sender.Port}.");
+            Console.WriteLine($"[session] streaming started: {_streamWidth}x{_streamHeight}@{Fps} " +
+                              $"({_quality}), start bitrate {_currentBitrateKbps} kbps, media port {_sender.Port}.");
         }
         catch (EncoderUnavailableException ex)
         {
@@ -276,6 +314,30 @@ public sealed class StreamSession : IDisposable
         }
     }
 
+    private string ResolveRequestedQuality(string? requested) =>
+        requested != null ? ServerOptions.Normalize(requested) : ServerOptions.Normalize(_options.DefaultQuality);
+
+    /// <summary>
+    /// Resolves the authoritative streamed dimensions from the quality setting (PROTOCOL.md §2.3).
+    /// "native" streams the source unchanged; "720p" downscales to 720 lines preserving aspect
+    /// ratio, rounding the width to the nearest even value, never upscaling, minimum 2. NV12
+    /// requires even dimensions.
+    /// </summary>
+    private (int width, int height) ResolveStreamSize(int srcWidth, int srcHeight)
+    {
+        if (_quality != "720p" || srcHeight <= 0 || srcWidth <= 0)
+            return (srcWidth, srcHeight);
+
+        int h = Math.Min(720, srcHeight);
+        double exact = (double)h * srcWidth / srcHeight;
+        int w = (int)(Math.Round(exact / 2.0, MidpointRounding.AwayFromZero) * 2); // round to nearest even
+        h &= ~1;                                    // even
+        if (w < 2) w = 2;
+        if (h < 2) h = 2;
+        if (w > srcWidth) w = srcWidth & ~1;        // clamp <= source; never upscale
+        return (w, h);
+    }
+
     private void OnStopStream()
     {
         if (!_streaming)
@@ -284,6 +346,34 @@ public sealed class StreamSession : IDisposable
         _send(OutgoingMessages.StreamStopped());
         _state = SessionState.Ready;
         Console.WriteLine("[session] streaming stopped.");
+    }
+
+    // ---- Dashboard commands (marshalled onto the control read loop) -----------------------
+
+    /// <summary>Queues a Restart-stream request from the web dashboard (any thread).</summary>
+    public void RequestRestart() => _commands.Enqueue(DashboardRestart);
+
+    /// <summary>
+    /// Drains queued dashboard commands. MUST be called only from the control read loop so that
+    /// pipeline start/stop stays serialized with control-message handling.
+    /// </summary>
+    public void DrainCommands()
+    {
+        while (_commands.TryDequeue(out var command))
+        {
+            try { command(); }
+            catch (Exception ex) { Console.Error.WriteLine($"[dashboard] command failed: {ex.Message}"); }
+        }
+    }
+
+    private void DashboardRestart()
+    {
+        if (!_streaming)
+            return; // nothing to restart; the dashboard only offers Restart while streaming
+        StopPipeline();
+        _state = SessionState.Ready;
+        BeginStream(); // reuses the current bitrate cap, fps, and quality
+        Console.WriteLine("[session] streaming restarted from dashboard.");
     }
 
     private void OnAudioStart()
@@ -477,13 +567,20 @@ public sealed class StreamSession : IDisposable
         _sender.Start();
 
         _duplicator = new DesktopDuplicator();
-        _converter = new Nv12Converter(_duplicator.Device, _duplicator.Width, _duplicator.Height, Fps);
+        (_streamWidth, _streamHeight) = ResolveStreamSize(_duplicator.Width, _duplicator.Height);
+        _converter = new Nv12Converter(
+            _duplicator.Device,
+            _duplicator.Width,
+            _duplicator.Height,
+            _streamWidth,
+            _streamHeight,
+            Fps);
 
         _currentBitrateKbps = Math.Min(8000, _maxBitrateKbps); // start bitrate (PROTOCOL.md §4)
         _encoder = EncoderFactory.Create(
             _duplicator.Device,
-            _duplicator.Width,
-            _duplicator.Height,
+            _streamWidth,
+            _streamHeight,
             Fps,
             _currentBitrateKbps);
         _encoder.OnEncodedFrame = OnEncoded;
@@ -792,7 +889,7 @@ public sealed class StreamSession : IDisposable
 
     private void AdaptDown()
     {
-        int next = Math.Max(2000, (int)(_currentBitrateKbps * 0.7));
+        int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.7));
         ApplyBitrate(next);
         _cleanStreak = 0;
     }
@@ -809,7 +906,12 @@ public sealed class StreamSession : IDisposable
             return;
         try
         {
-            _encoder.SetBitrate(kbps);
+            if (!_encoder.SetBitrate(kbps))
+            {
+                Console.Error.WriteLine(
+                    $"[encoder] bitrate reconfiguration rejected; keeping {_currentBitrateKbps} kbps");
+                return;
+            }
             _currentBitrateKbps = kbps;
             _send(OutgoingMessages.Bitrate(kbps));
         }

@@ -28,8 +28,30 @@ public sealed class Nv12Converter : IDisposable
     private ID3D11Texture2D? _boundBgra;
     private int _next;
 
+    /// <summary>Width of the NV12 output textures produced by <see cref="Convert"/>.</summary>
+    public int OutWidth { get; }
+
+    /// <summary>Height of the NV12 output textures produced by <see cref="Convert"/>.</summary>
+    public int OutHeight { get; }
+
+    /// <summary>Output dimensions equal the input dimensions (no scaling).</summary>
     public Nv12Converter(ID3D11Device device, int width, int height, int fps)
+        : this(device, width, height, width, height, fps)
     {
+    }
+
+    /// <summary>
+    /// Converts a BGRA source of (<paramref name="inWidth"/>, <paramref name="inHeight"/>)
+    /// into NV12 output textures of (<paramref name="outWidth"/>, <paramref name="outHeight"/>).
+    /// The VideoProcessor scales input to output during the blit, so quality downscaling is free
+    /// on the GPU. All four dimensions must be even (NV12 requirement).
+    /// </summary>
+    public Nv12Converter(
+        ID3D11Device device, int inWidth, int inHeight, int outWidth, int outHeight, int fps)
+    {
+        OutWidth = outWidth;
+        OutHeight = outHeight;
+
         _videoDevice = device.QueryInterface<ID3D11VideoDevice>();
         _videoContext = device.ImmediateContext.QueryInterface<ID3D11VideoContext>();
 
@@ -37,11 +59,11 @@ public sealed class Nv12Converter : IDisposable
         {
             InputFrameFormat = VideoFrameFormat.Progressive,
             InputFrameRate = new Rational((uint)fps, 1),
-            InputWidth = (uint)width,
-            InputHeight = (uint)height,
+            InputWidth = (uint)inWidth,
+            InputHeight = (uint)inHeight,
             OutputFrameRate = new Rational((uint)fps, 1),
-            OutputWidth = (uint)width,
-            OutputHeight = (uint)height,
+            OutputWidth = (uint)outWidth,
+            OutputHeight = (uint)outHeight,
             Usage = VideoUsage.PlaybackNormal,
         };
 
@@ -58,9 +80,10 @@ public sealed class Nv12Converter : IDisposable
             Texture2D = new Texture2DVideoProcessorOutputView { MipSlice = 0 },
         };
 
+        // The NV12 pool is created at OUTPUT dimensions; VideoProcessorBlt scales into it.
         for (int i = 0; i < PoolSize; i++)
         {
-            _nv12[i] = CreateNv12Texture(device, width, height);
+            _nv12[i] = CreateNv12Texture(device, outWidth, outHeight);
             _outputViews[i] = _videoDevice.CreateVideoProcessorOutputView(_nv12[i], _enumerator, outDesc);
         }
     }

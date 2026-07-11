@@ -1,12 +1,15 @@
 <resources>
     <string name="app_name">DeskStream</string>
-    <string name="mouse_toggle_on">On</string>
-    <string name="mouse_toggle_off">Off</string>
+    <string name="mouse_menu">Mouse</string>
+    <string name="mouse_menu_show_description">Show mouse controls</string>
+    <string name="mouse_menu_hide_description">Hide mouse controls</string>
+    <string name="mouse_controls_shown">Mouse controls shown</string>
+    <string name="mouse_enable">Enable</string>
+    <string name="mouse_disable">Disable</string>
     <string name="mouse_mode_starting">…</string>
     <string name="mouse_mode_unavailable">N/A</string>
-    <string name="mouse_mode_pad">Pad</string>
+    <string name="mouse_mode_touchpad">Touchpad</string>
     <string name="mouse_mode_direct">Direct</string>
-    <string name="mouse_toggle_description">Toggle remote mouse</string>
     <string name="mouse_enable_description">Enable remote mouse</string>
     <string name="mouse_disable_description">Disable remote mouse</string>
     <string name="mouse_mode_change_description">Change pointer mode</string>
@@ -14,9 +17,59 @@
     <string name="mouse_unavailable_description">Remote mouse unavailable</string>
     <string name="mouse_mode_pad_description">Touchpad mode; tap to use direct pointer mode</string>
     <string name="mouse_mode_direct_description">Direct pointer mode; tap to use touchpad mode</string>
-    <string name="mouse_click">Click</string>
-    <string name="mouse_click_description">Left click; touch and hold for right click</string>
-    <string name="mouse_gesture_hint">Move: 1 finger · Click: double-tap · Drag: double-tap + move\nScroll: 2 fingers · Right-click: 2-finger tap</string>
+    <string name="mouse_left">Left</string>
+    <string name="mouse_right">Right</string>
+    <string name="mouse_left_click_description">Send a left mouse click</string>
+    <string name="mouse_right_click_description">Send a right mouse click</string>
+    <string name="mouse_gesture_hint">Move: 1 finger · Click: double-tap · Drag: double-tap + move\nScroll: 2 fingers · Right-click: short 2-finger tap</string>
     <string name="leave_stream_prompt">Leave the stream?</string>
     <string name="leave_stream_action">LEAVE</string>
+
+    <!-- Toolbar buttons (v0.5.0 restyle) -->
+    <string name="toolbar_mute">Mute</string>
+    <string name="toolbar_unmute">Unmute</string>
+    <string name="toolbar_stats">Stats</string>
+    <string name="toolbar_screenshot">Shot</string>
+    <string name="toolbar_leave">Leave</string>
+    <string name="toolbar_hide">Hide</string>
+    <string name="cd_mute_button">Mute PC audio</string>
+    <string name="cd_unmute_button">Unmute PC audio</string>
+    <string name="cd_stats_button">Toggle latency and network statistics overlay</string>
+    <string name="cd_quality_button">Stream quality: %1$s. Tap to switch.</string>
+    <string name="cd_screenshot_button">Save a screenshot of the current stream frame</string>
+    <string name="cd_leave_button">Leave the stream and return to the server list</string>
+    <string name="cd_hide_button">Hide all on-screen controls for a clean screen</string>
+
+    <!-- Clean screen mode -->
+    <string name="controls_hidden_hint">Clean screen — hold 3 fingers or press Back to restore controls</string>
+
+    <!-- Stream quality (v0.5.0) -->
+    <string name="quality_native">Native</string>
+    <string name="quality_720p">720p</string>
+    <string name="quality_switching">Switching to %1$s…</string>
+
+    <!-- Screenshot (v0.5.0) -->
+    <string name="screenshot_no_frame">No frame yet</string>
+    <string name="screenshot_saved">Screenshot saved: %1$s</string>
+    <string name="screenshot_failed">Screenshot failed</string>
+    <string name="screenshot_save_failed">Could not save screenshot</string>
+
+    <!-- Connection-state chip (v0.5.0) -->
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_streaming">Streaming %1$d×%2$d@%3$d</string>
+    <string name="status_reconnecting">Reconnecting…</string>
+    <string name="status_disconnected">Disconnected</string>
+
+    <!-- Discovery screen (v0.5.0 restyle) -->
+    <string name="discovery_initial_subtitle">Searching this Wi-Fi network…</string>
+    <string name="discovery_empty_title">Searching for PCs on your WiFi…</string>
+    <string name="discovery_empty_subtitle">Make sure the PC app is running and both devices share the same network.</string>
+    <string name="discovery_manual_label">Manual connection</string>
+    <string name="discovery_manual_hint">Server IP address</string>
+    <string name="discovery_connect_action">Connect</string>
+    <string name="discovery_paired_badge">PAIRED</string>
+    <string name="pair_dialog_body">Enter the 6-digit PIN shown on your PC</string>
+    <string name="pair_dialog_hint">PIN</string>
+    <string name="pair_dialog_positive">Pair</string>
+    <string name="pair_dialog_negative">Cancel</string>
 </resources>

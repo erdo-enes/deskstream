@@ -11,7 +11,8 @@ typedef void (^DSFrameDropHandler)(void);
 
 /// DeskStream v1 frame reassembly and XOR-FEC recovery.
 ///
-/// The assembler intentionally holds no more than two incomplete frames. Any reference gap
+/// The assembler intentionally holds no more than four incomplete frames. This is Wi-Fi packet
+/// reordering state, not a render queue; completed frames are emitted immediately. Any reference gap
 /// invokes `dropHandler` (normally REQUEST_IDR) and suppresses output until a complete
 /// keyframe arrives. Calls are synchronized so decoder-error callbacks may safely request
 /// discard from a queue other than the media receive queue.

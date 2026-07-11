@@ -53,6 +53,7 @@ static BOOL DSResolveIPv4(NSString *host, uint16_t port, struct sockaddr_in *res
 @implementation DSUDPSocket {
     dispatch_queue_t _queue;
     DSDatagramHandler _handler;
+    DSRawDatagramHandler _rawHandler;
     dispatch_source_t _readSource;
     int _fileDescriptor;
     struct sockaddr_in _expectedAddress;
@@ -60,6 +61,8 @@ static BOOL DSResolveIPv4(NSString *host, uint16_t port, struct sockaddr_in *res
     uint16_t _expectedPort;
     uint16_t _localPort;
     BOOL _running;
+    uint32_t _cachedSourceAddress;
+    NSString *_cachedSourceHost;
 }
 
 - (instancetype)initWithExpectedHost:(NSString *)expectedHost
@@ -82,6 +85,28 @@ static BOOL DSResolveIPv4(NSString *host, uint16_t port, struct sockaddr_in *res
             }
             _validatesHost = YES;
         }
+    }
+    return self;
+}
+
+- (instancetype)initWithExpectedHost:(NSString *)expectedHost
+                         expectedPort:(uint16_t)expectedPort
+                                queue:(dispatch_queue_t)queue
+                           rawHandler:(DSRawDatagramHandler)rawHandler
+                                error:(NSError **)error {
+    NSParameterAssert(rawHandler != nil);
+    // Reuse the designated initializer for endpoint resolution and invariant setup, then swap
+    // its never-called placeholder callback for the zero-copy callback.
+    self = [self initWithExpectedHost:expectedHost
+                         expectedPort:expectedPort
+                                queue:queue
+                              handler:^(__unused NSData *data,
+                                        __unused NSString *host,
+                                        __unused uint16_t port) {}
+                                error:error];
+    if (self) {
+        _handler = nil;
+        _rawHandler = [rawHandler copy];
     }
     return self;
 }
@@ -193,27 +218,44 @@ static BOOL DSResolveIPv4(NSString *host, uint16_t port, struct sockaddr_in *res
 - (void)receiveAvailableDatagrams {
     uint8_t bytes[65535];
     while (_running) {
-        struct sockaddr_in source = {0};
-        socklen_t sourceLength = sizeof(source);
-        ssize_t count = recvfrom(_fileDescriptor,
-                                 bytes,
-                                 sizeof(bytes),
-                                 MSG_DONTWAIT,
-                                 (struct sockaddr *)&source,
-                                 &sourceLength);
-        if (count < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
-            return;
-        }
-        if (source.sin_family != AF_INET) continue;
-        uint16_t sourcePort = ntohs(source.sin_port);
-        if (_validatesHost && source.sin_addr.s_addr != _expectedAddress.sin_addr.s_addr) continue;
-        if (_expectedPort != 0 && sourcePort != _expectedPort) continue;
+        // A 20 Mbps stream plus FEC can deliver thousands of datagrams in one dispatch-source
+        // callback. Drain temporary NSData objects after each callback instead of retaining the
+        // whole burst until this method returns, which otherwise creates allocator/memory spikes
+        // large enough to make the serial media queue fall behind.
+        @autoreleasepool {
+            struct sockaddr_in source = {0};
+            socklen_t sourceLength = sizeof(source);
+            ssize_t count = recvfrom(_fileDescriptor,
+                                     bytes,
+                                     sizeof(bytes),
+                                     MSG_DONTWAIT,
+                                     (struct sockaddr *)&source,
+                                     &sourceLength);
+            if (count < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+                return;
+            }
+            if (source.sin_family != AF_INET) continue;
+            uint16_t sourcePort = ntohs(source.sin_port);
+            if (_validatesHost && source.sin_addr.s_addr != _expectedAddress.sin_addr.s_addr) continue;
+            if (_expectedPort != 0 && sourcePort != _expectedPort) continue;
 
-        char hostBuffer[INET_ADDRSTRLEN] = {0};
-        if (inet_ntop(AF_INET, &source.sin_addr, hostBuffer, sizeof(hostBuffer)) == NULL) continue;
-        NSData *data = [NSData dataWithBytes:bytes length:(NSUInteger)count];
-        _handler(data, [NSString stringWithUTF8String:hostBuffer], sourcePort);
+            if (_rawHandler != nil) {
+                _rawHandler(bytes, (size_t)count);
+            } else {
+                // The source address is stable for audio and usually stable for discovery.
+                // Cache its printable form instead of allocating an NSString for every packet.
+                uint32_t sourceAddress = source.sin_addr.s_addr;
+                if (_cachedSourceHost == nil || _cachedSourceAddress != sourceAddress) {
+                    char hostBuffer[INET_ADDRSTRLEN] = {0};
+                    if (inet_ntop(AF_INET, &source.sin_addr, hostBuffer, sizeof(hostBuffer)) == NULL) continue;
+                    _cachedSourceHost = [NSString stringWithUTF8String:hostBuffer];
+                    _cachedSourceAddress = sourceAddress;
+                }
+                NSData *data = [NSData dataWithBytes:bytes length:(NSUInteger)count];
+                _handler(data, _cachedSourceHost, sourcePort);
+            }
+        }
     }
 }
 

@@ -6,7 +6,6 @@ import android.view.View
 import android.view.ViewConfiguration
 import com.deskstream.client.net.ControlClient
 import com.deskstream.client.proto.MousePacket
-import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
@@ -16,7 +15,11 @@ enum class MouseMode { TOUCHPAD, DIRECT }
 class RemoteMouseController(
     private val target: View,
     private val sendMotion: (ByteArray) -> Unit,
-    private val onModeChanged: (MouseMode) -> Unit = {}
+    private val onModeChanged: (MouseMode) -> Unit = {},
+    /** The reveal path is captured only while clean screen is active, so ordinary three-finger
+     * input cannot interfere with mouse/gamepad use while the controls are visible. */
+    private val shouldHandleCleanScreenGesture: () -> Boolean = { false },
+    private val onCleanScreenReveal: () -> Unit = {}
 ) : View.OnTouchListener {
     private val packet = ByteArray(MousePacket.SIZE)
     private var enabled = false
@@ -43,6 +46,19 @@ class RemoteMouseController(
     private var pendingDx = 0f
     private var pendingDy = 0f
     private var twoFingerTravel = 0f
+    // Clean-screen reveal tracking is independent of mouse state so it still works while mouse
+    // forwarding is unavailable or explicitly disabled.
+    private var threeFingerActive = false
+    private var threeFingerMoved = false
+    private var threeFingerRevealFired = false
+    private var threeFingerCentroidX = 0f
+    private var threeFingerCentroidY = 0f
+    private val cleanScreenReveal = Runnable {
+        if (threeFingerActive && !threeFingerMoved && !threeFingerRevealFired) {
+            threeFingerRevealFired = true
+            onCleanScreenReveal()
+        }
+    }
 
     init { target.setOnTouchListener(this) }
 
@@ -81,11 +97,83 @@ class RemoteMouseController(
         leftHeld = false
         clearPendingTap()
         ControlClient.resetMouse()
+        cancelCleanScreenGesture()
         resetGestureOnly()
     }
 
     override fun onTouch(view: View, event: MotionEvent): Boolean {
-        if (!enabled) return false
+        // Clean-screen reveal detection runs before mouse handling. It consumes the entire
+        // three-finger sequence, including all lifts, so it cannot become a right/left click.
+        when (event.actionMasked) {
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount == 3 && !threeFingerActive &&
+                    shouldHandleCleanScreenGesture()
+                ) {
+                    // Release any in-progress drag and clear pending tap state before the reveal
+                    // hold starts. Cursor motion may have preceded the third finger, but no
+                    // button transition from this gesture can reach the host.
+                    if (enabled) {
+                        if (leftHeld) sendButton("left", false)
+                        ControlClient.resetMouse()
+                    }
+                    leftHeld = false
+                    clearPendingTap()
+                    resetGestureOnly()
+                    maxPointers = 3
+                    threeFingerActive = true
+                    threeFingerMoved = false
+                    threeFingerRevealFired = false
+                    threeFingerCentroidX = averageX(event)
+                    threeFingerCentroidY = averageY(event)
+                    target.removeCallbacks(cleanScreenReveal)
+                    target.postDelayed(cleanScreenReveal, CLEAN_SCREEN_REVEAL_HOLD_MS)
+                    return true
+                } else if (threeFingerActive && event.pointerCount > 3) {
+                    // A fourth+ finger disqualifies the hold, but the rest of the sequence is
+                    // still consumed to prevent it falling through as mouse input.
+                    threeFingerMoved = true
+                    target.removeCallbacks(cleanScreenReveal)
+                    return true
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> if (threeFingerActive) {
+                val cx = averageX(event)
+                val cy = averageY(event)
+                if (!threeFingerMoved &&
+                    hypot((cx - threeFingerCentroidX).toDouble(), (cy - threeFingerCentroidY).toDouble()) >=
+                    touchSlopPx * CLEAN_SCREEN_SLOP_MULTIPLIER
+                ) {
+                    threeFingerMoved = true
+                    target.removeCallbacks(cleanScreenReveal)
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> if (threeFingerActive) {
+                if (event.actionMasked == MotionEvent.ACTION_UP) {
+                    cancelCleanScreenGesture()
+                    resetGestureOnly()
+                } else if (event.pointerCount <= 3 && !threeFingerRevealFired) {
+                    // One of the required fingers lifted before the hold completed.
+                    threeFingerMoved = true
+                    target.removeCallbacks(cleanScreenReveal)
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> if (threeFingerActive) {
+                cancelCleanScreenGesture()
+                resetGestureOnly()
+                return true
+            }
+
+            else -> {}
+        }
+
+        // Returning true while clean screen is active keeps the sequence captured even if mouse
+        // forwarding is off, allowing the second and third pointer events to reach this listener.
+        if (!enabled) return shouldHandleCleanScreenGesture()
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 view.requestUnbufferedDispatch(event)
@@ -109,27 +197,38 @@ class RemoteMouseController(
                 doubleTapInProgress = false
                 clearPendingTap()
                 maxPointers = maxOf(maxPointers, event.pointerCount)
+                // Start multi-finger travel from the centroid at the moment the additional
+                // finger lands. Tracking both axes prevents a horizontal two-finger swipe from
+                // being mistaken for a stationary right-click tap when the fingers lift.
+                lastX = averageX(event)
                 lastY = averageY(event)
             }
 
             MotionEvent.ACTION_MOVE -> {
                 maxPointers = maxOf(maxPointers, event.pointerCount)
                 if (event.pointerCount >= 2) {
+                    val x = averageX(event)
                     val y = averageY(event)
+                    val deltaX = x - lastX
                     val deltaY = lastY - y
-                    twoFingerTravel += abs(deltaY)
+                    twoFingerTravel += hypot(deltaX.toDouble(), deltaY.toDouble()).toFloat()
+                    if (twoFingerTravel >= touchSlopPx) moved = true
                     // MotionEvent coordinates are physical pixels. Convert to dp before
                     // producing wheel units so scrolling feels the same on phones with
-                    // different display densities.
-                    scrollRemainder += deltaY / displayDensity * SCROLL_UNITS_PER_DP
-                    if (twoFingerTravel >= touchSlopPx) {
-                        moved = true
+                    // different display densities. Three-or-more-finger input is deliberately
+                    // inert while the normal controls are visible; it must never scroll or
+                    // become a right click.
+                    if (event.pointerCount == 2) {
+                        scrollRemainder += deltaY / displayDensity * SCROLL_UNITS_PER_DP
+                    }
+                    if (moved && event.pointerCount == 2) {
                         val wheel = scrollRemainder.toInt()
                         if (wheel != 0) {
                             send(MousePacket.MODE_RELATIVE, 0, 0, 0, wheel)
                             scrollRemainder -= wheel
                         }
                     }
+                    lastX = x
                     lastY = y
                 } else {
                     val dx = event.x - lastX
@@ -185,9 +284,16 @@ class RemoteMouseController(
                 if (leftHeld) {
                     sendButton("left", false)
                     leftHeld = false
-                } else if (!moved && maxPointers >= 2) {
+                } else if (!moved && maxPointers == 2 &&
+                    twoFingerTravel < touchSlopPx &&
+                    upAt - downAt <= MAX_TAP_DURATION_MS
+                ) {
                     clearPendingTap()
                     sendClick("right")
+                } else if (maxPointers > 1) {
+                    // A long/moving two-finger gesture or any three-or-more-finger gesture is
+                    // neither a click nor the first half of a later double-tap.
+                    clearPendingTap()
                 } else if (!moved && upAt - downAt <= MAX_TAP_DURATION_MS) {
                     if (mode == MouseMode.DIRECT) sendAbsolute(event.x, event.y, view)
                     if (doubleTapInProgress) {
@@ -304,9 +410,22 @@ class RemoteMouseController(
         doubleTapInProgress = false
     }
 
+    private fun cancelCleanScreenGesture() {
+        target.removeCallbacks(cleanScreenReveal)
+        threeFingerActive = false
+        threeFingerMoved = false
+        threeFingerRevealFired = false
+    }
+
     private fun averageY(event: MotionEvent): Float {
         var total = 0f
         for (i in 0 until event.pointerCount) total += event.getY(i)
+        return total / event.pointerCount
+    }
+
+    private fun averageX(event: MotionEvent): Float {
+        var total = 0f
+        for (i in 0 until event.pointerCount) total += event.getX(i)
         return total / event.pointerCount
     }
 
@@ -319,6 +438,8 @@ class RemoteMouseController(
         private const val SCROLL_UNITS_PER_DP = 6.0f
         private val DOUBLE_TAP_TIMEOUT_MS = ViewConfiguration.getDoubleTapTimeout().toLong()
         private val MAX_TAP_DURATION_MS = ViewConfiguration.getLongPressTimeout().toLong()
+        private const val CLEAN_SCREEN_REVEAL_HOLD_MS = 600L
+        private const val CLEAN_SCREEN_SLOP_MULTIPLIER = 2f
         private const val MIN_SEND_INTERVAL_NANOS = 1_000_000_000L / 120L
     }
 }

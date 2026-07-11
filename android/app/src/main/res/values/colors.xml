@@ -1,7 +1,23 @@
 <resources>
     <color name="black">#FF000000</color>
-    <color name="white">#FFFFFFFF</color>
     <color name="purple_500">#FF6200EE</color>
     <color name="purple_700">#FF3700B3</color>
     <color name="teal_200">#FF03DAC5</color>
+
+    <!-- Dark UI palette shared by the discovery screen and stream toolbar. -->
+    <color name="bg_dark">#FF101317</color>
+    <color name="surface_dark">#FF1B1F24</color>
+    <color name="divider_dark">#FF32373E</color>
+    <color name="text_primary_dark">#FFF2F3F5</color>
+    <color name="text_secondary_dark">#FFA7ADB6</color>
+    <color name="accent_blue">#FF4C8DFF</color>
+
+    <!-- Connection-state chip colors. -->
+    <color name="status_green">#FF3DDC84</color>
+    <color name="status_amber">#FFFFC24B</color>
+    <color name="status_red">#FFFF5A5F</color>
+
+    <color name="chip_bg_translucent">#99000000</color>
+    <color name="badge_paired_bg">#332ECC71</color>
+    <color name="badge_paired_text">#FF2ECC71</color>
 </resources>

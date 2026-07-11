@@ -14,5 +14,6 @@ public interface IVideoEncoder : IDisposable
 
     void RequestIdr();
 
-    void SetBitrate(int kbps);
+    /// <summary>Attempts a live bitrate change. Returns true only when the encoder accepts it.</summary>
+    bool SetBitrate(int kbps);
 }

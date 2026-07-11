@@ -11,24 +11,27 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Enter the PIN shown on your PC"
-        android:textSize="14sp"
-        android:layout_marginBottom="12dp" />
+        android:layout_marginBottom="16dp"
+        android:gravity="center"
+        android:text="@string/pair_dialog_body"
+        android:textSize="14sp" />
 
     <com.google.android.material.textfield.TextInputLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="6-digit PIN">
+        android:hint="@string/pair_dialog_hint">
 
         <com.google.android.material.textfield.TextInputEditText
             android:id="@+id/etPin"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:inputType="number"
-            android:maxLength="6"
+            android:layout_height="72dp"
+            android:fontFamily="monospace"
             android:gravity="center"
-            android:textSize="24sp"
-            android:letterSpacing="0.3" />
+            android:inputType="number"
+            android:letterSpacing="0.5"
+            android:maxLength="6"
+            android:textSize="32sp"
+            android:textStyle="bold" />
 
     </com.google.android.material.textfield.TextInputLayout>
 

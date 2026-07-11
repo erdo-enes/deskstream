@@ -5,6 +5,10 @@
         <item name="colorAccent">@color/teal_200</item>
     </style>
 
+    <style name="Theme.DeskStream.Main" parent="Theme.DeskStream">
+        <item name="android:windowBackground">@color/bg_dark</item>
+    </style>
+
     <style name="Theme.DeskStream.Fullscreen" parent="Theme.DeskStream">
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowNoTitle">true</item>

@@ -5,104 +5,165 @@
     android:id="@+id/rootLayout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:padding="16dp"
+    android:padding="20dp"
     tools:context=".ui.MainActivity">
 
     <TextView
         android:id="@+id/tvTitle"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
         android:text="@string/app_name"
-        android:textSize="28sp"
+        android:textColor="@color/text_primary_dark"
+        android:textSize="30sp"
         android:textStyle="bold"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintStart_toStartOf="parent" />
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
 
     <TextView
         android:id="@+id/tvSubtitle"
-        android:layout_width="wrap_content"
+        android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="Discovered servers on this network"
+        android:layout_marginEnd="8dp"
+        android:text="@string/discovery_initial_subtitle"
+        android:textColor="@color/text_secondary_dark"
         android:textSize="14sp"
-        app:layout_constraintTop_toBottomOf="@id/tvTitle"
-        app:layout_constraintStart_toStartOf="parent" />
+        app:layout_constraintEnd_toStartOf="@id/progressDiscovering"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/tvTitle" />
 
     <ProgressBar
         android:id="@+id/progressDiscovering"
         style="?android:attr/progressBarStyleSmall"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        app:layout_constraintTop_toTopOf="@id/tvSubtitle"
         app:layout_constraintBottom_toBottomOf="@id/tvSubtitle"
-        app:layout_constraintEnd_toEndOf="parent" />
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="@id/tvSubtitle" />
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/rvServers"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="16dp"
         android:clipToPadding="false"
-        app:layout_constraintTop_toBottomOf="@id/tvSubtitle"
-        app:layout_constraintBottom_toTopOf="@id/tvManualHint"
+        app:layout_constraintBottom_toTopOf="@id/cardManualConnect"
+        app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
+        app:layout_constraintTop_toBottomOf="@id/tvSubtitle" />
 
-    <TextView
-        android:id="@+id/tvEmptyHint"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="No servers found yet. Make sure the DeskStream server is running on the same network, or enter its IP below."
-        android:textAlignment="center"
-        android:padding="24dp"
-        app:layout_constraintTop_toTopOf="@id/rvServers"
-        app:layout_constraintBottom_toBottomOf="@id/rvServers"
-        app:layout_constraintStart_toStartOf="@id/rvServers"
-        app:layout_constraintEnd_toEndOf="@id/rvServers" />
-
-    <TextView
-        android:id="@+id/tvManualHint"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="8dp"
-        android:text="Manual connection"
-        android:textStyle="bold"
-        app:layout_constraintBottom_toTopOf="@id/rowManual"
-        app:layout_constraintStart_toStartOf="parent" />
-
+    <!-- Empty state: a subtle progress indicator above reassuring copy, shown in place of the
+         list while no servers have replied to discovery yet. -->
     <LinearLayout
-        android:id="@+id/rowManual"
+        android:id="@+id/emptyStateContainer"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="24dp"
+        app:layout_constraintBottom_toBottomOf="@id/rvServers"
+        app:layout_constraintEnd_toEndOf="@id/rvServers"
+        app:layout_constraintStart_toStartOf="@id/rvServers"
+        app:layout_constraintTop_toTopOf="@id/rvServers">
 
-        <com.google.android.material.textfield.TextInputLayout
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="Server IP address">
+        <ProgressBar
+            android:id="@+id/progressEmptyState"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:layout_marginBottom="16dp"
+            android:indeterminateTint="@color/accent_blue" />
 
-            <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/etManualIp"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:inputType="text"
-                android:imeOptions="actionDone"
-                android:maxLines="1" />
-
-        </com.google.android.material.textfield.TextInputLayout>
-
-        <Button
-            android:id="@+id/btnConnect"
+        <TextView
+            android:id="@+id/tvEmptyHint"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:text="Connect" />
+            android:gravity="center"
+            android:text="@string/discovery_empty_title"
+            android:textColor="@color/text_primary_dark"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:gravity="center"
+            android:text="@string/discovery_empty_subtitle"
+            android:textColor="@color/text_secondary_dark"
+            android:textSize="13sp" />
 
     </LinearLayout>
+
+    <!-- Manual connection: always visible, clearly separated as its own card so it reads as a
+         real fallback affordance rather than an afterthought below the list. -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/cardManualConnect"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="4dp"
+        app:cardBackgroundColor="@color/surface_dark"
+        app:cardCornerRadius="14dp"
+        app:cardElevation="0dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:strokeColor="@color/divider_dark"
+        app:strokeWidth="1dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="10dp"
+                android:text="@string/discovery_manual_label"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:id="@+id/rowManual"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:hint="@string/discovery_manual_hint"
+                    app:boxStrokeColor="@color/accent_blue"
+                    app:hintTextColor="@color/text_secondary_dark">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/etManualIp"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:imeOptions="actionDone"
+                        android:inputType="text"
+                        android:maxLines="1"
+                        android:textColor="@color/text_primary_dark" />
+
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnConnect"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="10dp"
+                    android:backgroundTint="@color/accent_blue"
+                    android:text="@string/discovery_connect_action" />
+
+            </LinearLayout>
+
+        </LinearLayout>
+
+    </com.google.android.material.card.MaterialCardView>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

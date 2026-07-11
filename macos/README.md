@@ -8,9 +8,12 @@ local ad-hoc-signed app.
 
 - LAN discovery plus manual IPv4 connection, PIN pairing, Keychain token storage, TCP
   keepalive, and automatic reconnect.
-- Two-frame H.264 UDP assembly with XOR-FEC recovery and drop-until-IDR behavior.
+- Four-frame H.264 UDP reordering/assembly state with XOR-FEC recovery and drop-until-IDR
+  behavior; completed frames still leave immediately, so this is not a jitter buffer.
 - Hardware H.264 presentation through `AVSampleBufferDisplayLayer`, marked for immediate
-  display without a playback timeline or jitter buffer.
+  display without a playback timeline. On macOS 14, conversion and renderer enqueue use a
+  dedicated user-interactive queue; flush recovery preserves the last image and resumes only
+  from a fresh IDR.
 - Separate bounded 48 kHz stereo PCM playback with local mute.
 - Direct mouse mode and explicit relative pointer capture; `Control-Option-Escape`, focus
   loss, sleep, disconnect, and stream stop all release captured input.
@@ -18,6 +21,10 @@ local ad-hoc-signed app.
   layout and game scan-code behavior.
 - Up to four GameController devices forwarded as virtual Xbox 360 controllers through the
   existing server/ViGEm path, including best-effort controller haptics.
+- Native (20 Mbps ceiling) / 720p (10 Mbps ceiling) quality selection, local PNG screenshots,
+  live stats, and full-screen controls.
+  macOS 14.4+ copies the displayed pixel directly; older supported systems use a one-frame
+  fallback decode that tears down immediately after the screenshot.
 
 ## Build and test
 

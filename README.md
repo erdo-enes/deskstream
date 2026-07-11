@@ -32,12 +32,24 @@ Miracast, and Chromecast, and designing those failure modes out. See
 4. Optional for gamepad forwarding: install the official
    [ViGEmBus 1.22 driver](https://github.com/nefarius/ViGEmBus/releases/latest), then restart
    DeskStream. Video and audio work without it.
+5. A web dashboard runs at `http://127.0.0.1:47810/` — pairing PIN, live stats, stream
+   restart, and the default quality (Native / 720p). `--web-lan` exposes it to the LAN
+   (unauthenticated — it shows the PIN), `--no-web` disables it.
+6. To run DeskStream automatically like a service: `DeskStreamer.Server.exe --install-autostart`
+   registers a logon Scheduled Task that starts the server headless in your session
+   (console output, including the PIN, goes to `deskstream.log`; manage it from the web
+   dashboard). `--uninstall-autostart` removes it. A true session-0 Windows service cannot
+   capture the desktop, so this is deliberately a user-session autostart.
+7. Optional: cap the encoder target with `--max-bitrate-kbps 12000` on congested WiFi
+   (default 20000; minimum 2000). FEC, packet headers, and PCM audio add wire overhead.
 
 **Android (8.0+):**
 1. Open `android/` in Android Studio, run on your device.
 2. Make sure the phone is on the **same WiFi** as the PC (5 GHz strongly recommended).
 3. Your PC appears in the list — tap it, type the 6-digit PIN shown in the PC console
    once. After that it auto-connects.
+4. In a stream, **Hide** removes every overlay. Hold three fingers for 600 ms, press Back,
+   or press F11 on a hardware keyboard to restore controls without clicking the host.
 
 **macOS (13+, Apple silicon):**
 1. `cd macos && make app` using Apple's Command Line Tools.
@@ -68,3 +80,5 @@ Miracast, and Chromecast, and designing those failure modes out. See
 - Clock-synchronized p95 pipeline telemetry, a media heartbeat, UDP re-punching, bounded
   pools/queues, and automatic stream restart keep long sessions from accumulating delay.
 - Closed-loop bitrate adaptation so WiFi congestion degrades quality, not latency.
+- Optional 720p60 mode downscales on the server GPU before encoding and uses a 10 Mbps client
+  ceiling — fewer pixels and packets to encode, send, and decode on constrained networks/devices.

@@ -26,10 +26,14 @@ APP_FRAMEWORKS := $(FRAMEWORKS) \
 	-framework AppKit \
 	-framework AVFoundation \
 	-framework CoreMedia \
+	-framework CoreVideo \
+	-framework CoreImage \
+	-framework VideoToolbox \
 	-framework QuartzCore \
 	-framework CoreGraphics \
 	-framework GameController \
-	-framework CoreHaptics
+	-framework CoreHaptics \
+	-framework UniformTypeIdentifiers
 
 .PHONY: all app core-test test clean
 

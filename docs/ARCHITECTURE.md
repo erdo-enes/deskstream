@@ -53,7 +53,7 @@ Rules that keep it low:
   receiver feeds 5 ms PCM blocks to a low-latency `AudioTrack` with local mute. Physical
   Android gamepads are reduced to newest-state snapshots and forwarded at up to 120 Hz.
   Touch becomes either relative touchpad motion or direct absolute primary-display motion.
-- `macos/` — native Objective-C/AppKit Apple-silicon app (macOS 13+). Its bounded two-frame
+- `macos/` — native Objective-C/AppKit Apple-silicon app (macOS 13+). Its bounded four-frame
   FEC assembler feeds H.264 access units directly to AVSampleBufferDisplayLayer with
   display-immediately semantics; separate bounded PCM output and foreground AppKit/
   GameController capture forward mouse, physical keyboard, and up to four gamepads.

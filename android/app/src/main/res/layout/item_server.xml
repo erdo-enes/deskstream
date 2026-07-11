@@ -4,35 +4,63 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_marginBottom="8dp"
-    app:cardCornerRadius="8dp"
-    app:cardElevation="1dp">
+    android:layout_marginBottom="10dp"
+    app:cardBackgroundColor="@color/surface_dark"
+    app:cardCornerRadius="14dp"
+    app:cardElevation="0dp"
+    app:strokeColor="@color/divider_dark"
+    app:strokeWidth="1dp">
 
     <LinearLayout
         android:id="@+id/itemRoot"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="16dp"
+        android:background="?attr/selectableItemBackground"
         android:clickable="true"
         android:focusable="true"
-        android:background="?attr/selectableItemBackground">
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="16dp">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/tvServerName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_primary_dark"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                tools:text="DESKTOP-PC" />
+
+            <TextView
+                android:id="@+id/tvServerIp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="@color/text_secondary_dark"
+                android:textSize="13sp"
+                tools:text="192.168.1.42:47801" />
+
+        </LinearLayout>
 
         <TextView
-            android:id="@+id/tvServerName"
+            android:id="@+id/tvPairedBadge"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textSize="16sp"
+            android:background="@drawable/bg_badge_paired"
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp"
+            android:text="@string/discovery_paired_badge"
+            android:textColor="@color/badge_paired_text"
+            android:textSize="11sp"
             android:textStyle="bold"
-            tools:text="DESKTOP-PC" />
-
-        <TextView
-            android:id="@+id/tvServerIp"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textSize="13sp"
-            android:alpha="0.7"
-            tools:text="192.168.1.42:47801" />
+            android:visibility="gone"
+            tools:visibility="visible" />
 
     </LinearLayout>
 

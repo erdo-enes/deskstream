@@ -13,6 +13,11 @@ typedef NS_ERROR_ENUM(DSNetworkErrorDomain, DSNetworkError) {
 
 typedef void (^DSDatagramHandler)(NSData *data, NSString *sourceHost, uint16_t sourcePort);
 
+/// Synchronous zero-copy receive callback. `bytes` is valid only for the duration of the block;
+/// consumers must finish parsing/copying it before returning. Intended for the high-rate media
+/// path, where allocating an NSData object for every UDP packet is unnecessarily expensive.
+typedef void (^DSRawDatagramHandler)(const void *bytes, size_t length);
+
 /// A one-shot bound IPv4 UDP socket with optional source endpoint validation.
 /// Receive callbacks run on the queue supplied at initialization.
 @interface DSUDPSocket : NSObject
@@ -23,6 +28,12 @@ typedef void (^DSDatagramHandler)(NSData *data, NSString *sourceHost, uint16_t s
                                          queue:(dispatch_queue_t)queue
                                        handler:(DSDatagramHandler)handler
                                          error:(NSError **)error NS_DESIGNATED_INITIALIZER;
+
+- (nullable instancetype)initWithExpectedHost:(nullable NSString *)expectedHost
+                                  expectedPort:(uint16_t)expectedPort
+                                         queue:(dispatch_queue_t)queue
+                                    rawHandler:(DSRawDatagramHandler)rawHandler
+                                         error:(NSError **)error;
 
 - (BOOL)bindToPort:(uint16_t)port receiveBufferSize:(int)receiveBufferSize error:(NSError **)error;
 - (BOOL)setBroadcastEnabled:(BOOL)enabled error:(NSError **)error;
