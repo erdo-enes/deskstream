@@ -27,7 +27,7 @@ Target: <50 ms glass-to-glass at 1080p60.
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.5.8 published)
+## Current state (v0.5.9 published)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public).
 - **v0.5.0** (published tag `v0.5.0`) brings stream quality selection (native/720p), localhost-only web dashboard (on TCP port 47810), Scheduled Task service/headless mode, client screenshot hotkeys, and major client UI restyling.
@@ -90,6 +90,19 @@ Target: <50 ms glass-to-glass at 1080p60.
   always correct) no longer prints unknown dims. Compile-verified only; the client-side
   drop→discard-until-keyframe amplifier (PROTOCOL §3.1) remains a suspect if drops persist —
   the new log reasons will discriminate on the next field run.
+- **v0.5.9** (published tag `v0.5.9`, server-only) is a comprehensive overhaul of the bitrate
+  adaptation algorithm. Despite v0.5.8 fixing the floor-pin regression, the algorithm still
+  spiraled to the floor within seconds on real WiFi networks due to compounding issues:
+  30% cuts (×0.7) every 1.5s produced 0.7⁴=0.24x in 6s; drop threshold of >2 frames fired
+  on normal WiFi jitter; latency margins of +15/+12ms fired on routine p95 noise; 2 IDRs in
+  1s triggered cuts on single retransmits; recovery needed 5 clean seconds per +10% step;
+  ceiling memory at 85% trapped quality far below the congestion point. Fixes:
+  cuts reduced to 20% (×0.8); debounce widened to 3s; drop threshold raised to >5 frames or
+  >5% loss; latency margins widened to +40ms capture / +25ms decode; latency streak raised
+  to 3 consecutive intervals; IDR burst trigger raised to 3 requests in 2s; recovery interval
+  lowered to 2 clean stats; multiplicative recovery raised to ×1.15; additive step doubled to
+  +1000 kbps; ceiling recovery accelerated to 5s cadence with 15-40% growth; ceiling set at
+  95% of pre-cut level; bitrate floor raised from 2000 to 3000 kbps.
 - Features are backward-compatible with older v0.4.0 clients:
   1. **Quality selection** — optional `"quality"` field in `START_STREAM` (`"native"` default,
      `"720p"` = server-side downscale to 720 lines in the existing D3D11 VideoProcessor,
