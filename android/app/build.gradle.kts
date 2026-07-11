@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 11
-        versionName = "0.5.0"
+        versionName = "0.5.3"
     }
 
     buildTypes {
@@ -39,6 +39,7 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 }
 

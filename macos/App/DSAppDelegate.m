@@ -281,8 +281,12 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
     self.connectionStatus.textColor = NSColor.secondaryLabelColor;
     self.connectionStatus.maximumNumberOfLines = 3;
 
+    NSString *version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.5.3";
+    NSTextField *versionLabel = [self label:[NSString stringWithFormat:@"Client Version: %@", version] size:11];
+    versionLabel.textColor = NSColor.tertiaryLabelColor;
+
     self.connectPanel = [NSStackView stackViewWithViews:@[
-        title, subtitle, self.serverPopup, self.hostField, actions, self.connectionStatus
+        title, subtitle, self.serverPopup, self.hostField, actions, self.connectionStatus, versionLabel
     ]];
     self.connectPanel.orientation = NSUserInterfaceLayoutOrientationVertical;
     self.connectPanel.alignment = NSLayoutAttributeCenterX;
@@ -299,6 +303,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
         [self.hostField.widthAnchor constraintEqualToConstant:500],
         [actions.widthAnchor constraintEqualToConstant:500],
         [self.connectionStatus.widthAnchor constraintEqualToConstant:500],
+        [versionLabel.widthAnchor constraintEqualToConstant:500],
     ]];
 
     self.streamView = [[DSStreamInputView alloc] initWithFrame:frame];

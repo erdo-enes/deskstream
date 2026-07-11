@@ -9,6 +9,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.deskstream.client.BuildConfig
 import com.deskstream.client.R
 import com.deskstream.client.data.Prefs
 import com.deskstream.client.databinding.ActivityMainBinding
@@ -52,6 +53,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         ControlClient.init(applicationContext)
+        binding.tvVersion.text = "v${BuildConfig.VERSION_NAME}"
         discoveryClient = DiscoveryClient(applicationContext)
 
         serverAdapter = ServerAdapter(

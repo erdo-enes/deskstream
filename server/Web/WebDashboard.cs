@@ -408,6 +408,7 @@ public sealed class WebDashboard : IDisposable
         return new
         {
             server = _hostname,
+            version = typeof(WebDashboard).Assembly.GetName().Version?.ToString(3) ?? "0.5.3",
             protocol = ProtocolConstants.Version,
             clientConnected = connected,
             clientName = session?.ClientName,
@@ -629,7 +630,7 @@ public sealed class WebDashboard : IDisposable
     }
 
     document.getElementById('hdr').innerHTML =
-      esc(s.server) + ' &middot; protocol v' + esc(s.protocol);
+      esc(s.server) + ' (v' + esc(s.version) + ') &middot; protocol v' + esc(s.protocol);
     const ports = s.ports || {};
     document.getElementById('listen').innerHTML =
       'Listening on ' + (s.listen || []).map(ip => '<code>' + esc(ip) + '</code>').join(' ') +
