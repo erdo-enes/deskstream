@@ -157,6 +157,23 @@ long prevCapReal = 0;
 long prevCapPointer = 0;
 long prevCapTimeouts = 0;
 long prevCapAccum = 0;
+
+// Headless suppresses the per-second console [stats] line, so accumulate a compact bounded
+// summary and emit it to the app log once every 10 s — the only stream telemetry a headless
+// field log otherwise has. Consistent with v0.5.2 (which suppressed the unbounded 1 Hz line).
+int win10Ticks = 0;
+long win10EncFps = 0, win10SentKbps = 0, win10Idr = 0;
+long win10Re = 0, win10Po = 0, win10To = 0, win10Pres = 0;
+int win10MaxDropped = 0;
+
+void ResetWindow10()
+{
+    win10Ticks = 0;
+    win10EncFps = win10SentKbps = win10Idr = 0;
+    win10Re = win10Po = win10To = win10Pres = 0;
+    win10MaxDropped = 0;
+}
+
 try
 {
     while (!shutdown.IsCancellationRequested)
@@ -217,9 +234,32 @@ try
                     $"cap {realDelta}re/{pointerDelta}po/{timeoutDelta}to ~{presentsPerSec}pres | " +
                     $"{audioStatus} | {gamepadStatus}");
             }
+            else
+            {
+                // Accumulate a bounded 10 s summary for the headless app log.
+                win10Ticks++;
+                win10EncFps += fps;
+                win10SentKbps += mediaKbps;
+                win10Idr += idrDelta;
+                win10Re += realDelta;
+                win10Po += pointerDelta;
+                win10To += timeoutDelta;
+                win10Pres += presentsPerSec;
+                win10MaxDropped = Math.Max(win10MaxDropped, session.LastClientFramesDropped);
+                if (win10Ticks >= 10)
+                {
+                    AsyncLogger.Info(
+                        $"[stats10s] enc ~{win10EncFps / win10Ticks} fps | " +
+                        $"sent ~{win10SentKbps / win10Ticks} kbps @ {session.CurrentBitrateKbps} kbps | " +
+                        $"client dropped max {win10MaxDropped} | IDR req {win10Idr} | " +
+                        $"cap {win10Re}re/{win10Po}po/{win10To}to ~{win10Pres}pres");
+                    ResetWindow10();
+                }
+            }
         }
         else
         {
+            ResetWindow10();
             prevEncoded = 0;
             prevIdr = 0;
             prevAudioBytes = 0;

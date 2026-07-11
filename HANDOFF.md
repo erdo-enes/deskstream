@@ -27,7 +27,7 @@ Target: <50 ms glass-to-glass at 1080p60.
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.5.7 published)
+## Current state (v0.5.8 published)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public).
 - **v0.5.0** (published tag `v0.5.0`) brings stream quality selection (native/720p), localhost-only web dashboard (on TCP port 47810), Scheduled Task service/headless mode, client screenshot hotkeys, and major client UI restyling.
@@ -72,6 +72,24 @@ Target: <50 ms glass-to-glass at 1080p60.
      skipped; enumeration is hardware-only so no software fallback exists).
   Compile-verified only; needs the real Windows+WiFi rig to confirm 60 fps under mouse motion
   and the sawtooth's disappearance.
+- **v0.5.8** (published tag `v0.5.8`, server-only) fixes the v0.5.7 field regression where the
+  bitrate controller death-spiraled to the 2000 kbps floor in 8 s and stayed pinned for the
+  whole session. Root cause (confirmed by two independent analyses): at the floor,
+  `AdaptDown`'s cut is a no-op, `ApplyBitrate` early-returns, and the v0.5.3 latency-baseline
+  reset (which lived inside `ApplyBitrate`'s success path) never ran — the all-time-min
+  baseline stayed poisoned, so `latencyGrowing` was chronically true, and each bogus no-op
+  DOWN also re-slammed the v0.5.7 ceiling memory to the floor, blocking recovery. Fixes in
+  `StreamSession.cs`: floor no-op DOWNs now reset the baseline (`ResetLatencyBaseline()`),
+  hold the debounce, log at DEBUG, and do NOT touch the ceiling or clean streak;
+  `latencyGrowing` requires ≥2 consecutive stats intervals; ceiling recovery decoupled from
+  the clean streak (×1.05/10 s quiet, accelerating to ×1.25 after 30 s without a real cut);
+  adaptation logs now name the exact trigger with numbers (`drops 4/300 (1.3%)` or
+  `latency p95 cap 62>28+15 dec 20>18+12 x2`); `--headless` emits a bounded `[stats10s]`
+  summary (enc fps, sent/target kbps, drops, IDR, cap re/po/to~pres) every 10 s; the
+  first-start `Stream starting: 0x0` log (read-before-init, cosmetic — STREAM_STARTED was
+  always correct) no longer prints unknown dims. Compile-verified only; the client-side
+  drop→discard-until-keyframe amplifier (PROTOCOL §3.1) remains a suspect if drops persist —
+  the new log reasons will discriminate on the next field run.
 - Features are backward-compatible with older v0.4.0 clients:
   1. **Quality selection** — optional `"quality"` field in `START_STREAM` (`"native"` default,
      `"720p"` = server-side downscale to 720 lines in the existing D3D11 VideoProcessor,

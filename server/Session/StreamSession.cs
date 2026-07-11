@@ -89,6 +89,10 @@ public sealed class StreamSession : IDisposable
     private long _lastIdrGenMs = -1000;
     private int _bestCaptureToReceiveMs = int.MaxValue;
     private int _bestDecodeToSurfaceMs = int.MaxValue;
+    // Consecutive stats intervals where p95 latency exceeded the learned baseline. We require a
+    // sustained rise (>=2 intervals) before cutting, so a single spike (transient / startup-IDR-
+    // contaminated p95 window) cannot slash bitrate.
+    private int _latencyGrowingStreak;
 
     // AIMD-with-memory: remember the level a loss episode was found at (the "breaking point")
     // and converge additively under it instead of sawtoothing through it. The ceiling slowly
@@ -96,6 +100,7 @@ public sealed class StreamSession : IDisposable
     private int _bitrateCeilingKbps = ServerOptions.DefaultMaxBitrateKbps;
     private long _lastAdaptDownMs = long.MinValue / 4;  // "far past" so the first cut is never debounced
     private long _lastCeilingRaiseMs;
+    private long _lastCeilingCutMs = long.MinValue / 4;  // time of the last REAL ceiling reduction
 
     // Stats surfaced to the console (Program reads these)
     private long _encodedFrames;
@@ -299,7 +304,11 @@ public sealed class StreamSession : IDisposable
     {
         try
         {
-            AsyncLogger.Info($"[session] Stream starting: {_streamWidth}x{_streamHeight}@{Fps} ({_quality}), max bitrate {_maxBitrateKbps} kbps");
+            // Dimensions are only known after StartPipeline queries the duplicator, so this
+            // pre-start line intentionally omits them (they were previously logged as 0x0 on the
+            // very first start, before any duplicator existed). The post-start line below reports
+            // the authoritative resolved dimensions.
+            AsyncLogger.Info($"[session] Stream starting: {_quality}@{Fps}, max bitrate {_maxBitrateKbps} kbps");
             StartPipeline();
             _send(OutgoingMessages.StreamStarted(
                 _sender!.Port,
@@ -631,10 +640,12 @@ public sealed class StreamSession : IDisposable
         _idrSinceLastStats = 0;
         _bitrateCeilingKbps = _maxBitrateKbps;
         _lastAdaptDownMs = long.MinValue / 4;
+        _lastCeilingCutMs = long.MinValue / 4;
         _lastCeilingRaiseMs = NowMs();
         _idrTimes.Clear();
         _bestCaptureToReceiveMs = int.MaxValue;
         _bestDecodeToSurfaceMs = int.MaxValue;
+        _latencyGrowingStreak = 0;
         _clockBaseUs = NowUs();
         _clock = Stopwatch.StartNew();
 
@@ -925,7 +936,7 @@ public sealed class StreamSession : IDisposable
 
         if (_idrTimes.Count >= 2)
         {
-            AdaptDown();
+            AdaptDown($"IDR burst {_idrTimes.Count}/1s");
             _idrTimes.Clear(); // avoid re-triggering off the same burst
         }
     }
@@ -950,58 +961,107 @@ public sealed class StreamSession : IDisposable
         if (s.DecodeToSurfaceP95Ms >= 0)
             _bestDecodeToSurfaceMs = Math.Min(_bestDecodeToSurfaceMs, s.DecodeToSurfaceP95Ms);
 
-        bool latencyGrowing =
+        bool latencyGrowingNow =
             (_bestCaptureToReceiveMs != int.MaxValue &&
              s.CaptureToReceiveP95Ms > _bestCaptureToReceiveMs + 15) ||
             (_bestDecodeToSurfaceMs != int.MaxValue &&
              s.DecodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 12);
-        bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 && !latencyGrowing;
+
+        // Require the rise to persist across >=2 consecutive intervals before reacting. A single
+        // p95 spike (game-launch transient, or a startup-IDR-contaminated window) must not cut.
+        _latencyGrowingStreak = latencyGrowingNow ? _latencyGrowingStreak + 1 : 0;
+        bool latencySustained = _latencyGrowingStreak >= 2;
 
         // A single dropped frame at 60 fps is already 1.67%, which tripped the old >1% trigger on
         // ordinary jitter. Require either a small absolute burst or a 2% loss rate.
-        if (s.FramesDropped > 2 || dropRate > 0.02 || latencyGrowing)
-        {
-            AdaptDown();
-        }
-        else if (clean)
-        {
-            // Ceiling recovery: nudge the remembered breaking point up on clean intervals, at most
-            // once per 10 s, so a transient blip does not cap quality for the rest of the session.
-            long now = NowMs();
-            if (now - _lastCeilingRaiseMs >= 10_000)
-            {
-                _bitrateCeilingKbps = Math.Min(_maxBitrateKbps, (int)(_bitrateCeilingKbps * 1.05));
-                _lastCeilingRaiseMs = now;
-            }
+        bool dropCongestion = s.FramesDropped > 2 || dropRate > 0.02;
+        bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 && !latencyGrowingNow;
 
-            _cleanStreak++;
-            if (_cleanStreak >= 5)
-            {
-                AdaptUp();
-                _cleanStreak = 0;
-            }
+        if (dropCongestion || latencySustained)
+        {
+            string reason = dropCongestion
+                ? $"drops {s.FramesDropped}/{total} ({dropRate:P1})"
+                : $"latency p95 cap {s.CaptureToReceiveP95Ms}>{BaselineStr(_bestCaptureToReceiveMs)}+15 " +
+                  $"dec {s.DecodeToSurfaceP95Ms}>{BaselineStr(_bestDecodeToSurfaceMs)}+12 x{_latencyGrowingStreak}";
+            AdaptDown(reason);
         }
         else
         {
-            _cleanStreak = 0;
+            // Ceiling recovery, independent of the (stricter) clean streak: on any quiet interval
+            // nudge the remembered breaking point back toward the hard max so a stale or transient
+            // episode cannot cap quality for minutes. Accelerate once a real cut is well past.
+            if (s.FramesDropped == 0 && !latencyGrowingNow && _bitrateCeilingKbps < _maxBitrateKbps)
+            {
+                long now = NowMs();
+                if (now - _lastCeilingRaiseMs >= 10_000)
+                {
+                    double factor = now - _lastCeilingCutMs >= 30_000 ? 1.25 : 1.05;
+                    _bitrateCeilingKbps = Math.Min(_maxBitrateKbps, (int)(_bitrateCeilingKbps * factor));
+                    _lastCeilingRaiseMs = now;
+                }
+            }
+
+            if (clean)
+            {
+                _cleanStreak++;
+                if (_cleanStreak >= 5)
+                {
+                    AdaptUp();
+                    _cleanStreak = 0;
+                }
+            }
+            else
+            {
+                _cleanStreak = 0;
+            }
         }
 
         _idrSinceLastStats = 0;
     }
 
-    private void AdaptDown()
+    private static string BaselineStr(int best) => best == int.MaxValue ? "-" : best.ToString();
+
+    /// <summary>
+    /// Re-learns the p95 latency baseline from scratch. Called after any real bitrate change (the
+    /// operating point moved) and after a floor no-op DOWN (so a chronically-high "growing" signal
+    /// at the floor cannot pin the stream there forever).
+    /// </summary>
+    private void ResetLatencyBaseline()
+    {
+        _bestCaptureToReceiveMs = int.MaxValue;
+        _bestDecodeToSurfaceMs = int.MaxValue;
+        _latencyGrowingStreak = 0;
+    }
+
+    private void AdaptDown(string reason)
     {
         long now = NowMs();
         // Debounce: one loss episode routinely produces both an OnRequestIdr burst and an OnStats
-        // drop report. Collapsing them into a single cut kills the "double 30% slash" sawtooth.
+        // drop report. Collapsing them into a single reaction kills the "double 30% slash" sawtooth.
         if (now - _lastAdaptDownMs < 1500)
             return;
-        _lastAdaptDownMs = now;
 
-        // Remember the breaking point just below where the loss appeared, then take the existing cut.
-        _bitrateCeilingKbps = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.85));
         int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.7));
-        AsyncLogger.Info($"[adaptation] Adapting bitrate DOWN: {_currentBitrateKbps} -> {next} kbps (ceiling now {_bitrateCeilingKbps}; due to frame drops / latency growth)");
+
+        // Floor no-op: the ×0.7 cut cannot lower an already-floored bitrate. This must NOT count as
+        // a real adaptation event — otherwise it slams the ceiling down to the floor and, because
+        // ApplyBitrate short-circuits on an unchanged bitrate, never resets the latency baseline,
+        // leaving latencyGrowing chronically true and pinning the stream at the floor (the field
+        // regression). Re-baseline, hold the debounce so we stop re-evaluating every stats tick,
+        // and log at DEBUG instead of spamming INFO.
+        if (next >= _currentBitrateKbps)
+        {
+            ResetLatencyBaseline();
+            _lastAdaptDownMs = now;
+            AsyncLogger.Debug($"[adaptation] DOWN suppressed at floor {_currentBitrateKbps} kbps ({reason}); latency baseline reset");
+            return;
+        }
+
+        _lastAdaptDownMs = now;
+        _lastCeilingCutMs = now;
+        // Remember the breaking point just below where the loss appeared, then take the cut.
+        _bitrateCeilingKbps = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.85));
+        AsyncLogger.Info($"[adaptation] DOWN {_currentBitrateKbps} -> {next} kbps ({reason}; ceiling {_bitrateCeilingKbps})");
         ApplyBitrate(next);
         _cleanStreak = 0;
     }
@@ -1011,10 +1071,13 @@ public sealed class StreamSession : IDisposable
         int ceiling = Math.Min(_maxBitrateKbps, _bitrateCeilingKbps);
         // Near the remembered breaking point, converge additively (+500 kbps) instead of the ×1.1
         // multiplicative step so we settle just under it rather than overshooting and re-triggering.
-        int next = _currentBitrateKbps >= (int)(0.85 * ceiling)
+        bool additive = _currentBitrateKbps >= (int)(0.85 * ceiling);
+        int next = additive
             ? Math.Min(ceiling, _currentBitrateKbps + 500)
             : Math.Min(ceiling, (int)(_currentBitrateKbps * 1.1));
-        AsyncLogger.Info($"[adaptation] Adapting bitrate UP: {_currentBitrateKbps} -> {next} kbps (ceiling {ceiling})");
+        if (next == _currentBitrateKbps)
+            return; // already at the ceiling; nothing to raise
+        AsyncLogger.Info($"[adaptation] UP {_currentBitrateKbps} -> {next} kbps ({(additive ? "additive" : "x1.1")}; ceiling {ceiling})");
         ApplyBitrate(next);
     }
 
@@ -1036,9 +1099,8 @@ public sealed class StreamSession : IDisposable
             _send(OutgoingMessages.Bitrate(kbps));
             AsyncLogger.Info($"[encoder] Bitrate reconfigured successfully to {kbps} kbps");
 
-            // Reset the best-latency baselines when the bitrate changes
-            _bestCaptureToReceiveMs = int.MaxValue;
-            _bestDecodeToSurfaceMs = int.MaxValue;
+            // The operating point moved: re-learn the p95 latency baseline from scratch.
+            ResetLatencyBaseline();
         }
         catch (Exception ex)
         {
