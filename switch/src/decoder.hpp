@@ -10,7 +10,7 @@ struct AVPacket;
 
 class H264Decoder {
 private:
-    AVCodec* _codec = nullptr;
+    const AVCodec* _codec = nullptr;
     AVCodecContext* _ctx = nullptr;
     AVFrame* _frame = nullptr;
     AVPacket* _packet = nullptr;

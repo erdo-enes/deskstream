@@ -33,9 +33,10 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 
 ASFLAGS	:=	-g $(ARCH_FLAGS)
 
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH_FLAGS) -Wl,-Map,$(notdir $*.map)
+export LD	:=	$(CXX)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g -Wl,-Map,$(notdir $*.map)
 
-LIBS	:=	-lavcodec -lavformat -lavutil -lswresample -lswscale -lz `sdl2-config --libs` -lnx
+LIBS	:=	`PKG_CONFIG_PATH=$(DEVKITPRO)/portlibs/switch/lib/pkgconfig pkg-config --static --libs libavcodec libavformat libavutil libswresample libswscale` `sdl2-config --libs` -lnx
 
 #---------------------------------------------------------------------------------
 # list of templates and rules
@@ -73,7 +74,7 @@ export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 
 #---------------------------------------------------------------------------------
 all: $(DEPSDIR)
-	@$(MAKE) --no-print-directory -C $(DEPSDIR) -f $(CURDIR)/Makefile BUILD=$(notdir $(CURDIR))
+	@$(MAKE) --no-print-directory -C $(DEPSDIR) -f $(TOPDIR)/Makefile BUILD=build
 
 $(DEPSDIR):
 	@mkdir -p $@

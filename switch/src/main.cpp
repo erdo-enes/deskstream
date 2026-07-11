@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <fstream>
 #include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <SDL2/SDL.h>
 
@@ -311,9 +313,24 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
                 // Trigger HD Rumble if compiled on the console
                 int largeMotor = std::stoi(getJsonValue(controlMsg, "largeMotor"));
                 int smallMotor = std::stoi(getJsonValue(controlMsg, "smallMotor"));
-                // Simple rumble activation
-                hidSendVibrationValues(HidVibrationDeviceHandle_ControllerPlayer1_Left, largeMotor > 0 ? 0.5f : 0.0f, largeMotor > 0 ? 160.0f : 0.0f);
-                hidSendVibrationValues(HidVibrationDeviceHandle_ControllerPlayer1_Right, smallMotor > 0 ? 0.5f : 0.0f, smallMotor > 0 ? 320.0f : 0.0f);
+                
+                HidVibrationDeviceHandle handles[2];
+                hidInitializeVibrationDevices(handles, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual);
+                
+                HidVibrationValue values[2];
+                // Left joy-con
+                values[0].amp_low = largeMotor / 255.0f;
+                values[0].freq_low = 160.0f;
+                values[0].amp_high = 0.0f;
+                values[0].freq_high = 320.0f;
+                
+                // Right joy-con
+                values[1].amp_low = 0.0f;
+                values[1].freq_low = 160.0f;
+                values[1].amp_high = smallMotor / 255.0f;
+                values[1].freq_high = 320.0f;
+                
+                hidSendVibrationValues(handles, values, 2);
 #endif
             } else if (type == "STREAM_STOPPED") {
                 running = false;
@@ -481,14 +498,12 @@ int main(int argc, char* argv[]) {
                         std::cout << i + 1 << ". " << list[i].hostname << " (" << list[i].ip << ")" << std::endl;
                     }
                     std::string select = showKeyboard("Select server index (1-" + std::to_string(list.size()) + ")", "1");
-                    try {
-                        size_t idx = std::stoi(select) - 1;
-                        if (idx < list.size()) {
-                            ip = list[idx].ip;
-                            cfg.token = ""; // reset token for new server
-                            runStream(renderer, ip, list[idx].controlPort, "");
-                        }
-                    } catch (...) {}
+                    int idx = atoi(select.c_str()) - 1;
+                    if (idx >= 0 && idx < (int)list.size()) {
+                        ip = list[idx].ip;
+                        cfg.token = ""; // reset token for new server
+                        runStream(renderer, ip, list[idx].controlPort, "");
+                    }
                 }
             }
         } else if (choice == "3") {
