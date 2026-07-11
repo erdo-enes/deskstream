@@ -27,11 +27,13 @@ Target: <50 ms glass-to-glass at 1080p60.
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.5.0 release candidate; v0.4.0 published)
+## Current state (v0.5.2 published)
 
-- GitHub: https://github.com/erdo-enes/deskstream (public). `v0.4.0` is the latest published
-  release (tag `v0.4.0`, July 11 2026; APK + win-x64 server zip + ad-hoc-signed arm64 macOS app).
-- The local v0.5.0 candidate adds, all backward-compatible with v0.4.0 peers:
+- GitHub: https://github.com/erdo-enes/deskstream (public).
+- **v0.5.0** (published tag `v0.5.0`) brings stream quality selection (native/720p), localhost-only web dashboard (on TCP port 47810), Scheduled Task service/headless mode, client screenshot hotkeys, and major client UI restyling.
+- **v0.5.1** (published tag `v0.5.1`) fixes the server 60 FPS pacing lock and 720p conversion stutter. It implements a precise drift-free capture micro-pacing loop (combining `Thread.Sleep` and `Thread.SpinWait` for sub-millisecond accuracy) and configures the Windows scheduler to 1ms resolution at startup.
+- **v0.5.2** (published tag `v0.5.2`) adds a high-performance, non-blocking asynchronous file logging system (`deskstream.app.log`) operating on a dedicated background worker thread to prevent thread jitter/stalls on critical stream and capture hot paths.
+- Features are backward-compatible with older v0.4.0 clients:
   1. **Quality selection** — optional `"quality"` field in `START_STREAM` (`"native"` default,
      `"720p"` = server-side downscale to 720 lines in the existing D3D11 VideoProcessor,
      aspect preserved, even dims, never upscaled; encoder created at the scaled size).
@@ -123,6 +125,8 @@ Target: <50 ms glass-to-glass at 1080p60.
 | **Client screenshots (Android + macOS)** | ✅ implemented v0.5.0; compile-verified |
 | **Server web dashboard (localhost:47810)** | ✅ implemented v0.5.0; compile-verified |
 | **Headless + logon-autostart "service" mode** | ✅ implemented v0.5.0; schtasks/Windows untested |
+| **Precise capture pacing (60 FPS lock & 720p stability)** | ✅ implemented v0.5.1; compile-verified |
+| **Async server app logging (deskstream.app.log)** | ✅ implemented v0.5.2; compile-verified |
 | Encryption (TLS control / AES-GCM media) | ❌ NOT implemented (LAN plaintext) |
 | mDNS advertisement, QR pairing | ❌ NOT implemented |
 | Framerate/resolution adaptation steps | ❌ NOT implemented (bitrate ladder only) |

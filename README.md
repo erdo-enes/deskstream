@@ -37,7 +37,7 @@ Miracast, and Chromecast, and designing those failure modes out. See
    (unauthenticated — it shows the PIN), `--no-web` disables it.
 6. To run DeskStream automatically like a service: `DeskStreamer.Server.exe --install-autostart`
    registers a logon Scheduled Task that starts the server headless in your session
-   (console output, including the PIN, goes to `deskstream.log`; manage it from the web
+   (console output, including the PIN, goes to `deskstream.log`, while application diagnostics go to `deskstream.app.log`; manage it from the web
    dashboard). `--uninstall-autostart` removes it. A true session-0 Windows service cannot
    capture the desktop, so this is deliberately a user-session autostart.
 7. Optional: cap the encoder target with `--max-bitrate-kbps 12000` on congested WiFi
