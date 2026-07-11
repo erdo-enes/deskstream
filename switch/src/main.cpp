@@ -440,13 +440,152 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
     std::cout << "[stream] Session disconnected." << std::endl;
 }
 
+static const uint8_t font8x8[95][8] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, //  
+    {0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00}, // !
+    {0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // "
+    {0x24, 0x24, 0x7E, 0x24, 0x7E, 0x24, 0x24, 0x00}, // #
+    {0x08, 0x3E, 0x08, 0x08, 0x3E, 0x08, 0x08, 0x00}, // $
+    {0x24, 0x54, 0x08, 0x08, 0x10, 0x2A, 0x24, 0x00}, // %
+    {0x18, 0x24, 0x18, 0x14, 0x22, 0x22, 0x1C, 0x00}, // &
+    {0x18, 0x18, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00}, // '
+    {0x08, 0x10, 0x20, 0x20, 0x20, 0x10, 0x08, 0x00}, // (
+    {0x10, 0x08, 0x04, 0x04, 0x04, 0x08, 0x10, 0x00}, // )
+    {0x00, 0x24, 0x18, 0x7E, 0x18, 0x24, 0x00, 0x00}, // *
+    {0x00, 0x08, 0x08, 0x3E, 0x08, 0x08, 0x00, 0x00}, // +
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x08}, // ,
+    {0x00, 0x00, 0x00, 0x3E, 0x00, 0x00, 0x00, 0x00}, // -
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00}, // .
+    {0x00, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x00}, // /
+    {0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00}, // 0
+    {0x18, 0x28, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00}, // 1
+    {0x3C, 0x42, 0x02, 0x3C, 0x40, 0x40, 0x7E, 0x00}, // 2
+    {0x3C, 0x42, 0x0C, 0x02, 0x02, 0x42, 0x3C, 0x00}, // 3
+    {0x08, 0x18, 0x28, 0x48, 0x7E, 0x08, 0x08, 0x00}, // 4
+    {0x7E, 0x40, 0x7C, 0x02, 0x02, 0x42, 0x3C, 0x00}, // 5
+    {0x3C, 0x40, 0x7C, 0x42, 0x42, 0x42, 0x3C, 0x00}, // 6
+    {0x7E, 0x02, 0x04, 0x08, 0x10, 0x10, 0x10, 0x00}, // 7
+    {0x3C, 0x42, 0x42, 0x3C, 0x42, 0x42, 0x3C, 0x00}, // 8
+    {0x3C, 0x42, 0x42, 0x3E, 0x02, 0x02, 0x3C, 0x00}, // 9
+    {0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00}, // :
+    {0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x08, 0x00}, // ;
+    {0x04, 0x08, 0x10, 0x20, 0x10, 0x08, 0x04, 0x00}, // <
+    {0x00, 0x00, 0x3E, 0x00, 0x3E, 0x00, 0x00, 0x00}, // =
+    {0x20, 0x10, 0x08, 0x04, 0x08, 0x10, 0x20, 0x00}, // >
+    {0x3C, 0x42, 0x02, 0x0C, 0x10, 0x00, 0x10, 0x00}, // ?
+    {0x3C, 0x42, 0x5A, 0x52, 0x5A, 0x40, 0x3C, 0x00}, // @
+    {0x18, 0x24, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x00}, // A
+    {0x7C, 0x42, 0x42, 0x7C, 0x42, 0x42, 0x7C, 0x00}, // B
+    {0x3C, 0x42, 0x40, 0x40, 0x40, 0x42, 0x3C, 0x00}, // C
+    {0x78, 0x44, 0x42, 0x42, 0x42, 0x44, 0x78, 0x00}, // D
+    {0x7E, 0x40, 0x40, 0x78, 0x40, 0x40, 0x7E, 0x00}, // E
+    {0x7E, 0x40, 0x40, 0x78, 0x40, 0x40, 0x40, 0x00}, // F
+    {0x3C, 0x42, 0x40, 0x4E, 0x42, 0x42, 0x3C, 0x00}, // G
+    {0x42, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x42, 0x00}, // H
+    {0x3E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00}, // I
+    {0x02, 0x02, 0x02, 0x02, 0x02, 0x42, 0x3C, 0x00}, // J
+    {0x42, 0x44, 0x48, 0x70, 0x48, 0x44, 0x42, 0x00}, // K
+    {0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7E, 0x00}, // L
+    {0x42, 0x66, 0x5A, 0x42, 0x42, 0x42, 0x42, 0x00}, // M
+    {0x42, 0x62, 0x52, 0x4A, 0x46, 0x42, 0x42, 0x00}, // N
+    {0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00}, // O
+    {0x7C, 0x42, 0x42, 0x7C, 0x40, 0x40, 0x40, 0x00}, // P
+    {0x3C, 0x42, 0x42, 0x42, 0x4A, 0x44, 0x3A, 0x00}, // Q
+    {0x7C, 0x42, 0x42, 0x7C, 0x48, 0x44, 0x42, 0x00}, // R
+    {0x3C, 0x42, 0x40, 0x3C, 0x02, 0x42, 0x3C, 0x00}, // S
+    {0x7E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00}, // T
+    {0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00}, // U
+    {0x42, 0x42, 0x42, 0x42, 0x24, 0x24, 0x18, 0x00}, // V
+    {0x42, 0x42, 0x42, 0x5A, 0x5A, 0x66, 0x42, 0x00}, // W
+    {0x42, 0x24, 0x18, 0x18, 0x24, 0x24, 0x42, 0x00}, // X
+    {0x42, 0x42, 0x24, 0x18, 0x08, 0x08, 0x08, 0x00}, // Y
+    {0x7E, 0x02, 0x04, 0x08, 0x10, 0x20, 0x7E, 0x00}, // Z
+    {0x3C, 0x20, 0x20, 0x20, 0x20, 0x20, 0x3C, 0x00}, // [
+    {0x00, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x00}, // Backslash
+    {0x3C, 0x02, 0x02, 0x02, 0x02, 0x02, 0x3C, 0x00}, // ]
+    {0x08, 0x14, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00}, // ^
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00}, // _
+    {0x08, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}, // `
+    {0x00, 0x00, 0x3C, 0x02, 0x3E, 0x42, 0x3E, 0x00}, // a
+    {0x40, 0x40, 0x7C, 0x42, 0x42, 0x42, 0x7C, 0x00}, // b
+    {0x00, 0x00, 0x3C, 0x40, 0x40, 0x42, 0x3C, 0x00}, // c
+    {0x02, 0x02, 0x3E, 0x42, 0x42, 0x42, 0x3E, 0x00}, // d
+    {0x00, 0x00, 0x3C, 0x42, 0x7E, 0x40, 0x3C, 0x00}, // e
+    {0x1C, 0x22, 0x20, 0x78, 0x20, 0x20, 0x20, 0x00}, // f
+    {0x00, 0x00, 0x3A, 0x46, 0x46, 0x3E, 0x02, 0x3C}, // g
+    {0x40, 0x40, 0x7C, 0x42, 0x42, 0x42, 0x42, 0x00}, // h
+    {0x08, 0x00, 0x18, 0x08, 0x08, 0x08, 0x1C, 0x00}, // i
+    {0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x44, 0x38}, // j
+    {0x40, 0x40, 0x44, 0x48, 0x70, 0x48, 0x44, 0x00}, // k
+    {0x18, 0x08, 0x08, 0x08, 0x08, 0x08, 0x1C, 0x00}, // l
+    {0x00, 0x00, 0x66, 0x5A, 0x42, 0x42, 0x42, 0x00}, // m
+    {0x00, 0x00, 0x7C, 0x42, 0x42, 0x42, 0x42, 0x00}, // n
+    {0x00, 0x00, 0x3C, 0x42, 0x42, 0x42, 0x3C, 0x00}, // o
+    {0x00, 0x00, 0x7C, 0x42, 0x42, 0x7C, 0x40, 0x40}, // p
+    {0x00, 0x00, 0x3E, 0x42, 0x42, 0x3E, 0x02, 0x02}, // q
+    {0x00, 0x00, 0x5C, 0x62, 0x40, 0x40, 0x40, 0x00}, // r
+    {0x00, 0x00, 0x3E, 0x40, 0x3C, 0x02, 0x3C, 0x00}, // s
+    {0x20, 0x20, 0x78, 0x20, 0x20, 0x20, 0x18, 0x00}, // t
+    {0x00, 0x00, 0x42, 0x42, 0x42, 0x42, 0x3E, 0x00}, // u
+    {0x00, 0x00, 0x42, 0x42, 0x24, 0x24, 0x18, 0x00}, // v
+    {0x00, 0x00, 0x42, 0x42, 0x5A, 0x5A, 0x24, 0x00}, // w
+    {0x00, 0x00, 0x42, 0x24, 0x18, 0x24, 0x42, 0x00}, // x
+    {0x00, 0x00, 0x42, 0x42, 0x3E, 0x02, 0x3C, 0x40}, // y
+    {0x00, 0x00, 0x7E, 0x04, 0x08, 0x10, 0x7E, 0x00}, // z
+    {0x0C, 0x10, 0x10, 0x20, 0x10, 0x10, 0x0C, 0x00}, // {
+    {0x08, 0x08, 0x08, 0x00, 0x08, 0x08, 0x08, 0x00}, // |
+    {0x30, 0x08, 0x08, 0x04, 0x08, 0x08, 0x30, 0x00}, // }
+    {0x00, 0x00, 0x00, 0x24, 0x58, 0x00, 0x00, 0x00}  // ~
+};
+
+static void drawChar(SDL_Renderer* r, char c, int x, int y, int scale, SDL_Color color) {
+    if (c < 32 || c > 127) c = '?';
+    const uint8_t* glyph = font8x8[c - 32];
+    SDL_SetRenderDrawColor(r, color.r, color.g, color.b, color.a);
+    for (int row = 0; row < 8; ++row) {
+        for (int col = 0; col < 8; ++col) {
+            if (glyph[row] & (1 << (7 - col))) {
+                SDL_Rect rect = { x + col * scale, y + row * scale, scale, scale };
+                SDL_RenderFillRect(r, &rect);
+            }
+        }
+    }
+}
+
+static void drawText(SDL_Renderer* r, const std::string& text, int x, int y, int scale, SDL_Color color) {
+    int curX = x;
+    for (char c : text) {
+        if (c == '\n') {
+            y += 8 * scale + 4;
+            curX = x;
+        } else {
+            drawChar(r, c, curX, y, scale, color);
+            curX += 8 * scale;
+        }
+    }
+}
+
+struct MenuItem {
+    std::string label;
+    int type; // 0: saved, 1: discovered, 2: manual, 3: exit
+    int index; // index in discovered list
+};
+
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     std::cout << "[main] Initializing DeskStream Switch Homebrew client." << std::endl;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK) < 0) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
         return -1;
+    }
+
+    // Open all available controllers
+    int numJoysticks = SDL_NumJoysticks();
+    std::vector<SDL_Joystick*> openJoysticks;
+    for (int i = 0; i < numJoysticks; ++i) {
+        SDL_Joystick* j = SDL_JoystickOpen(i);
+        if (j) openJoysticks.push_back(j);
     }
 
     SDL_Window* window = SDL_CreateWindow("DeskStream", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, 0);
@@ -454,6 +593,7 @@ int main(int argc, char* argv[]) {
 
     if (!window || !renderer) {
         std::cerr << "Failed to create SDL window/renderer." << std::endl;
+        for (auto* j : openJoysticks) SDL_JoystickClose(j);
         SDL_Quit();
         return -1;
     }
@@ -461,72 +601,201 @@ int main(int argc, char* argv[]) {
     SavedConfig cfg = loadConfig();
     std::string ip = cfg.serverIp;
 
+    DiscoveryClient discovery;
+    discovery.start();
+
+    std::vector<DiscoveredServer> list;
+    uint32_t lastProbeTicks = 0;
+    int selectIdx = 0;
+
     bool quit = false;
     while (!quit) {
+        // 1. Poll LAN Discovery automatically (every 1.5 seconds)
+        uint32_t now = SDL_GetTicks();
+        if (now - lastProbeTicks >= 1500) {
+            auto freshList = discovery.probe();
+            if (!freshList.empty() || list.empty()) {
+                list = freshList;
+            }
+            lastProbeTicks = now;
+        }
+
+        // 2. Build Menu Items dynamically
+        std::vector<MenuItem> menuItems;
+        if (!cfg.serverIp.empty()) {
+            menuItems.push_back({"Connect to Saved Server (" + cfg.serverIp + ")", 0, 0});
+        }
+        for (size_t i = 0; i < list.size(); ++i) {
+            menuItems.push_back({"Discovered: " + list[i].hostname + " (" + list[i].ip + ")", 1, (int)i});
+        }
+        menuItems.push_back({"Connect to Manual IP Address", 2, 0});
+        menuItems.push_back({"Exit", 3, 0});
+
+        if (selectIdx >= (int)menuItems.size()) {
+            selectIdx = (int)menuItems.size() - 1;
+        }
+        if (selectIdx < 0) {
+            selectIdx = 0;
+        }
+
+        // 3. Process Input events
+        bool activateItem = false;
+        bool triggerManual = false;
+        bool triggerRefresh = false;
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 quit = true;
+            } else if (event.type == SDL_KEYDOWN) {
+                switch (event.key.keysym.sym) {
+                    case SDLK_UP:
+                    case SDLK_w:
+                        selectIdx = (selectIdx - 1 + menuItems.size()) % menuItems.size();
+                        break;
+                    case SDLK_DOWN:
+                    case SDLK_s:
+                        selectIdx = (selectIdx + 1) % menuItems.size();
+                        break;
+                    case SDLK_RETURN:
+                    case SDLK_SPACE:
+                        activateItem = true;
+                        break;
+                    case SDLK_ESCAPE:
+                        quit = true;
+                        break;
+                    case SDLK_y:
+                    case SDLK_x:
+                        triggerManual = true;
+                        break;
+                    case SDLK_r:
+                        triggerRefresh = true;
+                        break;
+                }
+            } else if (event.type == SDL_JOYBUTTONDOWN) {
+                int button = event.jbutton.button;
+                // standard Joy-Con mapping:
+                // 0: A, 1: B, 2: X, 3: Y, 10: Plus, 11: Minus, 13: D-pad Up, 15: D-pad Down
+                if (button == 13) {
+                    selectIdx = (selectIdx - 1 + menuItems.size()) % menuItems.size();
+                } else if (button == 15) {
+                    selectIdx = (selectIdx + 1) % menuItems.size();
+                } else if (button == 0) { // A
+                    activateItem = true;
+                } else if (button == 2 || button == 3) { // X / Y -> Manual IP
+                    triggerManual = true;
+                } else if (button == 10) { // Plus -> Refresh
+                    triggerRefresh = true;
+                } else if (button == 11) { // Minus -> Exit
+                    quit = true;
+                }
+            } else if (event.type == SDL_JOYHATMOTION) {
+                if (event.jhat.value & SDL_HAT_UP) {
+                    selectIdx = (selectIdx - 1 + menuItems.size()) % menuItems.size();
+                } else if (event.jhat.value & SDL_HAT_DOWN) {
+                    selectIdx = (selectIdx + 1) % menuItems.size();
+                }
             }
         }
 
-        // Simple text-based display interface for the Main Menu using standard console 
-        // or SDL rendering of choices. We will prompt the user to input server IP.
-        std::cout << "\n=== DeskStream Client Menu ===" << std::endl;
-        std::cout << "1. Connect to Saved Server (" << (ip.empty() ? "None" : ip) << ")" << std::endl;
-        std::cout << "2. Discover Servers on LAN" << std::endl;
-        std::cout << "3. Connect to Manual IP" << std::endl;
-        std::cout << "4. Exit" << std::endl;
+        // 4. Handle Actions
+        if (triggerRefresh) {
+            list.clear();
+            lastProbeTicks = 0;
+        }
 
-        std::string choice = showKeyboard("Select choice (1-4)", "1");
-        if (choice == "1") {
-            if (ip.empty()) {
-                std::cout << "No saved server IP. Enter one first." << std::endl;
-                continue;
-            }
-            runStream(renderer, ip, 47801, cfg.token);
-        } else if (choice == "2") {
-            DiscoveryClient discovery;
-            if (discovery.start()) {
-                std::cout << "Scanning LAN for DeskStream servers..." << std::endl;
-                auto list = discovery.probe();
-                if (list.empty()) {
-                    std::cout << "No servers found." << std::endl;
-                } else {
-                    std::cout << "Discovered servers:" << std::endl;
-                    for (size_t i = 0; i < list.size(); ++i) {
-                        std::cout << i + 1 << ". " << list[i].hostname << " (" << list[i].ip << ")" << std::endl;
-                    }
-                    std::string select = showKeyboard("Select server index (1-" + std::to_string(list.size()) + ")", "1");
-                    int idx = atoi(select.c_str()) - 1;
-                    if (idx >= 0 && idx < (int)list.size()) {
-                        ip = list[idx].ip;
-                        cfg.token = ""; // reset token for new server
-                        runStream(renderer, ip, list[idx].controlPort, "");
-                    }
-                }
-            }
-        } else if (choice == "3") {
+        if (triggerManual) {
             std::string manualIp = showKeyboard("Enter Windows PC IP Address", ip);
             if (!manualIp.empty()) {
                 ip = manualIp;
                 cfg.token = ""; // reset token
                 runStream(renderer, ip, 47801, "");
+                cfg = loadConfig();
+                ip = cfg.serverIp;
             }
-        } else if (choice == "4" || choice.empty()) {
-            quit = true;
         }
 
-        SDL_RenderClear(renderer);
-        // Display a nice dark background with text instruction on Switch screen
+        if (activateItem && selectIdx < (int)menuItems.size()) {
+            MenuItem item = menuItems[selectIdx];
+            if (item.type == 0) {
+                runStream(renderer, cfg.serverIp, 47801, cfg.token);
+                cfg = loadConfig();
+                ip = cfg.serverIp;
+            } else if (item.type == 1) {
+                ip = list[item.index].ip;
+                cfg.token = ""; // reset token for new server
+                runStream(renderer, ip, list[item.index].controlPort, "");
+                cfg = loadConfig();
+                ip = cfg.serverIp;
+            } else if (item.type == 2) {
+                std::string manualIp = showKeyboard("Enter Windows PC IP Address", ip);
+                if (!manualIp.empty()) {
+                    ip = manualIp;
+                    cfg.token = ""; // reset token
+                    runStream(renderer, ip, 47801, "");
+                    cfg = loadConfig();
+                    ip = cfg.serverIp;
+                }
+            } else if (item.type == 3) {
+                quit = true;
+            }
+        }
+
+        // 5. Render graphical menu
         SDL_SetRenderDrawColor(renderer, 23, 27, 33, 255);
         SDL_RenderClear(renderer);
+
+        // Header
+        drawText(renderer, "DeskStream", 60, 50, 4, {255, 255, 255, 255});
+        drawText(renderer, "Low-Latency Windows Stream Client", 60, 90, 2, {140, 150, 165, 255});
+
+        // Horizontal separator line
+        SDL_Rect separator = { 60, 120, 1160, 2 };
+        SDL_SetRenderDrawColor(renderer, 50, 55, 65, 255);
+        SDL_RenderFillRect(renderer, &separator);
+
+        // Server List / Options
+        int startY = 160;
+        for (size_t i = 0; i < menuItems.size(); ++i) {
+            bool selected = ((int)i == selectIdx);
+            SDL_Rect card = { 60, startY + (int)i * 65, 1160, 50 };
+            if (selected) {
+                SDL_SetRenderDrawColor(renderer, 59, 130, 246, 255); // Blue highlight
+            } else {
+                SDL_SetRenderDrawColor(renderer, 35, 41, 50, 255); // Dark card
+            }
+            SDL_RenderFillRect(renderer, &card);
+
+            SDL_Color textColor = selected ? SDL_Color{255, 255, 255, 255} : SDL_Color{210, 220, 235, 255};
+            drawText(renderer, menuItems[i].label, 80, startY + (int)i * 65 + 17, 2, textColor);
+        }
+
+        // Status message
+        if (list.empty()) {
+            drawText(renderer, "Scanning LAN for DeskStream servers...", 60, startY + (int)menuItems.size() * 65 + 20, 2, {154, 164, 176, 255});
+        } else {
+            drawText(renderer, "Scan active. Discovered " + std::to_string(list.size()) + " server(s).", 60, startY + (int)menuItems.size() * 65 + 20, 2, {34, 197, 94, 255});
+        }
+
+        // Footer Instructions
+        SDL_Rect footerLine = { 60, 640, 1160, 1 };
+        SDL_SetRenderDrawColor(renderer, 50, 55, 65, 255);
+        SDL_RenderFillRect(renderer, &footerLine);
+
+        drawText(renderer, "Nav: D-pad / L-Stick | Select: A / Enter | Manual IP: X / Y | Refresh: Plus / R | Exit: Minus / ESC", 60, 660, 2, {140, 150, 165, 255});
+
         SDL_RenderPresent(renderer);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps UI loop
     }
 
+    // Teardown
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    for (auto* j : openJoysticks) {
+        if (SDL_JoystickGetAttached(j)) {
+            SDL_JoystickClose(j);
+        }
+    }
     SDL_Quit();
     return 0;
 }
