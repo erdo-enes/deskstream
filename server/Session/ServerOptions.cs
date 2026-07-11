@@ -7,7 +7,7 @@ namespace DeskStreamer.Server.Session;
 /// </summary>
 public sealed class ServerOptions
 {
-    public const int MinimumBitrateKbps = 2000;
+    public const int MinimumBitrateKbps = 3000;
     public const int DefaultMaxBitrateKbps = 20000;
 
     // Codec APIs express bits/second as uint. Keeping the configured kbps below this boundary

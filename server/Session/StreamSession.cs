@@ -929,14 +929,15 @@ public sealed class StreamSession : IDisposable
             _lastIdrGenMs = now;
         }
 
-        // "Down" trigger: >= 2 REQUEST_IDR within 1 s.
+        // "Down" trigger: >= 3 REQUEST_IDR within 2 s indicates sustained packet loss,
+        // not just a single transient re-request from a WiFi hiccup.
         _idrTimes.Enqueue(now);
-        while (_idrTimes.Count > 0 && now - _idrTimes.Peek() > 1000)
+        while (_idrTimes.Count > 0 && now - _idrTimes.Peek() > 2000)
             _idrTimes.Dequeue();
 
-        if (_idrTimes.Count >= 2)
+        if (_idrTimes.Count >= 3)
         {
-            AdaptDown($"IDR burst {_idrTimes.Count}/1s");
+            AdaptDown($"IDR burst {_idrTimes.Count}/2s");
             _idrTimes.Clear(); // avoid re-triggering off the same burst
         }
     }
@@ -961,20 +962,23 @@ public sealed class StreamSession : IDisposable
         if (s.DecodeToSurfaceP95Ms >= 0)
             _bestDecodeToSurfaceMs = Math.Min(_bestDecodeToSurfaceMs, s.DecodeToSurfaceP95Ms);
 
+        // Widen latency margins substantially: WiFi p95 jitter of 20-40ms is normal and should
+        // not trigger cuts. Only react if capture-to-receive grows by >40ms or decode-to-surface
+        // by >25ms above the learned floor.
         bool latencyGrowingNow =
             (_bestCaptureToReceiveMs != int.MaxValue &&
-             s.CaptureToReceiveP95Ms > _bestCaptureToReceiveMs + 15) ||
+             s.CaptureToReceiveP95Ms > _bestCaptureToReceiveMs + 40) ||
             (_bestDecodeToSurfaceMs != int.MaxValue &&
-             s.DecodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 12);
+             s.DecodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 25);
 
-        // Require the rise to persist across >=2 consecutive intervals before reacting. A single
-        // p95 spike (game-launch transient, or a startup-IDR-contaminated window) must not cut.
+        // Require the rise to persist across >=3 consecutive intervals before reacting.
+        // WiFi produces frequent 1-2 interval spikes that are not real congestion.
         _latencyGrowingStreak = latencyGrowingNow ? _latencyGrowingStreak + 1 : 0;
-        bool latencySustained = _latencyGrowingStreak >= 2;
+        bool latencySustained = _latencyGrowingStreak >= 3;
 
-        // A single dropped frame at 60 fps is already 1.67%, which tripped the old >1% trigger on
-        // ordinary jitter. Require either a small absolute burst or a 2% loss rate.
-        bool dropCongestion = s.FramesDropped > 2 || dropRate > 0.02;
+        // Require a meaningful loss: >5 frames dropped or >5% loss rate. At 60fps, dropping
+        // 3-4 frames per second is typical WiFi behavior, not network congestion.
+        bool dropCongestion = s.FramesDropped > 5 || dropRate > 0.05;
         bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 && !latencyGrowingNow;
 
         if (dropCongestion || latencySustained)
@@ -990,12 +994,15 @@ public sealed class StreamSession : IDisposable
             // Ceiling recovery, independent of the (stricter) clean streak: on any quiet interval
             // nudge the remembered breaking point back toward the hard max so a stale or transient
             // episode cannot cap quality for minutes. Accelerate once a real cut is well past.
+            // Ceiling recovery: on any clean interval, aggressively raise the remembered
+            // breaking point back toward the hard max. The old 10s/5% cadence was far too slow
+            // and left the stream capped at low quality for minutes after a single blip.
             if (s.FramesDropped == 0 && !latencyGrowingNow && _bitrateCeilingKbps < _maxBitrateKbps)
             {
                 long now = NowMs();
-                if (now - _lastCeilingRaiseMs >= 10_000)
+                if (now - _lastCeilingRaiseMs >= 5_000)
                 {
-                    double factor = now - _lastCeilingCutMs >= 30_000 ? 1.25 : 1.05;
+                    double factor = now - _lastCeilingCutMs >= 15_000 ? 1.40 : 1.15;
                     _bitrateCeilingKbps = Math.Min(_maxBitrateKbps, (int)(_bitrateCeilingKbps * factor));
                     _lastCeilingRaiseMs = now;
                 }
@@ -1004,7 +1011,10 @@ public sealed class StreamSession : IDisposable
             if (clean)
             {
                 _cleanStreak++;
-                if (_cleanStreak >= 5)
+                // Require only 2 clean intervals before trying to climb back up.
+                // The old value of 5 meant 5+ seconds of perfect delivery before any
+                // recovery, which was far too conservative for WiFi environments.
+                if (_cleanStreak >= 2)
                 {
                     AdaptUp();
                     _cleanStreak = 0;
@@ -1037,18 +1047,17 @@ public sealed class StreamSession : IDisposable
     {
         long now = NowMs();
         // Debounce: one loss episode routinely produces both an OnRequestIdr burst and an OnStats
-        // drop report. Collapsing them into a single reaction kills the "double 30% slash" sawtooth.
-        if (now - _lastAdaptDownMs < 1500)
+        // drop report. Collapsing them into a single reaction kills the double-slash sawtooth.
+        // Widen to 3s to prevent rapid successive cuts on WiFi.
+        if (now - _lastAdaptDownMs < 3000)
             return;
 
-        int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.7));
+        // Gentler cut: only 20% reduction instead of 30%. This prevents the catastrophic
+        // compound crash (0.7^4 = 0.24x in 6 seconds) that the old algorithm suffered.
+        int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.80));
 
-        // Floor no-op: the ×0.7 cut cannot lower an already-floored bitrate. This must NOT count as
-        // a real adaptation event — otherwise it slams the ceiling down to the floor and, because
-        // ApplyBitrate short-circuits on an unchanged bitrate, never resets the latency baseline,
-        // leaving latencyGrowing chronically true and pinning the stream at the floor (the field
-        // regression). Re-baseline, hold the debounce so we stop re-evaluating every stats tick,
-        // and log at DEBUG instead of spamming INFO.
+        // Floor no-op: the cut cannot lower an already-floored bitrate. Re-baseline so
+        // latency signals don't keep firing, hold the debounce, and log at DEBUG.
         if (next >= _currentBitrateKbps)
         {
             ResetLatencyBaseline();
@@ -1059,8 +1068,9 @@ public sealed class StreamSession : IDisposable
 
         _lastAdaptDownMs = now;
         _lastCeilingCutMs = now;
-        // Remember the breaking point just below where the loss appeared, then take the cut.
-        _bitrateCeilingKbps = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.85));
+        // Set ceiling at 95% of the pre-cut level (not 85%) so recovery has room to climb
+        // back close to where it was, rather than being trapped far below.
+        _bitrateCeilingKbps = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.95));
         AsyncLogger.Info($"[adaptation] DOWN {_currentBitrateKbps} -> {next} kbps ({reason}; ceiling {_bitrateCeilingKbps})");
         ApplyBitrate(next);
         _cleanStreak = 0;
@@ -1069,15 +1079,15 @@ public sealed class StreamSession : IDisposable
     private void AdaptUp()
     {
         int ceiling = Math.Min(_maxBitrateKbps, _bitrateCeilingKbps);
-        // Near the remembered breaking point, converge additively (+500 kbps) instead of the ×1.1
-        // multiplicative step so we settle just under it rather than overshooting and re-triggering.
-        bool additive = _currentBitrateKbps >= (int)(0.85 * ceiling);
+        // Use 15% multiplicative increase for faster recovery. Near the ceiling (within 10%),
+        // switch to additive +1000 kbps so we probe gently rather than overshooting.
+        bool additive = _currentBitrateKbps >= (int)(0.90 * ceiling);
         int next = additive
-            ? Math.Min(ceiling, _currentBitrateKbps + 500)
-            : Math.Min(ceiling, (int)(_currentBitrateKbps * 1.1));
+            ? Math.Min(ceiling, _currentBitrateKbps + 1000)
+            : Math.Min(ceiling, (int)(_currentBitrateKbps * 1.15));
         if (next == _currentBitrateKbps)
             return; // already at the ceiling; nothing to raise
-        AsyncLogger.Info($"[adaptation] UP {_currentBitrateKbps} -> {next} kbps ({(additive ? "additive" : "x1.1")}; ceiling {ceiling})");
+        AsyncLogger.Info($"[adaptation] UP {_currentBitrateKbps} -> {next} kbps ({(additive ? "additive" : "x1.15")}; ceiling {ceiling})");
         ApplyBitrate(next);
     }
 
