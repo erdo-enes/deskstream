@@ -90,6 +90,13 @@ public sealed class StreamSession : IDisposable
     private int _bestCaptureToReceiveMs = int.MaxValue;
     private int _bestDecodeToSurfaceMs = int.MaxValue;
 
+    // AIMD-with-memory: remember the level a loss episode was found at (the "breaking point")
+    // and converge additively under it instead of sawtoothing through it. The ceiling slowly
+    // recovers on clean intervals so a transient blip does not cap quality forever.
+    private int _bitrateCeilingKbps = ServerOptions.DefaultMaxBitrateKbps;
+    private long _lastAdaptDownMs = long.MinValue / 4;  // "far past" so the first cut is never debounced
+    private long _lastCeilingRaiseMs;
+
     // Stats surfaced to the console (Program reads these)
     private long _encodedFrames;
     private int _capturedSinceEncode;
@@ -120,6 +127,12 @@ public sealed class StreamSession : IDisposable
     public bool MediaEndpointReady => _sender?.HasClient == true;
     public long MediaFramesSent => _sender?.FramesSent ?? 0;
     public long MediaBytesSent => _sender?.BytesSent ?? 0;
+
+    // Capture-pipeline diagnostics (Program composes the 1 Hz stats line from per-second deltas).
+    public long CaptureRealFrames => _duplicator?.RealFrames ?? 0;
+    public long CapturePointerOnly => _duplicator?.PointerOnlyFrames ?? 0;
+    public long CaptureTimeouts => _duplicator?.Timeouts ?? 0;
+    public long CaptureAccumulatedFrames => _duplicator?.AccumulatedFrames ?? 0;
 
     public StreamSession(
         Action<object> send,
@@ -606,6 +619,9 @@ public sealed class StreamSession : IDisposable
             _currentBitrateKbps);
         _encoder.OnEncodedFrame = OnEncoded;
 
+        // Shape only oversized IDR bursts (token-bucket); normal frames pass untouched.
+        _sender!.SetPacingRate(_currentBitrateKbps, Fps);
+
         _frameId = 0;
         Interlocked.Exchange(ref _pipelineFaultHandling, 0);
         Interlocked.Exchange(ref _endpointIdrPending, 1);
@@ -613,6 +629,9 @@ public sealed class StreamSession : IDisposable
         _capturedSinceEncode = 0;
         _cleanStreak = 0;
         _idrSinceLastStats = 0;
+        _bitrateCeilingKbps = _maxBitrateKbps;
+        _lastAdaptDownMs = long.MinValue / 4;
+        _lastCeilingRaiseMs = NowMs();
         _idrTimes.Clear();
         _bestCaptureToReceiveMs = int.MaxValue;
         _bestDecodeToSurfaceMs = int.MaxValue;
@@ -632,6 +651,9 @@ public sealed class StreamSession : IDisposable
 
     private void CaptureLoop(CancellationToken ct)
     {
+        // Register with the MMCSS "Games" scheduling class so the capture thread keeps getting CPU
+        // under a fullscreen game's 100% load. Guarded + reverted on exit; failure is tolerated.
+        IntPtr mmcss = NativeMethods.JoinGamesMmcss();
         try
         {
             long frameIntervalTicks = Math.Max(1, Stopwatch.Frequency / Math.Max(1, Fps));
@@ -707,6 +729,10 @@ public sealed class StreamSession : IDisposable
                 // tears down the encoder. Move it off-thread, but keep the TCP session alive.
                 _ = Task.Run(() => StopFaultedPipeline(ex));
             }
+        }
+        finally
+        {
+            NativeMethods.RevertGamesMmcss(mmcss);
         }
     }
 
@@ -931,12 +957,23 @@ public sealed class StreamSession : IDisposable
              s.DecodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 12);
         bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 && !latencyGrowing;
 
-        if (dropRate > 0.01 || latencyGrowing)
+        // A single dropped frame at 60 fps is already 1.67%, which tripped the old >1% trigger on
+        // ordinary jitter. Require either a small absolute burst or a 2% loss rate.
+        if (s.FramesDropped > 2 || dropRate > 0.02 || latencyGrowing)
         {
             AdaptDown();
         }
         else if (clean)
         {
+            // Ceiling recovery: nudge the remembered breaking point up on clean intervals, at most
+            // once per 10 s, so a transient blip does not cap quality for the rest of the session.
+            long now = NowMs();
+            if (now - _lastCeilingRaiseMs >= 10_000)
+            {
+                _bitrateCeilingKbps = Math.Min(_maxBitrateKbps, (int)(_bitrateCeilingKbps * 1.05));
+                _lastCeilingRaiseMs = now;
+            }
+
             _cleanStreak++;
             if (_cleanStreak >= 5)
             {
@@ -954,16 +991,30 @@ public sealed class StreamSession : IDisposable
 
     private void AdaptDown()
     {
+        long now = NowMs();
+        // Debounce: one loss episode routinely produces both an OnRequestIdr burst and an OnStats
+        // drop report. Collapsing them into a single cut kills the "double 30% slash" sawtooth.
+        if (now - _lastAdaptDownMs < 1500)
+            return;
+        _lastAdaptDownMs = now;
+
+        // Remember the breaking point just below where the loss appeared, then take the existing cut.
+        _bitrateCeilingKbps = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.85));
         int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.7));
-        AsyncLogger.Info($"[adaptation] Adapting bitrate DOWN: {_currentBitrateKbps} -> {next} kbps (due to frame drops / latency growth)");
+        AsyncLogger.Info($"[adaptation] Adapting bitrate DOWN: {_currentBitrateKbps} -> {next} kbps (ceiling now {_bitrateCeilingKbps}; due to frame drops / latency growth)");
         ApplyBitrate(next);
         _cleanStreak = 0;
     }
 
     private void AdaptUp()
     {
-        int next = Math.Min(_maxBitrateKbps, (int)(_currentBitrateKbps * 1.1));
-        AsyncLogger.Info($"[adaptation] Adapting bitrate UP: {_currentBitrateKbps} -> {next} kbps");
+        int ceiling = Math.Min(_maxBitrateKbps, _bitrateCeilingKbps);
+        // Near the remembered breaking point, converge additively (+500 kbps) instead of the ×1.1
+        // multiplicative step so we settle just under it rather than overshooting and re-triggering.
+        int next = _currentBitrateKbps >= (int)(0.85 * ceiling)
+            ? Math.Min(ceiling, _currentBitrateKbps + 500)
+            : Math.Min(ceiling, (int)(_currentBitrateKbps * 1.1));
+        AsyncLogger.Info($"[adaptation] Adapting bitrate UP: {_currentBitrateKbps} -> {next} kbps (ceiling {ceiling})");
         ApplyBitrate(next);
     }
 
@@ -981,6 +1032,7 @@ public sealed class StreamSession : IDisposable
                 return;
             }
             _currentBitrateKbps = kbps;
+            _sender?.SetPacingRate(_currentBitrateKbps, Fps);
             _send(OutgoingMessages.Bitrate(kbps));
             AsyncLogger.Info($"[encoder] Bitrate reconfigured successfully to {kbps} kbps");
 

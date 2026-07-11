@@ -49,6 +49,18 @@ internal sealed class CodecApi : IDisposable
         }
     }
 
+    /// <summary>
+    /// True when the encoder reports the given CODECAPI parameter is supported (IsSupported == S_OK).
+    /// Used to avoid noisy SetValue failures on parameters the MFT does not expose.
+    /// </summary>
+    public bool IsSupported(Guid key)
+    {
+        if (_api == null)
+            return false;
+        try { return _api.IsSupported(ref key) == 0; }
+        catch { return false; }
+    }
+
     /// <summary>Sets a VT_UI4 property. Returns the raw HRESULT (0 on success).</summary>
     public int SetUInt32(Guid key, uint value)
     {

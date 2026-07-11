@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -31,6 +32,77 @@ public sealed class MediaSender : IDisposable
     private long _framesSent;
     private long _packetsSent;
     private long _bytesSent;
+
+    // Token-bucket micro-pacing (PROTOCOL.md §3.3). Only oversized IDR bursts get shaped: the
+    // bucket comfortably covers a normal P-frame, so those pass untouched. Shaping a ~150-300 KB
+    // IDR at the 96 Mbps ceiling adds a one-frame ~12-25 ms spike instead of a 2x/s burst that
+    // makes a Wi-Fi client drop 3-8 packets and slash bitrate. _pacingBytesPerSec and
+    // _bucketCapacity are set from the control thread (SetPacingRate) and read on the encoder
+    // send thread; the token count + refill timestamp are touched on the send thread only.
+    // (C# forbids `volatile long`, so cross-thread access uses Volatile.Read/Write.)
+    private long _pacingBytesPerSec;   // 0 = pacing disabled
+    private long _bucketCapacity;
+    private double _tokens;
+    private long _lastRefillTs;
+
+    /// <summary>
+    /// Configures the pacing rate from the live encoder target. avg = the CBR byte rate; the pacing
+    /// rate is 8x that, clamped to [32 Mbps, 96 Mbps] (floor keeps P-frames instant; ceiling stays
+    /// under a single 5 GHz client's drain rate). Bucket capacity is two frames' worth of average
+    /// bytes (min 64 KiB) so a normal frame never trips the bucket. Call at pipeline start and on
+    /// every bitrate change; 0 fps or kbps disables pacing.
+    /// </summary>
+    public void SetPacingRate(int currentBitrateKbps, int fps)
+    {
+        if (currentBitrateKbps <= 0 || fps <= 0)
+        {
+            Volatile.Write(ref _pacingBytesPerSec, 0);
+            return;
+        }
+        long avg = (long)currentBitrateKbps * 1000 / 8;          // bytes/sec at the CBR target
+        long rate = Math.Clamp(avg * 8, 4_000_000, 12_000_000);   // 32..96 Mbps in bytes/sec
+        long capacity = Math.Max(64 * 1024, avg / fps * 2);
+        Volatile.Write(ref _bucketCapacity, capacity);
+        Volatile.Write(ref _pacingBytesPerSec, rate);
+    }
+
+    /// <summary>
+    /// Token-bucket gate run on the send thread at the top of the datagram-send routine. Refills by
+    /// elapsed*rate (capped at capacity); if the datagram fits, subtract and return immediately;
+    /// otherwise coarse-sleep then spin to the exact target tick and drain the bucket to zero.
+    /// </summary>
+    private void PaceBeforeSend(int len)
+    {
+        long rate = Volatile.Read(ref _pacingBytesPerSec);
+        if (rate <= 0)
+            return; // pacing disabled: never touch the hot path
+
+        long capacity = Volatile.Read(ref _bucketCapacity);
+        if (capacity <= 0)
+            capacity = 64 * 1024;
+
+        long now = Stopwatch.GetTimestamp();
+        double elapsedSec = (now - _lastRefillTs) / (double)Stopwatch.Frequency;
+        _lastRefillTs = now;
+        _tokens = Math.Min(capacity, _tokens + elapsedSec * rate);
+
+        if (_tokens >= len)
+        {
+            _tokens -= len;
+            return;
+        }
+
+        // Not enough tokens for this datagram: wait until the bucket would cover it.
+        double waitSec = (len - _tokens) / rate;
+        long targetTs = now + (long)(waitSec * Stopwatch.Frequency);
+        long waitMs = (long)(waitSec * 1000);
+        if (waitMs > 1)
+            Thread.Sleep((int)(waitMs - 1));
+        while (Stopwatch.GetTimestamp() < targetTs)
+            Thread.SpinWait(5);
+        _tokens = 0;
+        _lastRefillTs = Stopwatch.GetTimestamp();
+    }
 
     /// <summary>Validated gamepad snapshots from the currently learned media endpoint.</summary>
     public Action<GamepadState>? OnGamepadState { get; set; }
@@ -76,6 +148,8 @@ public sealed class MediaSender : IDisposable
     /// <summary>Starts the background loop that learns the client's media address from DSMH packets.</summary>
     public void Start()
     {
+        _tokens = Volatile.Read(ref _bucketCapacity);
+        _lastRefillTs = Stopwatch.GetTimestamp();
         _cts = new CancellationTokenSource();
         _learnLoop = Task.Run(() => LearnLoopAsync(_cts.Token));
         _heartbeatLoop = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
@@ -241,6 +315,7 @@ public sealed class MediaSender : IDisposable
 
     private bool SendDatagram(EndPoint client, int totalLen)
     {
+        PaceBeforeSend(totalLen);
         try
         {
             int sent = _socket.SendTo(_sendBuffer, 0, totalLen, SocketFlags.None, client);

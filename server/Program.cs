@@ -94,6 +94,9 @@ if (headless)
 if (OperatingSystem.IsWindows())
 {
     try { NativeMethods.TimeBeginPeriod(1); } catch { }
+    // Give the whole process scheduling headroom so capture/encode threads are not starved by
+    // a foreground fullscreen game. Guarded: a failure must never prevent the server starting.
+    try { NativeMethods.SetPriorityClass(NativeMethods.GetCurrentProcess(), NativeMethods.HIGH_PRIORITY_CLASS); } catch { }
 }
 
 // Favor latency over throughput in the GC (hot path is otherwise allocation-free).
@@ -150,6 +153,10 @@ long prevIdr = 0;
 long prevAudioBytes = 0;
 long prevMediaFrames = 0;
 long prevMediaBytes = 0;
+long prevCapReal = 0;
+long prevCapPointer = 0;
+long prevCapTimeouts = 0;
+long prevCapAccum = 0;
 try
 {
     while (!shutdown.IsCancellationRequested)
@@ -171,11 +178,28 @@ try
             long mediaKbps = mediaBytes >= prevMediaBytes
                 ? (mediaBytes - prevMediaBytes) * 8 / 1000
                 : 0;
+
+            long capReal = session.CaptureRealFrames;
+            long capPointer = session.CapturePointerOnly;
+            long capTimeouts = session.CaptureTimeouts;
+            long capAccum = session.CaptureAccumulatedFrames;
+            long realDelta = Math.Max(0, capReal - prevCapReal);
+            long pointerDelta = Math.Max(0, capPointer - prevCapPointer);
+            long timeoutDelta = Math.Max(0, capTimeouts - prevCapTimeouts);
+            long accumDelta = Math.Max(0, capAccum - prevCapAccum);
+            // presents/s ~= Δaccumulated + Δreal: distinguishes "content is only N fps" from
+            // "the pipeline is dropping presents" when reading these logs later.
+            long presentsPerSec = accumDelta + realDelta;
+
             prevEncoded = enc;
             prevIdr = idr;
             prevAudioBytes = audioBytes;
             prevMediaFrames = mediaFrames;
             prevMediaBytes = mediaBytes;
+            prevCapReal = capReal;
+            prevCapPointer = capPointer;
+            prevCapTimeouts = capTimeouts;
+            prevCapAccum = capAccum;
 
             string audioStatus = session.AudioStreaming
                 ? $"audio {audioKbps,4} kbps"
@@ -190,6 +214,7 @@ try
                     $"[stats] {fps,3} fps encoded | {session.CurrentBitrateKbps,6} kbps | " +
                     $"media {(session.MediaEndpointReady ? "ready" : "WAIT"),5} {sentFps,3} fps/{mediaKbps,5} kbps | " +
                     $"client dropped {session.LastClientFramesDropped,3} | IDR req/s {idrDelta} | " +
+                    $"cap {realDelta}re/{pointerDelta}po/{timeoutDelta}to ~{presentsPerSec}pres | " +
                     $"{audioStatus} | {gamepadStatus}");
             }
         }
@@ -200,6 +225,10 @@ try
             prevAudioBytes = 0;
             prevMediaFrames = 0;
             prevMediaBytes = 0;
+            prevCapReal = 0;
+            prevCapPointer = 0;
+            prevCapTimeouts = 0;
+            prevCapAccum = 0;
         }
     }
 }
@@ -240,9 +269,54 @@ static IEnumerable<string> LocalIPv4Addresses()
 
 internal static class NativeMethods
 {
+    public const uint HIGH_PRIORITY_CLASS = 0x00000080;
+
     [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
     public static extern uint TimeBeginPeriod(uint uPeriod);
 
     [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
     public static extern uint TimeEndPeriod(uint uPeriod);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetPriorityClass(IntPtr handle, uint priorityClass);
+
+    // MMCSS: register a thread with a pro-audio/games multimedia scheduling class so the
+    // capture and encoder threads keep getting CPU under 100% GPU/CPU game load.
+    [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
+
+    [DllImport("avrt.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool AvRevertMmThreadCharacteristics(IntPtr avrtHandle);
+
+    /// <summary>
+    /// Registers the calling thread with the MMCSS "Games" task. Returns an opaque handle to pass
+    /// to <see cref="RevertGamesMmcss"/> on thread exit, or IntPtr.Zero if unavailable. Never throws.
+    /// </summary>
+    public static IntPtr JoinGamesMmcss()
+    {
+        if (!OperatingSystem.IsWindows())
+            return IntPtr.Zero;
+        try
+        {
+            uint taskIndex = 0;
+            return AvSetMmThreadCharacteristicsW("Games", ref taskIndex);
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
+    }
+
+    /// <summary>Reverts an MMCSS registration obtained from <see cref="JoinGamesMmcss"/>. Never throws.</summary>
+    public static void RevertGamesMmcss(IntPtr avrtHandle)
+    {
+        if (avrtHandle == IntPtr.Zero)
+            return;
+        try { AvRevertMmThreadCharacteristics(avrtHandle); } catch { }
+    }
 }

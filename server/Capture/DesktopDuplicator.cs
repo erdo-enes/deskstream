@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using SharpGen.Runtime;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -21,6 +22,23 @@ public sealed class DesktopDuplicator : IDisposable
 
     private IDXGIOutputDuplication? _duplication;
     private ID3D11Texture2D? _bgraCopy;
+
+    // Capture diagnostics (allocation-free Interlocked counters, monotonically increasing).
+    // realFrames    : acquisitions that carried new screen content (a CopyResource happened).
+    // pointerOnly   : acquisitions that only moved the mouse pointer (LastPresentTime == 0).
+    // timeouts      : TryAcquire calls that exhausted their timeout budget with no new content.
+    // accumulatedFrames: sum of DXGI OutduplFrameInfo.AccumulatedFrames over real acquisitions.
+    // presents/s (surfaced downstream) ~= Δaccumulated + Δreal tells "the content is only N fps"
+    // apart from "the pipeline is dropping presents".
+    private long _realFrames;
+    private long _pointerOnly;
+    private long _timeouts;
+    private long _accumulatedFrames;
+
+    public long RealFrames => Interlocked.Read(ref _realFrames);
+    public long PointerOnlyFrames => Interlocked.Read(ref _pointerOnly);
+    public long Timeouts => Interlocked.Read(ref _timeouts);
+    public long AccumulatedFrames => Interlocked.Read(ref _accumulatedFrames);
 
     public ID3D11Device Device { get; }
     public ID3D11DeviceContext Context { get; }
@@ -114,8 +132,15 @@ public sealed class DesktopDuplicator : IDisposable
 
     /// <summary>
     /// Tries to acquire the next desktop frame. Returns true and yields a stable private BGRA
-    /// texture (owned by this class, reused every call) when a NEW frame is available.
-    /// Returns false on timeout (idle desktop) or after recovering from an access-lost event.
+    /// texture (owned by this class, reused every call) when a NEW frame carrying real screen
+    /// content is available. Returns false only on genuine ~full-timeout idle or after recovering
+    /// from an access-lost event.
+    ///
+    /// Pointer-only updates (LastPresentTime == 0 — the mouse moved but no pixels changed) are
+    /// absorbed inside this call's own timeout budget rather than returned as "no frame". Returning
+    /// on every mouse move made the caller's idle heuristic (a 50 ms sleep on a quick false) fire
+    /// constantly while the mouse moved, capping capture at ~20-31 fps in games. The loop below
+    /// keeps waiting — without sleeping — until either real content arrives or the budget expires.
     /// </summary>
     public bool TryAcquire(int timeoutMs, out ID3D11Texture2D bgra)
     {
@@ -127,43 +152,69 @@ public sealed class DesktopDuplicator : IDisposable
             return false;
         }
 
-        Result r = _duplication.AcquireNextFrame(
-            (uint)timeoutMs, out OutduplFrameInfo frameInfo, out IDXGIResource? desktopResource);
+        long start = Stopwatch.GetTimestamp();
+        long deadline = start + (long)Math.Max(0, timeoutMs) * Stopwatch.Frequency / 1000;
 
-        if (r == Vortice.DXGI.ResultCode.WaitTimeout)
+        while (true)
         {
-            desktopResource?.Dispose();
-            return false; // no new frame; correct to skip re-encoding
-        }
+            long now = Stopwatch.GetTimestamp();
+            long remainingTicks = deadline - now;
+            uint remainingMs = remainingTicks <= 0
+                ? 0u
+                : (uint)(remainingTicks * 1000 / Stopwatch.Frequency);
 
-        if (r == Vortice.DXGI.ResultCode.AccessLost)
-        {
-            desktopResource?.Dispose();
-            RecreateAfterAccessLost();
-            return false;
-        }
+            Result r = _duplication.AcquireNextFrame(
+                remainingMs, out OutduplFrameInfo frameInfo, out IDXGIResource? desktopResource);
 
-        if (r.Failure || desktopResource == null)
-        {
-            desktopResource?.Dispose();
-            return false;
-        }
+            if (r == Vortice.DXGI.ResultCode.WaitTimeout)
+            {
+                desktopResource?.Dispose();
+                Interlocked.Increment(ref _timeouts);
+                return false; // genuinely idle for the whole budget; correct to skip re-encoding
+            }
 
-        try
-        {
-            // LastPresentTime == 0 means only the mouse pointer moved — no new screen content.
-            if (frameInfo.LastPresentTime == 0)
+            if (r == Vortice.DXGI.ResultCode.AccessLost)
+            {
+                desktopResource?.Dispose();
+                RecreateAfterAccessLost();
                 return false;
+            }
 
-            using var frameTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
-            Context.CopyResource(_bgraCopy!, frameTexture);
-            return true;
-        }
-        finally
-        {
-            desktopResource.Dispose();
-            // Release immediately — we already own a private copy.
-            try { _duplication.ReleaseFrame(); } catch { }
+            if (r.Failure || desktopResource == null)
+            {
+                desktopResource?.Dispose();
+                return false;
+            }
+
+            // LastPresentTime == 0 means only the mouse pointer moved — no new screen content.
+            // Absorb it and keep waiting within the remaining budget instead of reporting idle.
+            if (frameInfo.LastPresentTime == 0)
+            {
+                Interlocked.Increment(ref _pointerOnly);
+                desktopResource.Dispose();
+                try { _duplication.ReleaseFrame(); } catch { }
+                if (Stopwatch.GetTimestamp() >= deadline)
+                {
+                    Interlocked.Increment(ref _timeouts);
+                    return false;
+                }
+                continue; // NO sleep — the outer idle sleep must stay unreachable during motion
+            }
+
+            try
+            {
+                using var frameTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
+                Context.CopyResource(_bgraCopy!, frameTexture);
+                Interlocked.Increment(ref _realFrames);
+                Interlocked.Add(ref _accumulatedFrames, frameInfo.AccumulatedFrames);
+                return true;
+            }
+            finally
+            {
+                desktopResource.Dispose();
+                // Release immediately — we already own a private copy.
+                try { _duplication.ReleaseFrame(); } catch { }
+            }
         }
     }
 

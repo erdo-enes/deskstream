@@ -27,7 +27,7 @@ Target: <50 ms glass-to-glass at 1080p60.
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.5.6 published)
+## Current state (v0.5.7 published)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public).
 - **v0.5.0** (published tag `v0.5.0`) brings stream quality selection (native/720p), localhost-only web dashboard (on TCP port 47810), Scheduled Task service/headless mode, client screenshot hotkeys, and major client UI restyling.
@@ -48,6 +48,30 @@ Target: <50 ms glass-to-glass at 1080p60.
   Surface at STREAM_STARTED now explicitly stops the epoch back to READY instead of leaving a
   receiver-less black session. New JUnit coverage under `android/app/src/test/`
   (FrameAssembler edge cases). All compile/unit-test verified; real-device validation ongoing.
+- **v0.5.7** (published tag `v0.5.7`) is a server-only release fixing the two root causes found
+  in real gameplay logs (sub-60fps plateaus + bitrate sawtooth):
+  1. `DesktopDuplicator.TryAcquire` now absorbs *pointer-only* DXGI updates inside its timeout
+     budget instead of fast-returning false — previously every gaming-mouse movement tripped
+     CaptureLoop's idle heuristic (`elapsed<10ms → Sleep(50)`), capping capture at 20–31 fps
+     exactly while aiming. This was the primary "not fully 60fps" cause.
+  2. Token-bucket packet pacing in `MediaSender` (clamp(8×bitrate, 32–96 Mbps), bucket
+     2 frames): P-frames pass untouched; oversized IDRs are shaped over ~12–25 ms instead of
+     bursting 280+ packets at line rate and tail-dropping the AP's per-station queue (the
+     `dropped 4-8` / 2× sent-kbps burst lines in the logs).
+  3. Adaptation: 1500 ms AdaptDown debounce (kills the double 30% slash per loss episode),
+     ceiling memory at 0.85× the breaking bitrate with additive +500 kbps approach near it and
+     ×1.05/10 s recovery; stats down-trigger needs >2 dropped frames or >2% (one frame at 60 fps
+     no longer slashes bitrate).
+  4. MMCSS "Games" registration for capture + encoder event threads, HIGH_PRIORITY_CLASS process.
+  5. New per-second capture diagnostics on the [stats] line: `cap <re>re/<po>po/<to>to ~<n>pres`
+     (real/pointer-only/timeout acquires, presents ≈ accumulated+real) — discriminates "content
+     is N fps" from "pipeline drops presents" in future logs.
+  6. Encoder log cleanup: `AVLowLatencyMode` gated behind `IsSupported` and logged as info
+     (`MF_LOW_LATENCY` attribute is the effective switch); the restart-time
+     `MF_E_INVALIDTYPE` candidate rejection was analyzed as benign (wrong-adapter MFT correctly
+     skipped; enumeration is hardware-only so no software fallback exists).
+  Compile-verified only; needs the real Windows+WiFi rig to confirm 60 fps under mouse motion
+  and the sawtooth's disappearance.
 - Features are backward-compatible with older v0.4.0 clients:
   1. **Quality selection** — optional `"quality"` field in `START_STREAM` (`"native"` default,
      `"720p"` = server-side downscale to 720 lines in the existing D3D11 VideoProcessor,

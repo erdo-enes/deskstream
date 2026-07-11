@@ -186,7 +186,14 @@ public sealed class H264Encoder : IVideoEncoder
         _codecApi = CodecApi.TryCreate(transform.NativePointer);
         if (_codecApi == null)
             Console.Error.WriteLine("[encoder] ICodecAPI unavailable; using defaults");
-        TrySetCodecBool(MfGuids.CODECAPI_AVLowLatencyMode, true);
+        // The effective low-latency switch is the MF_LOW_LATENCY attribute set on the transform
+        // above; CODECAPI_AVLowLatencyMode is redundant and many MFTs reject SetValue on it with
+        // E_INVALIDARG. Only set it when the encoder advertises support, and treat a miss as
+        // informational rather than an error.
+        if (_codecApi != null && _codecApi.IsSupported(MfGuids.CODECAPI_AVLowLatencyMode))
+            TrySetCodecBool(MfGuids.CODECAPI_AVLowLatencyMode, true);
+        else
+            Console.WriteLine("[encoder] CODECAPI_AVLowLatencyMode not supported; MF_LOW_LATENCY attribute is the effective low-latency switch.");
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonRateControlMode, MfGuids.RateControlMode_CBR);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonMeanBitRate, bitrate);
         // H.264 expresses HRD/VBV size in bytes. One frame prevents the rate controller from
@@ -312,44 +319,54 @@ public sealed class H264Encoder : IVideoEncoder
 
     private void EventLoop()
     {
-        while (_running)
+        // Register with the MMCSS "Games" scheduling class so ProcessOutput drains promptly under
+        // a fullscreen game's load. Guarded + reverted on exit; failure is tolerated silently.
+        IntPtr mmcss = NativeMethods.JoinGamesMmcss();
+        try
         {
-            IMFMediaEvent mediaEvent;
-            try
+            while (_running)
             {
-                mediaEvent = _events.GetEvent(0); // blocking
-            }
-            catch (SharpGenException)
-            {
-                break; // MFT shut down
-            }
-
-            try
-            {
-                var type = mediaEvent.EventType;
-                if (!_running) break;
-
-                if (type == MediaEventTypes.TransformNeedInput)
+                IMFMediaEvent mediaEvent;
+                try
                 {
-                    lock (_feedGate)
+                    mediaEvent = _events.GetEvent(0); // blocking
+                }
+                catch (SharpGenException)
+                {
+                    break; // MFT shut down
+                }
+
+                try
+                {
+                    var type = mediaEvent.EventType;
+                    if (!_running) break;
+
+                    if (type == MediaEventTypes.TransformNeedInput)
                     {
-                        if (_hasPending) FeedLocked();
-                        else _needInput = true;
+                        lock (_feedGate)
+                        {
+                            if (_hasPending) FeedLocked();
+                            else _needInput = true;
+                        }
+                    }
+                    else if (type == MediaEventTypes.TransformHaveOutput)
+                    {
+                        DrainOutput();
                     }
                 }
-                else if (type == MediaEventTypes.TransformHaveOutput)
+                catch (Exception ex)
                 {
-                    DrainOutput();
+                    Console.Error.WriteLine($"[encoder] event handling error: {ex.Message}");
+                }
+                finally
+                {
+                    mediaEvent.Dispose();
                 }
             }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[encoder] event handling error: {ex.Message}");
-            }
-            finally
-            {
-                mediaEvent.Dispose();
-            }
+        }
+        finally
+        {
+            NativeMethods.RevertGamesMmcss(mmcss);
         }
     }
 
