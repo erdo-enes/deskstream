@@ -27,7 +27,7 @@ Target: <50 ms glass-to-glass at 1080p60.
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.5.4 published)
+## Current state (v0.5.5 published)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public).
 - **v0.5.0** (published tag `v0.5.0`) brings stream quality selection (native/720p), localhost-only web dashboard (on TCP port 47810), Scheduled Task service/headless mode, client screenshot hotkeys, and major client UI restyling.
@@ -35,6 +35,7 @@ Target: <50 ms glass-to-glass at 1080p60.
 - **v0.5.2** (published tag `v0.5.2`) adds a high-performance, non-blocking asynchronous file logging system (`deskstream.app.log`) operating on a dedicated background worker thread to prevent thread jitter/stalls on critical stream and capture hot paths.
 - **v0.5.3** (published tag `v0.5.3`) fixes GPU starvation under 100% load during gameplay by setting the D3D11 DXGI device priority to High (`GPUThreadPriority = 5`) and the capture thread scheduling to `Highest`. It also fixes the bitrate adaptation downward spiral by adding a 5-second startup warmup window and resetting latency baselines on bitrate shifts.
 - **v0.5.4** (published tag `v0.5.4`) adds client and server version displays: Android client shows its package version name, macOS client reads and displays its bundle version on the connection screen, and the server includes its version in the web dashboard UI header.
+- **v0.5.5** (published tag `v0.5.5`) adds a complete C++/SDL2/libnx homebrew client for the Nintendo Switch under the `switch/` directory, including a standard `Makefile` that compiles into a `.nro` binary. The client maps Joy-Cons / Pro Controllers to Xbox 360 virtual controller packets and sends them over UDP.
 - Features are backward-compatible with older v0.4.0 clients:
   1. **Quality selection** — optional `"quality"` field in `START_STREAM` (`"native"` default,
      `"720p"` = server-side downscale to 720 lines in the existing D3D11 VideoProcessor,
