@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime;
+using System.Runtime.InteropServices;
 using DeskStreamer.Server.Net;
 using DeskStreamer.Server.Protocol;
 using DeskStreamer.Server.Service;
@@ -84,6 +85,11 @@ if (headless)
 }
 
 // ---- Startup -----------------------------------------------------------------------------
+
+if (OperatingSystem.IsWindows())
+{
+    try { NativeMethods.TimeBeginPeriod(1); } catch { }
+}
 
 // Favor latency over throughput in the GC (hot path is otherwise allocation-free).
 GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
@@ -190,6 +196,10 @@ catch (OperationCanceledException)
 }
 
 Console.WriteLine("Shutting down...");
+if (OperatingSystem.IsWindows())
+{
+    try { NativeMethods.TimeEndPeriod(1); } catch { }
+}
 return 0;
 
 static IEnumerable<string> LocalIPv4Addresses()
@@ -212,4 +222,13 @@ static IEnumerable<string> LocalIPv4Addresses()
     if (result.Count == 0)
         result.Add("(no active IPv4 interface found)");
     return result;
+}
+
+internal static class NativeMethods
+{
+    [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    public static extern uint TimeBeginPeriod(uint uPeriod);
+
+    [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    public static extern uint TimeEndPeriod(uint uPeriod);
 }

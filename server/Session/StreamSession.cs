@@ -616,12 +616,36 @@ public sealed class StreamSession : IDisposable
             long nextFrameTicks = Stopwatch.GetTimestamp();
             while (!ct.IsCancellationRequested)
             {
-                if (_duplicator!.TryAcquire(100, out var bgra))
+                long nowTicks = Stopwatch.GetTimestamp();
+                if (nowTicks < nextFrameTicks)
                 {
-                    long nowTicks = Stopwatch.GetTimestamp();
-                    if (nowTicks < nextFrameTicks)
-                        continue; // Desktop may present at 120/144/240 Hz; honor requested FPS.
-                    nextFrameTicks = nowTicks + frameIntervalTicks;
+                    long remainingTicks = nextFrameTicks - nowTicks;
+                    long remainingMs = remainingTicks * 1000 / Stopwatch.Frequency;
+                    if (remainingMs > 1)
+                    {
+                        Thread.Sleep((int)(remainingMs - 1));
+                    }
+                    while (Stopwatch.GetTimestamp() < nextFrameTicks)
+                    {
+                        Thread.SpinWait(5);
+                    }
+                }
+
+                long acquireStart = Stopwatch.GetTimestamp();
+                bool acquired = _duplicator!.TryAcquire(100, out var bgra);
+                long acquireEnd = Stopwatch.GetTimestamp();
+
+                if (acquired)
+                {
+                    nowTicks = acquireEnd;
+                    if (nowTicks > nextFrameTicks + frameIntervalTicks * 2)
+                    {
+                        nextFrameTicks = nowTicks + frameIntervalTicks;
+                    }
+                    else
+                    {
+                        nextFrameTicks += frameIntervalTicks;
+                    }
 
                     if (Interlocked.Increment(ref _capturedSinceEncode) > Fps * 3)
                         throw new InvalidOperationException("The hardware encoder stopped producing frames");
@@ -629,16 +653,24 @@ public sealed class StreamSession : IDisposable
                     Volatile.Write(ref _lastNv12, nv12);
                     SubmitCapture(nv12);
                 }
-                else if (Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
+                else
                 {
-                    // On a static desktop Desktop Duplication has no new frame after the
-                    // endpoint is learned. Re-submit the latest NV12 surface as an IDR so the
-                    // newly connected Android decoder still receives an initial picture.
-                    var latest = Volatile.Read(ref _lastNv12);
-                    if (latest != null)
-                        SubmitCapture(latest, forceIdr: true);
-                    else
-                        Interlocked.Exchange(ref _endpointIdrPending, 1);
+                    nextFrameTicks = acquireEnd;
+
+                    long elapsedMs = (acquireEnd - acquireStart) * 1000 / Stopwatch.Frequency;
+                    if (elapsedMs < 10)
+                    {
+                        Thread.Sleep(50);
+                    }
+
+                    if (Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
+                    {
+                        var latest = Volatile.Read(ref _lastNv12);
+                        if (latest != null)
+                            SubmitCapture(latest, forceIdr: true);
+                        else
+                            Interlocked.Exchange(ref _endpointIdrPending, 1);
+                    }
                 }
             }
         }
