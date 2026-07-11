@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using DeskStreamer.Server.Logging;
 using DeskStreamer.Server.Protocol;
 using DeskStreamer.Server.Session;
 
@@ -85,6 +86,7 @@ public sealed class ControlServer : IDisposable
     {
         var remote = tcp.Client.RemoteEndPoint;
         Console.WriteLine($"[control] client connected from {remote}.");
+        AsyncLogger.Info($"[control] Client connected from {remote}");
 
         tcp.NoDelay = true;
         var stream = tcp.GetStream();
@@ -144,6 +146,7 @@ public sealed class ControlServer : IDisposable
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[control] connection error: {ex.Message}");
+            AsyncLogger.Error($"[control] Connection error for {remote}: {ex.Message}");
         }
         finally
         {
@@ -151,6 +154,7 @@ public sealed class ControlServer : IDisposable
             session.Dispose();
             try { tcp.Close(); } catch { }
             Console.WriteLine($"[control] client {remote} disconnected.");
+            AsyncLogger.Info($"[control] Client {remote} disconnected");
         }
     }
 

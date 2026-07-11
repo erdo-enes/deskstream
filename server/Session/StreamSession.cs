@@ -5,6 +5,7 @@ using DeskStreamer.Server.Audio;
 using DeskStreamer.Server.Capture;
 using DeskStreamer.Server.Encode;
 using DeskStreamer.Server.Input;
+using DeskStreamer.Server.Logging;
 using DeskStreamer.Server.Net;
 using DeskStreamer.Server.Protocol;
 using Vortice.Direct3D11;
@@ -194,6 +195,7 @@ public sealed class StreamSession : IDisposable
             _send(OutgoingMessages.HelloOk(_serverName, _displayWidth, _displayHeight));
             _state = SessionState.Ready;
             Console.WriteLine($"[session] client '{hello.ClientName}' connected and authenticated.");
+            AsyncLogger.Info($"[session] Client '{hello.ClientName}' ({_clientAddress}) connected and authenticated successfully.");
         }
         else
         {
@@ -212,6 +214,7 @@ public sealed class StreamSession : IDisposable
         _pinExpiryMs = NowMs() + 60_000;
         _state = SessionState.AwaitingPairCode;
         PrintPin(_pin);
+        AsyncLogger.Info($"[pairing] Generated pairing PIN {_pin} for client '{_clientName}'");
     }
 
     private void OnPairCode(ReadOnlySpan<byte> payload)
@@ -234,10 +237,12 @@ public sealed class StreamSession : IDisposable
             _pin = null;
             _state = SessionState.AwaitingHello; // client re-sends HELLO with the token
             Console.WriteLine("[session] pairing succeeded; token issued.");
+            AsyncLogger.Info($"[session] Pairing succeeded for client '{_clientName}' ({_clientId})");
         }
         else
         {
             _pinAttempts--;
+            AsyncLogger.Warn($"[pairing] Incorrect PIN entered for client '{_clientName}'. Attempts remaining: {_pinAttempts}");
             if (_pinAttempts > 0)
             {
                 _send(OutgoingMessages.PairFail(_pinAttempts));
@@ -281,6 +286,7 @@ public sealed class StreamSession : IDisposable
     {
         try
         {
+            AsyncLogger.Info($"[session] Stream starting: {_streamWidth}x{_streamHeight}@{Fps} ({_quality}), max bitrate {_maxBitrateKbps} kbps");
             StartPipeline();
             _send(OutgoingMessages.StreamStarted(
                 _sender!.Port,
@@ -292,6 +298,7 @@ public sealed class StreamSession : IDisposable
             _state = SessionState.Streaming;
             Console.WriteLine($"[session] streaming started: {_streamWidth}x{_streamHeight}@{Fps} " +
                               $"({_quality}), start bitrate {_currentBitrateKbps} kbps, media port {_sender.Port}.");
+            AsyncLogger.Info($"[session] Stream successfully started on media port {_sender.Port}. Encoder: {_encoder.BackendName}");
         }
         catch (EncoderUnavailableException ex)
         {
@@ -302,6 +309,7 @@ public sealed class StreamSession : IDisposable
             _send(OutgoingMessages.Error("ENCODER_UNAVAILABLE", ex.Message));
             _send(OutgoingMessages.StreamStopped());
             Console.Error.WriteLine($"[session] encoder unavailable: {ex.Message}");
+            AsyncLogger.Error($"[session] Encoder unavailable: {ex.Message}");
             _state = SessionState.Ready;
         }
         catch (Exception ex)
@@ -310,6 +318,7 @@ public sealed class StreamSession : IDisposable
             _send(OutgoingMessages.Error("STREAM_FAILED", ex.Message));
             _send(OutgoingMessages.StreamStopped());
             Console.Error.WriteLine($"[session] failed to start stream: {ex}");
+            AsyncLogger.Error($"[session] Failed to start stream: {ex}");
             _state = SessionState.Ready;
         }
     }
@@ -346,6 +355,7 @@ public sealed class StreamSession : IDisposable
         _send(OutgoingMessages.StreamStopped());
         _state = SessionState.Ready;
         Console.WriteLine("[session] streaming stopped.");
+        AsyncLogger.Info("[session] Streaming stopped by client.");
     }
 
     // ---- Dashboard commands (marshalled onto the control read loop) -----------------------
@@ -362,7 +372,11 @@ public sealed class StreamSession : IDisposable
         while (_commands.TryDequeue(out var command))
         {
             try { command(); }
-            catch (Exception ex) { Console.Error.WriteLine($"[dashboard] command failed: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[dashboard] command failed: {ex.Message}");
+                AsyncLogger.Error($"[dashboard] Command failed: {ex.Message}");
+            }
         }
     }
 
@@ -374,6 +388,7 @@ public sealed class StreamSession : IDisposable
         _state = SessionState.Ready;
         BeginStream(); // reuses the current bitrate cap, fps, and quality
         Console.WriteLine("[session] streaming restarted from dashboard.");
+        AsyncLogger.Info("[session] Streaming restarted from dashboard command.");
     }
 
     private void OnAudioStart()
@@ -407,6 +422,7 @@ public sealed class StreamSession : IDisposable
             _send(OutgoingMessages.AudioStarted(_audioSender.Port));
             Console.WriteLine($"[audio] system output '{_audioCapture.DeviceName}' -> " +
                               $"48 kHz stereo PCM16, UDP {_audioSender.Port}.");
+            AsyncLogger.Info($"[audio] System output '{_audioCapture.DeviceName}' started -> 48 kHz stereo PCM16, UDP {_audioSender.Port}.");
         }
         catch (Exception ex)
         {
@@ -416,6 +432,7 @@ public sealed class StreamSession : IDisposable
                 : ex.Message;
             _send(OutgoingMessages.AudioUnavailable(message));
             Console.Error.WriteLine($"[audio] unavailable: {message}");
+            AsyncLogger.Error($"[audio] Audio unavailable: {message}");
         }
     }
 
@@ -456,6 +473,7 @@ public sealed class StreamSession : IDisposable
             int count = _gamepads.Start(requested);
             _send(OutgoingMessages.GamepadStarted(count));
             Console.WriteLine($"[gamepad] {count} virtual Xbox 360 controller(s) connected.");
+            AsyncLogger.Info($"[gamepad] {count} virtual Xbox 360 controller(s) connected successfully.");
         }
         catch (Exception ex)
         {
@@ -463,6 +481,7 @@ public sealed class StreamSession : IDisposable
             string messageText = DescribeGamepadError(ex);
             _send(OutgoingMessages.GamepadUnavailable(messageText));
             Console.Error.WriteLine($"[gamepad] unavailable: {messageText}");
+            AsyncLogger.Error($"[gamepad] Gamepads unavailable: {messageText}");
         }
     }
 
@@ -506,11 +525,13 @@ public sealed class StreamSession : IDisposable
                 ? "mouse and keyboard"
                 : mouseRequested ? "mouse" : "keyboard";
             Console.WriteLine($"[input] authenticated remote {capabilities} enabled.");
+            AsyncLogger.Info($"[input] Authenticated remote {capabilities} enabled successfully.");
         }
         catch (Exception ex)
         {
             StopInput();
             _send(OutgoingMessages.InputUnavailable(ex.Message));
+            AsyncLogger.Error($"[input] Input failed to start: {ex.Message}");
         }
     }
 
@@ -677,6 +698,7 @@ public sealed class StreamSession : IDisposable
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[capture] loop terminated: {ex.Message}");
+            AsyncLogger.Error($"[capture] Capture loop terminated exceptionally: {ex.Message}");
             if (!ct.IsCancellationRequested &&
                 Interlocked.CompareExchange(ref _pipelineFaultHandling, 1, 0) == 0)
             {
@@ -707,6 +729,7 @@ public sealed class StreamSession : IDisposable
         _send(OutgoingMessages.Error("STREAM_FAILED", ex.Message));
         _send(OutgoingMessages.StreamStopped());
         Console.Error.WriteLine("[session] stream stopped after capture/encoder fault; control session remains connected.");
+        AsyncLogger.Error($"[session] Stream stopped after capture/encoder fault: {ex.Message}");
     }
 
     private void OnEncoded(byte[] data, int length, bool keyframe, uint ptsMs)
@@ -731,6 +754,7 @@ public sealed class StreamSession : IDisposable
         _audioStreaming = false;
         _send(OutgoingMessages.AudioUnavailable(message));
         Console.Error.WriteLine($"[audio] capture stopped: {message}");
+        AsyncLogger.Error($"[audio] Capture stopped: {message}");
     }
 
     private void OnGamepadState(GamepadState state)
@@ -745,6 +769,7 @@ public sealed class StreamSession : IDisposable
             StopGamepads();
             _send(OutgoingMessages.GamepadUnavailable(message));
             Console.Error.WriteLine($"[gamepad] virtual controller stopped: {message}");
+            AsyncLogger.Error($"[gamepad] Virtual controller stopped: {message}");
         }
     }
 
@@ -778,11 +803,13 @@ public sealed class StreamSession : IDisposable
         if (!_streaming) return;
         Interlocked.Exchange(ref _endpointIdrPending, 1);
         Console.WriteLine("[media] client endpoint learned; scheduling an IDR.");
+        AsyncLogger.Info("[media] Client media UDP endpoint learned; scheduling an IDR frame.");
     }
 
     private void StopPipeline()
     {
         _streaming = false;
+        AsyncLogger.Info("[session] Stopping stream pipeline.");
         StopInput();
         StopGamepads();
         StopAudio();
@@ -922,6 +949,7 @@ public sealed class StreamSession : IDisposable
     private void AdaptDown()
     {
         int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.7));
+        AsyncLogger.Info($"[adaptation] Adapting bitrate DOWN: {_currentBitrateKbps} -> {next} kbps (due to frame drops / latency growth)");
         ApplyBitrate(next);
         _cleanStreak = 0;
     }
@@ -929,6 +957,7 @@ public sealed class StreamSession : IDisposable
     private void AdaptUp()
     {
         int next = Math.Min(_maxBitrateKbps, (int)(_currentBitrateKbps * 1.1));
+        AsyncLogger.Info($"[adaptation] Adapting bitrate UP: {_currentBitrateKbps} -> {next} kbps");
         ApplyBitrate(next);
     }
 
@@ -942,16 +971,19 @@ public sealed class StreamSession : IDisposable
             {
                 Console.Error.WriteLine(
                     $"[encoder] bitrate reconfiguration rejected; keeping {_currentBitrateKbps} kbps");
+                AsyncLogger.Warn($"[encoder] Bitrate reconfiguration to {kbps} kbps rejected by the hardware encoder; keeping {_currentBitrateKbps} kbps");
                 return;
             }
             _currentBitrateKbps = kbps;
             _send(OutgoingMessages.Bitrate(kbps));
+            AsyncLogger.Info($"[encoder] Bitrate reconfigured successfully to {kbps} kbps");
         }
         catch (Exception ex)
         {
             // Some vendor drivers expose hardware encode but reject live reconfiguration.
             // Keep the healthy stream at its previous target instead of dropping the session.
             Console.Error.WriteLine($"[encoder] bitrate reconfiguration rejected: {ex.Message}");
+            AsyncLogger.Error($"[encoder] Bitrate reconfiguration failed: {ex.Message}");
         }
     }
 

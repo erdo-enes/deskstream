@@ -3,6 +3,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime;
 using System.Runtime.InteropServices;
+using DeskStreamer.Server.Logging;
 using DeskStreamer.Server.Net;
 using DeskStreamer.Server.Protocol;
 using DeskStreamer.Server.Service;
@@ -33,6 +34,9 @@ if (HasFlag("--uninstall-autostart"))
 bool headless = HasFlag("--headless");
 bool noWeb = HasFlag("--no-web");
 bool webLan = HasFlag("--web-lan");
+
+string appLogPath = Path.Combine(AppContext.BaseDirectory, "deskstream.app.log");
+AsyncLogger.Initialize(appLogPath);
 
 int webPort = 47810;
 if (FlagValue("--web-port") is { } portText && int.TryParse(portText, out int parsedPort)
@@ -82,6 +86,7 @@ if (headless)
     Console.SetOut(logWriter);
     Console.SetError(logWriter);
     Console.WriteLine($"=== DeskStream headless start {DateTimeOffset.Now:O} ===");
+    AsyncLogger.Info("Running in headless mode.");
 }
 
 // ---- Startup -----------------------------------------------------------------------------
@@ -101,18 +106,26 @@ Console.WriteLine("DeskStream server");
 Console.WriteLine("=================");
 Console.WriteLine($"Host: {hostname}");
 Console.WriteLine("Listening on:");
+AsyncLogger.Info($"DeskStream Server starting on host: {hostname}");
 foreach (var ip in listenIps)
+{
     Console.WriteLine($"  {ip}   (discovery UDP {Ports.Discovery}, control TCP {Ports.Control}, " +
                       $"video UDP {Ports.PreferredMedia}, audio UDP {Ports.PreferredAudio})");
+    AsyncLogger.Info($"Listening on: {ip} (discovery={Ports.Discovery}, control={Ports.Control}, video={Ports.PreferredMedia}, audio={Ports.PreferredAudio})");
+}
 Console.WriteLine();
 Console.WriteLine($"Default stream quality: {options.DefaultQuality}");
 Console.WriteLine($"Maximum stream bitrate: {options.MaxBitrateKbps} kbps");
+AsyncLogger.Info($"Default stream quality: {options.DefaultQuality}");
+AsyncLogger.Info($"Maximum stream bitrate: {options.MaxBitrateKbps} kbps");
 string firewallPorts = "UDP 47800/47802/47803 and TCP 47801";
 if (webLan && !noWeb)
     firewallPorts += $" plus TCP {webPort} for the LAN dashboard";
 Console.WriteLine($"Firewall: allow {firewallPorts} on the Private network profile.");
 Console.WriteLine("Waiting for a client to connect...");
 Console.WriteLine();
+AsyncLogger.Info($"Firewall requirements: allow {firewallPorts} on the Private network profile.");
+AsyncLogger.Info("Waiting for a client to connect...");
 
 var pairing = new PairingManager();
 
@@ -196,6 +209,7 @@ catch (OperationCanceledException)
 }
 
 Console.WriteLine("Shutting down...");
+AsyncLogger.Info("Server shutting down.");
 if (OperatingSystem.IsWindows())
 {
     try { NativeMethods.TimeEndPeriod(1); } catch { }
