@@ -27,12 +27,13 @@ Target: <50 ms glass-to-glass at 1080p60.
   immediate hardware H.264 presentation, bounded PCM audio, direct/captured mouse input,
   physical keyboard forwarding, and up to four GameController devices with haptics.
 
-## Current state (v0.5.2 published)
+## Current state (v0.5.3 published)
 
 - GitHub: https://github.com/erdo-enes/deskstream (public).
 - **v0.5.0** (published tag `v0.5.0`) brings stream quality selection (native/720p), localhost-only web dashboard (on TCP port 47810), Scheduled Task service/headless mode, client screenshot hotkeys, and major client UI restyling.
 - **v0.5.1** (published tag `v0.5.1`) fixes the server 60 FPS pacing lock and 720p conversion stutter. It implements a precise drift-free capture micro-pacing loop (combining `Thread.Sleep` and `Thread.SpinWait` for sub-millisecond accuracy) and configures the Windows scheduler to 1ms resolution at startup.
 - **v0.5.2** (published tag `v0.5.2`) adds a high-performance, non-blocking asynchronous file logging system (`deskstream.app.log`) operating on a dedicated background worker thread to prevent thread jitter/stalls on critical stream and capture hot paths.
+- **v0.5.3** (published tag `v0.5.3`) fixes GPU starvation under 100% load during gameplay by setting the D3D11 DXGI device priority to High (`GPUThreadPriority = 5`) and the capture thread scheduling to `Highest`. It also fixes the bitrate adaptation downward spiral by adding a 5-second startup warmup window and resetting latency baselines on bitrate shifts.
 - Features are backward-compatible with older v0.4.0 clients:
   1. **Quality selection** — optional `"quality"` field in `START_STREAM` (`"native"` default,
      `"720p"` = server-side downscale to 720 lines in the existing D3D11 VideoProcessor,
