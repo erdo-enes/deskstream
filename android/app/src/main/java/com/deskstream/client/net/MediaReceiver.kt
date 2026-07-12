@@ -454,9 +454,10 @@ class MediaReceiver(
         private const val HOLE_PUNCH_MESSAGE = "DSMH"
         private const val INPUT_SEND_QUEUE_CAPACITY = 16
         private const val RECV_PACKET_BUFFER_BYTES = 1500
-        // IDR access units arrive as a burst. 256 KiB caused a loss -> IDR -> larger burst
-        // feedback loop on real Wi-Fi devices.
-        private const val RECV_SOCKET_BUFFER_BYTES = 1024 * 1024
+        // Keep enough room for a paced 150-300 KiB IDR, but do not allow the kernel to hide
+        // hundreds of milliseconds of stale video. At ~24 Mbps wire rate a 1 MiB socket queue
+        // alone can hold ~350 ms; combined Wi-Fi/driver buffering produced 600+ ms field stalls.
+        private const val RECV_SOCKET_BUFFER_BYTES = 512 * 1024
         private const val SOCKET_TIMEOUT_MS = 1000
         private const val VIDEO_REPUNCH_MS = 1500L
         private const val VIDEO_RECOVERY_INTERVAL_MS = 5000L

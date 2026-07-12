@@ -87,20 +87,33 @@ public sealed class StreamSession : IDisposable
     private int _idrSinceLastStats;
     private readonly Queue<long> _idrTimes = new();
     private long _lastIdrGenMs = -1000;
-    private int _bestCaptureToReceiveMs = int.MaxValue;
+    private int _bestTransportMs = int.MaxValue;
     private int _bestDecodeToSurfaceMs = int.MaxValue;
     // Consecutive stats intervals where p95 latency exceeded the learned baseline. We require a
-    // sustained rise (>=2 intervals) before cutting, so a single spike (transient / startup-IDR-
+    // sustained rise (>=3 intervals) before cutting, so a single spike (transient / startup-IDR-
     // contaminated p95 window) cannot slash bitrate.
     private int _latencyGrowingStreak;
 
-    // AIMD-with-memory: remember the level a loss episode was found at (the "breaking point")
-    // and converge additively under it instead of sawtoothing through it. The ceiling slowly
-    // recovers on clean intervals so a transient blip does not cap quality forever.
+    // Stable AIMD-with-memory. Media Foundation bitrate changes are synchronous and can take
+    // hundreds of milliseconds on real NVIDIA drivers, so probing must be deliberately slow.
+    // A congestion cut pins the session ceiling at the new safe rate; only a full minute without
+    // congestion permits a small ceiling probe.
     private int _bitrateCeilingKbps = ServerOptions.DefaultMaxBitrateKbps;
-    private long _lastAdaptDownMs = long.MinValue / 4;  // "far past" so the first cut is never debounced
+    private long _lastBitrateChangeMs = long.MinValue / 4;
+    private long _lastCongestionMs = long.MinValue / 4;
     private long _lastCeilingRaiseMs;
-    private long _lastCeilingCutMs = long.MinValue / 4;  // time of the last REAL ceiling reduction
+    private bool _upwardAdaptationDisabled;
+
+    private const long BitrateSettleMs = 15_000;
+    private const long CongestionHoldMs = 30_000;
+    private const long CeilingRecoveryDelayMs = 60_000;
+    private const long CeilingRecoveryIntervalMs = 30_000;
+    private const int CleanIntervalsBeforeProbe = 10;
+    private const int BitrateProbeStepKbps = 500;
+    private const int NetworkLatencyBudgetMs = 80;
+    private const int NetworkBacklogCutMs = 150;
+    private const int DecoderLatencyBudgetMs = 40;
+    private const long SlowBitrateReconfigureMs = 50;
 
     // Stats surfaced to the console (Program reads these)
     private long _encodedFrames;
@@ -114,6 +127,18 @@ public sealed class StreamSession : IDisposable
     public int GamepadCount => _gamepads?.Count ?? 0;
     public int Fps { get; private set; } = 60;
     public int CurrentBitrateKbps => _currentBitrateKbps;
+    public int BitrateCeilingKbps => _bitrateCeilingKbps;
+    public bool UpwardAdaptationEnabled => !_upwardAdaptationDisabled;
+    public long AdaptationHoldRemainingMs
+    {
+        get
+        {
+            long now = NowMs();
+            long settleUntil = Volatile.Read(ref _lastBitrateChangeMs) + BitrateSettleMs;
+            long congestionUntil = Volatile.Read(ref _lastCongestionMs) + CongestionHoldMs;
+            return Math.Max(0, Math.Max(settleUntil, congestionUntil) - now);
+        }
+    }
     public int LastClientFramesDropped { get; private set; }
     public int LastClientFramesOk { get; private set; }
     public int LastClientFramesAssembled { get; private set; } = -1;
@@ -659,11 +684,12 @@ public sealed class StreamSession : IDisposable
         _cleanStreak = 0;
         _idrSinceLastStats = 0;
         _bitrateCeilingKbps = _maxBitrateKbps;
-        _lastAdaptDownMs = long.MinValue / 4;
-        _lastCeilingCutMs = long.MinValue / 4;
-        _lastCeilingRaiseMs = NowMs();
+        _lastCongestionMs = long.MinValue / 4;
+        _lastBitrateChangeMs = NowMs();
+        _lastCeilingRaiseMs = _lastBitrateChangeMs;
+        _upwardAdaptationDisabled = false;
         _idrTimes.Clear();
-        _bestCaptureToReceiveMs = int.MaxValue;
+        _bestTransportMs = int.MaxValue;
         _bestDecodeToSurfaceMs = int.MaxValue;
         _latencyGrowingStreak = 0;
         LastClientFramesDropped = 0;
@@ -972,24 +998,34 @@ public sealed class StreamSession : IDisposable
         LastDecodeToSurfaceP95Ms = s.DecodeToSurfaceP95Ms;
         _lastClientStatsAtMs = NowMs();
 
-        // Skip adaptation during the first 2 seconds to avoid startup transient triggers.
-        if (_clock == null || _clock.ElapsedMilliseconds < 2000)
-            return;
-
         int total = s.FramesOk + s.FramesDropped;
         double dropRate = total > 0 ? (double)s.FramesDropped / total : 0.0;
 
-        if (s.CaptureToReceiveP95Ms >= 0)
-            _bestCaptureToReceiveMs = Math.Min(_bestCaptureToReceiveMs, s.CaptureToReceiveP95Ms);
+        // capture-to-receive contains host capture/encode time too. Subtract the server pipeline
+        // component when available so a loaded host GPU is not misdiagnosed as Wi-Fi congestion.
+        int transportP95Ms = s.CaptureToReceiveP95Ms;
+        if (transportP95Ms >= 0 && s.ServerPipelineP95Ms >= 0)
+            transportP95Ms = Math.Max(0, transportP95Ms - s.ServerPipelineP95Ms);
+
+        if (transportP95Ms >= 0)
+            _bestTransportMs = Math.Min(_bestTransportMs, transportP95Ms);
         if (s.DecodeToSurfaceP95Ms >= 0)
             _bestDecodeToSurfaceMs = Math.Min(_bestDecodeToSurfaceMs, s.DecodeToSurfaceP95Ms);
 
-        // Widen latency margins substantially: WiFi p95 jitter of 20-40ms is normal and should
-        // not trigger cuts. Only react if capture-to-receive grows by >40ms or decode-to-surface
-        // by >25ms above the learned floor.
+        // Learn the healthy startup floor, but let startup IDR, clock synchronization, and the
+        // hardware codec settle before making a synchronous Media Foundation bitrate change.
+        if (_clock == null || _clock.ElapsedMilliseconds < BitrateSettleMs)
+        {
+            _idrSinceLastStats = 0;
+            return;
+        }
+
+        // Preserve the healthy floor for the entire stream epoch. The old implementation reset
+        // it after every bitrate change, allowing a 600 ms backlog to become the new "healthy"
+        // baseline and immediately authorizing another increase.
         bool latencyGrowingNow =
-            (_bestCaptureToReceiveMs != int.MaxValue &&
-             s.CaptureToReceiveP95Ms > _bestCaptureToReceiveMs + 40) ||
+            (_bestTransportMs != int.MaxValue &&
+             transportP95Ms > _bestTransportMs + 40) ||
             (_bestDecodeToSurfaceMs != int.MaxValue &&
              s.DecodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 25);
 
@@ -998,47 +1034,33 @@ public sealed class StreamSession : IDisposable
         _latencyGrowingStreak = latencyGrowingNow ? _latencyGrowingStreak + 1 : 0;
         bool latencySustained = _latencyGrowingStreak >= 3;
 
-        // Require a meaningful loss: >5 frames dropped or >5% loss rate. At 60fps, dropping
-        // 3-4 frames per second is typical WiFi behavior, not network congestion.
-        bool dropCongestion = s.FramesDropped > 5 || dropRate > 0.05;
-        bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 && !latencyGrowingNow;
+        bool dropCongestion = s.FramesDropped >= 3 || dropRate > 0.03;
+        bool absoluteNetworkBacklog = transportP95Ms >= NetworkBacklogCutMs;
+        bool withinLatencyBudget =
+            (transportP95Ms < 0 || transportP95Ms <= NetworkLatencyBudgetMs) &&
+            (s.DecodeToSurfaceP95Ms < 0 || s.DecodeToSurfaceP95Ms <= DecoderLatencyBudgetMs);
+        bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 &&
+            !latencyGrowingNow && withinLatencyBudget;
 
-        if (dropCongestion || latencySustained)
+        if (dropCongestion || latencySustained || absoluteNetworkBacklog)
         {
             string reason = dropCongestion
                 ? $"drops {s.FramesDropped}/{total} ({dropRate:P1})"
-                : $"latency p95 cap {s.CaptureToReceiveP95Ms}>{BaselineStr(_bestCaptureToReceiveMs)}+15 " +
-                  $"dec {s.DecodeToSurfaceP95Ms}>{BaselineStr(_bestDecodeToSurfaceMs)}+12 x{_latencyGrowingStreak}";
+                : absoluteNetworkBacklog
+                    ? $"transport backlog p95 {transportP95Ms} ms " +
+                      $"(cap {s.CaptureToReceiveP95Ms} - pipe {s.ServerPipelineP95Ms}) >= {NetworkBacklogCutMs} ms"
+                    : $"latency p95 transport {transportP95Ms}>{BaselineStr(_bestTransportMs)}+40 " +
+                      $"dec {s.DecodeToSurfaceP95Ms}>{BaselineStr(_bestDecodeToSurfaceMs)}+25 x{_latencyGrowingStreak}";
             AdaptDown(reason);
+            _cleanStreak = 0;
         }
         else
         {
-            // Ceiling recovery, independent of the (stricter) clean streak: on any quiet interval
-            // nudge the remembered breaking point back toward the hard max so a stale or transient
-            // episode cannot cap quality for minutes. Accelerate once a real cut is well past.
-            // Ceiling recovery: on any clean interval, aggressively raise the remembered
-            // breaking point back toward the hard max. The old 10s/5% cadence was far too slow
-            // and left the stream capped at low quality for minutes after a single blip.
-            if (s.FramesDropped == 0 && !latencyGrowingNow && _bitrateCeilingKbps < _maxBitrateKbps)
-            {
-                long now = NowMs();
-                if (now - _lastCeilingRaiseMs >= 5_000)
-                {
-                    double factor = now - _lastCeilingCutMs >= 15_000 ? 1.40 : 1.15;
-                    _bitrateCeilingKbps = Math.Min(_maxBitrateKbps, (int)(_bitrateCeilingKbps * factor));
-                    _lastCeilingRaiseMs = now;
-                }
-            }
-
             if (clean)
             {
-                _cleanStreak++;
-                // Require only 2 clean intervals before trying to climb back up.
-                // The old value of 5 meant 5+ seconds of perfect delivery before any
-                // recovery, which was far too conservative for WiFi environments.
-                if (_cleanStreak >= 2)
+                _cleanStreak = Math.Min(CleanIntervalsBeforeProbe, _cleanStreak + 1);
+                if (_cleanStreak >= CleanIntervalsBeforeProbe && AdaptUp())
                 {
-                    AdaptUp();
                     _cleanStreak = 0;
                 }
             }
@@ -1053,93 +1075,127 @@ public sealed class StreamSession : IDisposable
 
     private static string BaselineStr(int best) => best == int.MaxValue ? "-" : best.ToString();
 
-    /// <summary>
-    /// Re-learns the p95 latency baseline from scratch. Called after any real bitrate change (the
-    /// operating point moved) and after a floor no-op DOWN (so a chronically-high "growing" signal
-    /// at the floor cannot pin the stream there forever).
-    /// </summary>
-    private void ResetLatencyBaseline()
-    {
-        _bestCaptureToReceiveMs = int.MaxValue;
-        _bestDecodeToSurfaceMs = int.MaxValue;
-        _latencyGrowingStreak = 0;
-    }
-
     private void AdaptDown(string reason)
     {
         long now = NowMs();
-        // Debounce: one loss episode routinely produces both an OnRequestIdr burst and an OnStats
-        // drop report. Collapsing them into a single reaction kills the double-slash sawtooth.
-        // Widen to 3s to prevent rapid successive cuts on WiFi.
-        if (now - _lastAdaptDownMs < 3000)
-            return;
+        _lastCongestionMs = now;
+        _cleanStreak = 0;
 
-        // Gentler cut: only 20% reduction instead of 30%. This prevents the catastrophic
-        // compound crash (0.7^4 = 0.24x in 6 seconds) that the old algorithm suffered.
-        int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.80));
-
-        // Floor no-op: the cut cannot lower an already-floored bitrate. Re-baseline so
-        // latency signals don't keep firing, hold the debounce, and log at DEBUG.
-        if (next >= _currentBitrateKbps)
+        // A cut needs time to drain already-queued UDP data and establish a new latency sample.
+        // Reconfiguring again during that drain produced the 200-600 ms freezes seen in field logs.
+        if (now - _lastBitrateChangeMs < BitrateSettleMs)
         {
-            ResetLatencyBaseline();
-            _lastAdaptDownMs = now;
-            AsyncLogger.Debug($"[adaptation] DOWN suppressed at floor {_currentBitrateKbps} kbps ({reason}); latency baseline reset");
+            AsyncLogger.Debug(
+                $"[adaptation] DOWN held while bitrate settles at {_currentBitrateKbps} kbps ({reason})");
             return;
         }
 
-        _lastAdaptDownMs = now;
-        _lastCeilingCutMs = now;
-        // Set ceiling at 95% of the pre-cut level (not 85%) so recovery has room to climb
-        // back close to where it was, rather than being trapped far below.
-        _bitrateCeilingKbps = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.95));
-        AsyncLogger.Info($"[adaptation] DOWN {_currentBitrateKbps} -> {next} kbps ({reason}; ceiling {_bitrateCeilingKbps})");
-        ApplyBitrate(next);
-        _cleanStreak = 0;
+        int next = Math.Max(ServerOptions.MinimumBitrateKbps, (int)(_currentBitrateKbps * 0.80));
+
+        if (next >= _currentBitrateKbps)
+        {
+            AsyncLogger.Debug(
+                $"[adaptation] DOWN suppressed at floor {_currentBitrateKbps} kbps ({reason})");
+            return;
+        }
+
+        int previous = _currentBitrateKbps;
+        if (ApplyBitrate(next))
+        {
+            // The cut rate is now the known-safe ceiling. It may be probed upward only after a
+            // full minute without loss/backlog, in 500 kbps steps.
+            _bitrateCeilingKbps = Math.Min(_bitrateCeilingKbps, next);
+            _lastCeilingRaiseMs = now;
+            AsyncLogger.Info(
+                $"[adaptation] DOWN {previous} -> {next} kbps ({reason}; ceiling {_bitrateCeilingKbps})");
+        }
     }
 
-    private void AdaptUp()
+    private bool AdaptUp()
     {
+        long now = NowMs();
+        if (_upwardAdaptationDisabled ||
+            now - _lastCongestionMs < CongestionHoldMs ||
+            now - _lastBitrateChangeMs < BitrateSettleMs)
+            return false;
+
+        if (_currentBitrateKbps >= _bitrateCeilingKbps)
+        {
+            if (now - _lastCongestionMs < CeilingRecoveryDelayMs ||
+                now - _lastCeilingRaiseMs < CeilingRecoveryIntervalMs ||
+                _bitrateCeilingKbps >= _maxBitrateKbps)
+                return false;
+
+            _bitrateCeilingKbps = Math.Min(
+                _maxBitrateKbps,
+                _bitrateCeilingKbps + BitrateProbeStepKbps);
+            _lastCeilingRaiseMs = now;
+            AsyncLogger.Info($"[adaptation] clean-path ceiling probe -> {_bitrateCeilingKbps} kbps");
+        }
+
         int ceiling = Math.Min(_maxBitrateKbps, _bitrateCeilingKbps);
-        // Use 15% multiplicative increase for faster recovery. Near the ceiling (within 10%),
-        // switch to additive +1000 kbps so we probe gently rather than overshooting.
-        bool additive = _currentBitrateKbps >= (int)(0.90 * ceiling);
-        int next = additive
-            ? Math.Min(ceiling, _currentBitrateKbps + 1000)
-            : Math.Min(ceiling, (int)(_currentBitrateKbps * 1.15));
+        int next = Math.Min(ceiling, _currentBitrateKbps + BitrateProbeStepKbps);
         if (next == _currentBitrateKbps)
-            return; // already at the ceiling; nothing to raise
-        AsyncLogger.Info($"[adaptation] UP {_currentBitrateKbps} -> {next} kbps ({(additive ? "additive" : "x1.15")}; ceiling {ceiling})");
-        ApplyBitrate(next);
+            return false;
+        int previous = _currentBitrateKbps;
+        if (!ApplyBitrate(next))
+            return false;
+        AsyncLogger.Info(
+            $"[adaptation] UP {previous} -> {next} kbps (+{BitrateProbeStepKbps}; ceiling {ceiling})");
+        return true;
     }
 
-    private void ApplyBitrate(int kbps)
+    private bool ApplyBitrate(int kbps)
     {
         if (kbps == _currentBitrateKbps || _encoder == null)
-            return;
+            return false;
+        // A rejected/throwing driver call is still an expensive reconfiguration attempt. Start
+        // the settle timer now so congestion stats cannot retry the same synchronous call every
+        // second and create a new stutter loop on unsupported hardware.
+        _lastBitrateChangeMs = NowMs();
+        long reconfigureStarted = Stopwatch.GetTimestamp();
         try
         {
             if (!_encoder.SetBitrate(kbps))
             {
+                long elapsedMs = (Stopwatch.GetTimestamp() - reconfigureStarted) * 1000 /
+                    Stopwatch.Frequency;
+                _upwardAdaptationDisabled = true;
                 Console.Error.WriteLine(
                     $"[encoder] bitrate reconfiguration rejected; keeping {_currentBitrateKbps} kbps");
-                AsyncLogger.Warn($"[encoder] Bitrate reconfiguration to {kbps} kbps rejected by the hardware encoder; keeping {_currentBitrateKbps} kbps");
-                return;
+                AsyncLogger.Warn(
+                    $"[encoder] Bitrate reconfiguration to {kbps} kbps rejected after {elapsedMs} ms; " +
+                    $"keeping {_currentBitrateKbps} kbps");
+                return false;
             }
             _currentBitrateKbps = kbps;
+            _lastBitrateChangeMs = NowMs();
             _sender?.SetPacingRate(_currentBitrateKbps, Fps);
             _send(OutgoingMessages.Bitrate(kbps));
-            AsyncLogger.Info($"[encoder] Bitrate reconfigured successfully to {kbps} kbps");
-
-            // The operating point moved: re-learn the p95 latency baseline from scratch.
-            ResetLatencyBaseline();
+            long successElapsedMs = (Stopwatch.GetTimestamp() - reconfigureStarted) * 1000 /
+                Stopwatch.Frequency;
+            if (successElapsedMs >= SlowBitrateReconfigureMs)
+            {
+                _upwardAdaptationDisabled = true;
+                AsyncLogger.Warn(
+                    $"[adaptation] Upward probes disabled for this stream: hardware bitrate " +
+                    $"reconfiguration took {successElapsedMs} ms (budget {SlowBitrateReconfigureMs} ms)");
+            }
+            AsyncLogger.Info(
+                $"[encoder] Bitrate reconfigured successfully to {kbps} kbps in {successElapsedMs} ms");
+            return true;
         }
         catch (Exception ex)
         {
+            long elapsedMs = (Stopwatch.GetTimestamp() - reconfigureStarted) * 1000 /
+                Stopwatch.Frequency;
+            _upwardAdaptationDisabled = true;
             // Some vendor drivers expose hardware encode but reject live reconfiguration.
             // Keep the healthy stream at its previous target instead of dropping the session.
             Console.Error.WriteLine($"[encoder] bitrate reconfiguration rejected: {ex.Message}");
-            AsyncLogger.Error($"[encoder] Bitrate reconfiguration failed: {ex.Message}");
+            AsyncLogger.Error(
+                $"[encoder] Bitrate reconfiguration failed after {elapsedMs} ms: {ex.Message}");
+            return false;
         }
     }
 

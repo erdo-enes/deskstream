@@ -166,6 +166,7 @@ long prevCapAccum = 0;
 // summary and emit it to the app log once every 10 s — the only stream telemetry a headless
 // field log otherwise has. Consistent with v0.5.2 (which suppressed the unbounded 1 Hz line).
 int win10Ticks = 0;
+int appDiagTicks = 0;
 long win10SubmitFps = 0, win10EncFps = 0, win10SentFps = 0, win10SentKbps = 0, win10Idr = 0;
 long win10Re = 0, win10Po = 0, win10To = 0, win10Pres = 0;
 int win10MaxDropped = 0;
@@ -257,13 +258,32 @@ try
             long clientFecPacketRate = clientStatsFresh && session.LastClientFecPackets >= 0
                 ? RatePerSecond(session.LastClientFecPackets, clientInterval)
                 : -1;
+            int clientTransportP95Ms = session.LastCaptureToReceiveP95Ms;
+            if (clientTransportP95Ms >= 0 && session.LastServerPipelineP95Ms >= 0)
+                clientTransportP95Ms = Math.Max(
+                    0,
+                    clientTransportP95Ms - session.LastServerPipelineP95Ms);
             string bottleneck = DiagnoseBottleneck(
                 session.Fps, presentsPerSec, submittedFps, fps, sentFps,
                 clientStatsFresh, clientAssembledFps, clientDecodedFps,
                 session.LastClientAssemblyDrops, session.LastClientDecoderDrops,
-                session.LastClientFecRecovered, session.LastServerPipelineP95Ms,
-                session.LastCaptureToReceiveP95Ms, session.LastDecodeToSurfaceP95Ms,
+                session.LastClientFecRecovered, clientTransportP95Ms,
+                session.LastDecodeToSurfaceP95Ms,
                 session.MediaEndpointReady);
+            string diagnosticLine =
+                $"[diag] likely={bottleneck} | host {presentsPerSec} present -> " +
+                $"{submittedFps} submit -> {fps} encode -> {sentFps} send | " +
+                $"android {Metric(clientAssembledFps)} assemble -> {Metric(clientDecodedFps)} render | " +
+                $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
+                $"fec-fix {Metric(session.LastClientFecRecovered)} | " +
+                $"udp pkts tx {sentPackets}/s rx {Metric(clientPacketRate)}/s fec {Metric(clientFecPacketRate)}/s " +
+                $"err {sendFailures} pace {pacingMs}ms | " +
+                $"rate {session.CurrentBitrateKbps}/{session.BitrateCeilingKbps} kbps " +
+                $"hold {(session.AdaptationHoldRemainingMs + 999) / 1000}s " +
+                $"probe {(session.UpwardAdaptationEnabled ? "on" : "off")} | " +
+                $"p95 pipe/cap/net/dec {Metric(session.LastServerPipelineP95Ms)}/" +
+                $"{Metric(session.LastCaptureToReceiveP95Ms)}/{Metric(clientTransportP95Ms)}/" +
+                $"{Metric(session.LastDecodeToSurfaceP95Ms)}ms";
 
             if (!headless)
             {
@@ -273,16 +293,14 @@ try
                     $"client dropped {session.LastClientFramesDropped,3} | IDR req/s {idrDelta} | " +
                     $"cap {realDelta}re/{pointerDelta}po/{timeoutDelta}to ~{presentsPerSec}pres | " +
                     $"{audioStatus} | {gamepadStatus}");
-                Console.WriteLine(
-                    $"[diag] likely={bottleneck} | host {presentsPerSec} present -> " +
-                    $"{submittedFps} submit -> {fps} encode -> {sentFps} send | " +
-                    $"android {Metric(clientAssembledFps)} assemble -> {Metric(clientDecodedFps)} render | " +
-                    $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
-                    $"fec-fix {Metric(session.LastClientFecRecovered)} | " +
-                    $"udp pkts tx {sentPackets}/s rx {Metric(clientPacketRate)}/s fec {Metric(clientFecPacketRate)}/s " +
-                    $"err {sendFailures} pace {pacingMs}ms | " +
-                    $"p95 pipe/net/dec {Metric(session.LastServerPipelineP95Ms)}/" +
-                    $"{Metric(session.LastCaptureToReceiveP95Ms)}/{Metric(session.LastDecodeToSurfaceP95Ms)}ms");
+                Console.WriteLine(diagnosticLine);
+                // GUI/non-headless runs previously wrote diagnostics only to the console, so the
+                // collected deskstream.app.log lacked the evidence needed for field debugging.
+                if (++appDiagTicks >= 10)
+                {
+                    AsyncLogger.Info(diagnosticLine);
+                    appDiagTicks = 0;
+                }
             }
             else
             {
@@ -304,15 +322,19 @@ try
                         $"[stats10s] host ~{win10SubmitFps / win10Ticks} submit -> " +
                         $"{win10EncFps / win10Ticks} encode -> {win10SentFps / win10Ticks} send fps | " +
                         $"android {Metric(clientAssembledFps)} assemble -> {Metric(clientDecodedFps)} render fps | " +
-                        $"sent ~{win10SentKbps / win10Ticks} kbps @ {session.CurrentBitrateKbps} kbps | " +
+                        $"sent ~{win10SentKbps / win10Ticks} kbps @ " +
+                        $"{session.CurrentBitrateKbps}/{session.BitrateCeilingKbps} kbps " +
+                        $"hold {(session.AdaptationHoldRemainingMs + 999) / 1000}s " +
+                        $"probe {(session.UpwardAdaptationEnabled ? "on" : "off")} | " +
                         $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
                         $"fec-fix {Metric(session.LastClientFecRecovered)} total-max {win10MaxDropped} | " +
                         $"udp last tx {sentPackets}/s rx {Metric(clientPacketRate)}/s err {sendFailures} " +
                         $"pace {pacingMs}ms | IDR req {win10Idr} | " +
                         $"cap {win10Re}re/{win10Po}po/{win10To}to ~{win10Pres}pres | " +
-                        $"likely {bottleneck} p95 pipe/net/dec " +
+                        $"likely {bottleneck} p95 pipe/cap/net/dec " +
                         $"{Metric(session.LastServerPipelineP95Ms)}/" +
                         $"{Metric(session.LastCaptureToReceiveP95Ms)}/" +
+                        $"{Metric(clientTransportP95Ms)}/" +
                         $"{Metric(session.LastDecodeToSurfaceP95Ms)}ms");
                     ResetWindow10();
                 }
@@ -321,6 +343,7 @@ try
         else
         {
             ResetWindow10();
+            appDiagTicks = 0;
             prevEncoded = 0;
             prevIdr = 0;
             prevAudioBytes = 0;
@@ -367,7 +390,6 @@ static string DiagnoseBottleneck(
     int assemblyDrops,
     int decoderDrops,
     int fecRecovered,
-    int pipelineP95Ms,
     int networkP95Ms,
     int decoderP95Ms,
     bool endpointReady)
@@ -390,8 +412,7 @@ static string DiagnoseBottleneck(
         (assembled >= 0 && decoded >= 0 && decoded + 3 < assembled) ||
         decoderP95Ms > 50)
         return "android-decoder";
-    if (networkP95Ms > 80 &&
-        (pipelineP95Ms < 0 || networkP95Ms - pipelineP95Ms > 50))
+    if (networkP95Ms > 80)
         return "wifi-jitter";
     if (decoded >= low) return "healthy";
     return "client/network-underrun";
