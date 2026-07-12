@@ -11,8 +11,8 @@ android {
         applicationId = "com.deskstream.client"
         minSdk = 26
         targetSdk = 34
-        versionCode = 12
-        versionName = "0.5.6"
+        versionCode = 21
+        versionName = "0.8.0"
     }
 
     buildTypes {

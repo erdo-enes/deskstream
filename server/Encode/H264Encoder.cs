@@ -202,7 +202,8 @@ public sealed class H264Encoder : IVideoEncoder
             (uint)Math.Max(4096, (long)bitrate / 8 / _fps));
         // 33 is the fastest edge of Microsoft's documented low-complexity range (0..33).
         TrySetCodecU32(MfGuids.CODECAPI_AVEncCommonQualityVsSpeed, 33);
-        TrySetCodecU32(MfGuids.CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+        if (_codecApi == null || _codecApi.IsModifiable(MfGuids.CODECAPI_AVEncMPVDefaultBPictureCount))
+            TrySetCodecU32(MfGuids.CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         TrySetCodecU32(MfGuids.CODECAPI_AVEncMPVGOPSize, 0xFFFF);
 
         // 6) Cache the negotiated sequence header (SPS/PPS) if the encoder exposes it.

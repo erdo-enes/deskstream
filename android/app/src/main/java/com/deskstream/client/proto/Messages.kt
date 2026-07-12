@@ -110,18 +110,32 @@ object ClientMessages {
 
     fun stats(
         framesOk: Int,
+        framesAssembled: Int,
         framesDropped: Int,
+        assemblyFramesDropped: Int,
+        decoderFramesDropped: Int,
+        fecPacketsRecovered: Int,
+        videoPacketsReceived: Int,
+        fecPacketsReceived: Int,
         bytes: Long,
         intervalMs: Long,
+        serverPipelineP95Ms: Int,
         captureToReceiveP95Ms: Int,
         decodeToSurfaceP95Ms: Int
     ): String =
         JSONObject().apply {
             put("type", "STATS")
             put("framesOk", framesOk)
+            put("framesAssembled", framesAssembled)
             put("framesDropped", framesDropped)
+            put("assemblyFramesDropped", assemblyFramesDropped)
+            put("decoderFramesDropped", decoderFramesDropped)
+            put("fecPacketsRecovered", fecPacketsRecovered)
+            put("videoPacketsReceived", videoPacketsReceived)
+            put("fecPacketsReceived", fecPacketsReceived)
             put("bytes", bytes)
             put("intervalMs", intervalMs)
+            put("serverPipelineP95Ms", serverPipelineP95Ms)
             put("captureToReceiveP95Ms", captureToReceiveP95Ms)
             put("decodeToSurfaceP95Ms", decodeToSurfaceP95Ms)
         }.toString()

@@ -104,6 +104,7 @@ public sealed class StreamSession : IDisposable
 
     // Stats surfaced to the console (Program reads these)
     private long _encodedFrames;
+    private long _captureSubmittedFrames;
     private int _capturedSinceEncode;
     private long _idrRequestTotal;
     private int _pipelineFaultHandling;
@@ -114,6 +115,19 @@ public sealed class StreamSession : IDisposable
     public int Fps { get; private set; } = 60;
     public int CurrentBitrateKbps => _currentBitrateKbps;
     public int LastClientFramesDropped { get; private set; }
+    public int LastClientFramesOk { get; private set; }
+    public int LastClientFramesAssembled { get; private set; } = -1;
+    public int LastClientAssemblyDrops { get; private set; } = -1;
+    public int LastClientDecoderDrops { get; private set; } = -1;
+    public int LastClientFecRecovered { get; private set; } = -1;
+    public int LastClientVideoPackets { get; private set; } = -1;
+    public int LastClientFecPackets { get; private set; } = -1;
+    public int LastClientStatsIntervalMs { get; private set; }
+    public int LastServerPipelineP95Ms { get; private set; } = -1;
+    public int LastCaptureToReceiveP95Ms { get; private set; } = -1;
+    public int LastDecodeToSurfaceP95Ms { get; private set; } = -1;
+    public long LastClientStatsAgeMs => _lastClientStatsAtMs <= 0 ? long.MaxValue : NowMs() - _lastClientStatsAtMs;
+    private long _lastClientStatsAtMs;
 
     // Surfaced to the web dashboard.
     public string ClientName => _clientName;
@@ -126,12 +140,16 @@ public sealed class StreamSession : IDisposable
     /// <summary>The pending pairing PIN while awaiting a PAIR_CODE, otherwise null.</summary>
     public string? PendingPin => _state == SessionState.AwaitingPairCode ? _pin : null;
     public long EncodedFrames => Interlocked.Read(ref _encodedFrames);
+    public long CaptureSubmittedFrames => Interlocked.Read(ref _captureSubmittedFrames);
     public long IdrRequestTotal => Interlocked.Read(ref _idrRequestTotal);
     public long AudioPacketsSent => _audioSender?.PacketsSent ?? 0;
     public long AudioBytesSent => _audioSender?.BytesSent ?? 0;
     public bool MediaEndpointReady => _sender?.HasClient == true;
     public long MediaFramesSent => _sender?.FramesSent ?? 0;
     public long MediaBytesSent => _sender?.BytesSent ?? 0;
+    public long MediaPacketsSent => _sender?.PacketsSent ?? 0;
+    public long MediaSendFailures => _sender?.SendFailures ?? 0;
+    public long MediaPacingWaitUs => _sender?.PacingWaitUs ?? 0;
 
     // Capture-pipeline diagnostics (Program composes the 1 Hz stats line from per-second deltas).
     public long CaptureRealFrames => _duplicator?.RealFrames ?? 0;
@@ -619,7 +637,7 @@ public sealed class StreamSession : IDisposable
             _streamHeight,
             Fps);
 
-        _currentBitrateKbps = Math.Min(8000, _maxBitrateKbps); // start bitrate (PROTOCOL.md §4)
+        _currentBitrateKbps = Math.Min(12000, _maxBitrateKbps); // start bitrate (PROTOCOL.md §4)
         _encoder = EncoderFactory.Create(
             _duplicator.Device,
             _streamWidth,
@@ -632,6 +650,8 @@ public sealed class StreamSession : IDisposable
         _sender!.SetPacingRate(_currentBitrateKbps, Fps);
 
         _frameId = 0;
+        Interlocked.Exchange(ref _encodedFrames, 0);
+        Interlocked.Exchange(ref _captureSubmittedFrames, 0);
         Interlocked.Exchange(ref _pipelineFaultHandling, 0);
         Interlocked.Exchange(ref _endpointIdrPending, 1);
         _lastNv12 = null;
@@ -646,6 +666,19 @@ public sealed class StreamSession : IDisposable
         _bestCaptureToReceiveMs = int.MaxValue;
         _bestDecodeToSurfaceMs = int.MaxValue;
         _latencyGrowingStreak = 0;
+        LastClientFramesDropped = 0;
+        LastClientFramesOk = 0;
+        LastClientFramesAssembled = -1;
+        LastClientAssemblyDrops = -1;
+        LastClientDecoderDrops = -1;
+        LastClientFecRecovered = -1;
+        LastClientVideoPackets = -1;
+        LastClientFecPackets = -1;
+        LastClientStatsIntervalMs = 0;
+        LastServerPipelineP95Ms = -1;
+        LastCaptureToReceiveP95Ms = -1;
+        LastDecodeToSurfaceP95Ms = -1;
+        _lastClientStatsAtMs = 0;
         _clockBaseUs = NowUs();
         _clock = Stopwatch.StartNew();
 
@@ -660,10 +693,23 @@ public sealed class StreamSession : IDisposable
         _captureThread.Start();
     }
 
+    /// <summary>
+    /// Capture loop — simple blocking acquire with continue-based rate limiting.
+    ///
+    /// This is the v0.4.0 approach that was proven to work for 1080p60 gaming:
+    ///   1. TryAcquire(100) blocks until DXGI has a frame (up to 100ms). At 60fps the
+    ///      frame arrives in ~16ms, so the call returns naturally — DXGI IS the pacer.
+    ///   2. If the frame arrived before the next interval (120/144Hz display), continue
+    ///      skips encoding and re-acquires. This prevents >60fps without sleeping.
+    ///   3. No pre-acquire sleep, no post-false sleep — the blocking acquire handles both
+    ///      pacing and idle. MMCSS + GPUThreadPriority=7 ensure the thread gets scheduled
+    ///      under 100% game load.
+    ///
+    /// The v0.5.x changes (micro-pacing sleep, Sleep(50) on false, frame pacing group)
+    /// all introduced timing issues that caused stutter. This loop is deliberately simple.
+    /// </summary>
     private void CaptureLoop(CancellationToken ct)
     {
-        // Register with the MMCSS "Games" scheduling class so the capture thread keeps getting CPU
-        // under a fullscreen game's 100% load. Guarded + reverted on exit; failure is tolerated.
         IntPtr mmcss = NativeMethods.JoinGamesMmcss();
         try
         {
@@ -671,36 +717,12 @@ public sealed class StreamSession : IDisposable
             long nextFrameTicks = Stopwatch.GetTimestamp();
             while (!ct.IsCancellationRequested)
             {
-                long nowTicks = Stopwatch.GetTimestamp();
-                if (nowTicks < nextFrameTicks)
+                if (_duplicator!.TryAcquire(100, out var bgra))
                 {
-                    long remainingTicks = nextFrameTicks - nowTicks;
-                    long remainingMs = remainingTicks * 1000 / Stopwatch.Frequency;
-                    if (remainingMs > 1)
-                    {
-                        Thread.Sleep((int)(remainingMs - 1));
-                    }
-                    while (Stopwatch.GetTimestamp() < nextFrameTicks)
-                    {
-                        Thread.SpinWait(5);
-                    }
-                }
-
-                long acquireStart = Stopwatch.GetTimestamp();
-                bool acquired = _duplicator!.TryAcquire(100, out var bgra);
-                long acquireEnd = Stopwatch.GetTimestamp();
-
-                if (acquired)
-                {
-                    nowTicks = acquireEnd;
-                    if (nowTicks > nextFrameTicks + frameIntervalTicks * 2)
-                    {
-                        nextFrameTicks = nowTicks + frameIntervalTicks;
-                    }
-                    else
-                    {
-                        nextFrameTicks += frameIntervalTicks;
-                    }
+                    long nowTicks = Stopwatch.GetTimestamp();
+                    if (nowTicks < nextFrameTicks)
+                        continue; // Desktop may present at 120/144/240 Hz; honor requested FPS.
+                    nextFrameTicks = nowTicks + frameIntervalTicks;
 
                     if (Interlocked.Increment(ref _capturedSinceEncode) > Fps * 3)
                         throw new InvalidOperationException("The hardware encoder stopped producing frames");
@@ -708,24 +730,13 @@ public sealed class StreamSession : IDisposable
                     Volatile.Write(ref _lastNv12, nv12);
                     SubmitCapture(nv12);
                 }
-                else
+                else if (Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
                 {
-                    nextFrameTicks = acquireEnd;
-
-                    long elapsedMs = (acquireEnd - acquireStart) * 1000 / Stopwatch.Frequency;
-                    if (elapsedMs < 10)
-                    {
-                        Thread.Sleep(50);
-                    }
-
-                    if (Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
-                    {
-                        var latest = Volatile.Read(ref _lastNv12);
-                        if (latest != null)
-                            SubmitCapture(latest, forceIdr: true);
-                        else
-                            Interlocked.Exchange(ref _endpointIdrPending, 1);
-                    }
+                    var latest = Volatile.Read(ref _lastNv12);
+                    if (latest != null)
+                        SubmitCapture(latest, forceIdr: true);
+                    else
+                        Interlocked.Exchange(ref _endpointIdrPending, 1);
                 }
             }
         }
@@ -736,8 +747,6 @@ public sealed class StreamSession : IDisposable
             if (!ct.IsCancellationRequested &&
                 Interlocked.CompareExchange(ref _pipelineFaultHandling, 1, 0) == 0)
             {
-                // This cannot run on the capture thread: StopPipeline joins that thread and
-                // tears down the encoder. Move it off-thread, but keep the TCP session alive.
                 _ = Task.Run(() => StopFaultedPipeline(ex));
             }
         }
@@ -752,6 +761,7 @@ public sealed class StreamSession : IDisposable
         if (forceIdr || Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
             _encoder!.RequestIdr();
         uint pts = (uint)(_clock!.ElapsedMilliseconds & 0xFFFFFFFF);
+        Interlocked.Increment(ref _captureSubmittedFrames);
         _encoder!.Submit(nv12, pts);
     }
 
@@ -949,9 +959,21 @@ public sealed class StreamSession : IDisposable
             return;
 
         LastClientFramesDropped = s.FramesDropped;
+        LastClientFramesOk = s.FramesOk;
+        LastClientFramesAssembled = s.FramesAssembled;
+        LastClientAssemblyDrops = s.AssemblyFramesDropped;
+        LastClientDecoderDrops = s.DecoderFramesDropped;
+        LastClientFecRecovered = s.FecPacketsRecovered;
+        LastClientVideoPackets = s.VideoPacketsReceived;
+        LastClientFecPackets = s.FecPacketsReceived;
+        LastClientStatsIntervalMs = s.IntervalMs;
+        LastServerPipelineP95Ms = s.ServerPipelineP95Ms;
+        LastCaptureToReceiveP95Ms = s.CaptureToReceiveP95Ms;
+        LastDecodeToSurfaceP95Ms = s.DecodeToSurfaceP95Ms;
+        _lastClientStatsAtMs = NowMs();
 
-        // Skip adaptation during the first 5 seconds to avoid startup transient triggers.
-        if (_clock == null || _clock.ElapsedMilliseconds < 5000)
+        // Skip adaptation during the first 2 seconds to avoid startup transient triggers.
+        if (_clock == null || _clock.ElapsedMilliseconds < 2000)
             return;
 
         int total = s.FramesOk + s.FramesDropped;

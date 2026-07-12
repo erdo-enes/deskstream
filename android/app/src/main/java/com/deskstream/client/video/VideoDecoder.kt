@@ -590,6 +590,9 @@ class VideoDecoder(
         private const val MIME_TYPE = "video/avc"
         private const val MIN_FPS = 24
         private const val MAX_FPS = 240
+        // This is only a producer-to-codec handoff bound, not a render queue. A 120 ms ceiling
+        // absorbs short Android scheduler/vendor-codec stalls without decoding stale video;
+        // the previous 3-frame/50 ms limit repeatedly broke healthy reference chains at 60 fps.
         private const val MAX_PENDING_FRAMES = 6
         private const val MAX_PENDING_AGE_US = 120_000L
         private const val CODEC_STARTUP_GRACE_US = 1_000_000L

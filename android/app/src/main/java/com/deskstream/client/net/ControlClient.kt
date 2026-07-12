@@ -215,15 +215,25 @@ object ControlClient {
 
     fun sendStats(
         framesOk: Int,
+        framesAssembled: Int,
         framesDropped: Int,
+        assemblyFramesDropped: Int,
+        decoderFramesDropped: Int,
+        fecPacketsRecovered: Int,
+        videoPacketsReceived: Int,
+        fecPacketsReceived: Int,
         bytes: Long,
         intervalMs: Long,
+        serverPipelineP95Ms: Int,
         captureToReceiveP95Ms: Int,
         decodeToSurfaceP95Ms: Int
     ) {
         scope.launch {
             writeFrame(ClientMessages.stats(
-                framesOk, framesDropped, bytes, intervalMs,
+                framesOk, framesAssembled, framesDropped,
+                assemblyFramesDropped, decoderFramesDropped,
+                fecPacketsRecovered, videoPacketsReceived, fecPacketsReceived,
+                bytes, intervalMs, serverPipelineP95Ms,
                 captureToReceiveP95Ms, decodeToSurfaceP95Ms
             ))
         }

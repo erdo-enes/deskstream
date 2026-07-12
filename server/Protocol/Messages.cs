@@ -99,9 +99,16 @@ public sealed class GamepadStartMessage
 public sealed class StatsMessage
 {
     [JsonPropertyName("framesOk")] public int FramesOk { get; set; }
+    [JsonPropertyName("framesAssembled")] public int FramesAssembled { get; set; } = -1;
     [JsonPropertyName("framesDropped")] public int FramesDropped { get; set; }
+    [JsonPropertyName("assemblyFramesDropped")] public int AssemblyFramesDropped { get; set; } = -1;
+    [JsonPropertyName("decoderFramesDropped")] public int DecoderFramesDropped { get; set; } = -1;
+    [JsonPropertyName("fecPacketsRecovered")] public int FecPacketsRecovered { get; set; } = -1;
+    [JsonPropertyName("videoPacketsReceived")] public int VideoPacketsReceived { get; set; } = -1;
+    [JsonPropertyName("fecPacketsReceived")] public int FecPacketsReceived { get; set; } = -1;
     [JsonPropertyName("bytes")] public long Bytes { get; set; }
     [JsonPropertyName("intervalMs")] public int IntervalMs { get; set; }
+    [JsonPropertyName("serverPipelineP95Ms")] public int ServerPipelineP95Ms { get; set; } = -1;
     [JsonPropertyName("captureToReceiveP95Ms")] public int CaptureToReceiveP95Ms { get; set; } = -1;
     [JsonPropertyName("decodeToSurfaceP95Ms")] public int DecodeToSurfaceP95Ms { get; set; } = -1;
 }

@@ -184,9 +184,9 @@ class FrameAssemblerTest {
         )
         val first = ByteArray(1200) { 0x35 }
         val last = ByteArray(16) { 0x6A }
-        val parity = ByteArray(1200) { index ->
-            (first[index].toInt() xor if (index < last.size) last[index].toInt() else 0).toByte()
-        }
+        // Interleaved FEC with two packets creates one parity group per packet. Group zero's
+        // parity is therefore the first packet itself.
+        val parity = first.copyOf()
 
         assembler.accept(
             packet(
@@ -213,6 +213,46 @@ class FrameAssemblerTest {
         assertEquals(1216, completedLength)
         assertTrue(completedData!!.copyOfRange(0, 1200).all { it == 0x35.toByte() })
         assertTrue(completedData!!.copyOfRange(1200, 1216).all { it == 0x6A.toByte() })
+        assertEquals(1, assembler.consumeFecRecoveredPackets())
+        assertEquals(0, assembler.consumeFecRecoveredPackets())
+    }
+
+    @Test
+    fun interleavedFec_recoversFourPacketBurst() {
+        var completedLength = 0
+        val assembler = FrameAssembler(
+            bufferPool = BufferPool(),
+            onFrameComplete = { _, length, _, _, _, _ -> completedLength = length },
+            onFrameDropped = { _, _ -> }
+        )
+        val payloads = Array(8) { index ->
+            ByteArray(if (index == 7) 16 else 1200) { (index + 1).toByte() }
+        }
+
+        // Lose packets 0..3. Each lands in a different interleaved parity group with 4..7.
+        for (index in 4..7) {
+            assembler.accept(
+                packet(71, index, 8, keyframe = true, payload = payloads[index]),
+                nowMs = index.toLong()
+            )
+        }
+        for (group in 0..3) {
+            val parity = ByteArray(1200) { offset ->
+                val tail = if (offset < payloads[group + 4].size) {
+                    payloads[group + 4][offset].toInt()
+                } else {
+                    0
+                }
+                (payloads[group][offset].toInt() xor tail).toByte()
+            }
+            assembler.accept(
+                packet(71, group, 8, keyframe = true, fec = true, payload = parity),
+                nowMs = (8 + group).toLong()
+            )
+        }
+
+        assertEquals(7 * 1200 + 16, completedLength)
+        assertEquals(4, assembler.consumeFecRecoveredPackets())
     }
 
     @Test
@@ -279,7 +319,7 @@ class FrameAssemblerTest {
         putU32(bytes, 4, frameId)
         putU16(bytes, 8, packetIndex)
         putU16(bytes, 10, packetCount)
-        putU16(bytes, 12, (packetCount + 7) / 8)
+        putU16(bytes, 12, minOf(4, packetCount))
         putU32(bytes, 14, frameId * 16)
         putU16(bytes, 18, 2)
         if (payload != null) {

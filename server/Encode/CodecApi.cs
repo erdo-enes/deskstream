@@ -61,6 +61,14 @@ internal sealed class CodecApi : IDisposable
         catch { return false; }
     }
 
+    public bool IsModifiable(Guid key)
+    {
+        if (_api == null)
+            return false;
+        try { return _api.IsModifiable(ref key) == 0; }
+        catch { return false; }
+    }
+
     /// <summary>Sets a VT_UI4 property. Returns the raw HRESULT (0 on success).</summary>
     public int SetUInt32(Guid key, uint value)
     {

@@ -153,6 +153,10 @@ long prevIdr = 0;
 long prevAudioBytes = 0;
 long prevMediaFrames = 0;
 long prevMediaBytes = 0;
+long prevMediaPackets = 0;
+long prevMediaFailures = 0;
+long prevPacingWaitUs = 0;
+long prevSubmitted = 0;
 long prevCapReal = 0;
 long prevCapPointer = 0;
 long prevCapTimeouts = 0;
@@ -162,14 +166,14 @@ long prevCapAccum = 0;
 // summary and emit it to the app log once every 10 s — the only stream telemetry a headless
 // field log otherwise has. Consistent with v0.5.2 (which suppressed the unbounded 1 Hz line).
 int win10Ticks = 0;
-long win10EncFps = 0, win10SentKbps = 0, win10Idr = 0;
+long win10SubmitFps = 0, win10EncFps = 0, win10SentFps = 0, win10SentKbps = 0, win10Idr = 0;
 long win10Re = 0, win10Po = 0, win10To = 0, win10Pres = 0;
 int win10MaxDropped = 0;
 
 void ResetWindow10()
 {
     win10Ticks = 0;
-    win10EncFps = win10SentKbps = win10Idr = 0;
+    win10SubmitFps = win10EncFps = win10SentFps = win10SentKbps = win10Idr = 0;
     win10Re = win10Po = win10To = win10Pres = 0;
     win10MaxDropped = 0;
 }
@@ -191,9 +195,19 @@ try
             long audioKbps = Math.Max(0, (audioBytes - prevAudioBytes) * 8 / 1000);
             long mediaFrames = session.MediaFramesSent;
             long mediaBytes = session.MediaBytesSent;
+            long mediaPackets = session.MediaPacketsSent;
+            long mediaFailures = session.MediaSendFailures;
+            long pacingWaitUs = session.MediaPacingWaitUs;
+            long submitted = session.CaptureSubmittedFrames;
             long sentFps = mediaFrames >= prevMediaFrames ? mediaFrames - prevMediaFrames : 0;
+            long submittedFps = submitted >= prevSubmitted ? submitted - prevSubmitted : 0;
             long mediaKbps = mediaBytes >= prevMediaBytes
                 ? (mediaBytes - prevMediaBytes) * 8 / 1000
+                : 0;
+            long sentPackets = mediaPackets >= prevMediaPackets ? mediaPackets - prevMediaPackets : 0;
+            long sendFailures = mediaFailures >= prevMediaFailures ? mediaFailures - prevMediaFailures : 0;
+            long pacingMs = pacingWaitUs >= prevPacingWaitUs
+                ? (pacingWaitUs - prevPacingWaitUs) / 1000
                 : 0;
 
             long capReal = session.CaptureRealFrames;
@@ -213,6 +227,10 @@ try
             prevAudioBytes = audioBytes;
             prevMediaFrames = mediaFrames;
             prevMediaBytes = mediaBytes;
+            prevMediaPackets = mediaPackets;
+            prevMediaFailures = mediaFailures;
+            prevPacingWaitUs = pacingWaitUs;
+            prevSubmitted = submitted;
             prevCapReal = capReal;
             prevCapPointer = capPointer;
             prevCapTimeouts = capTimeouts;
@@ -225,6 +243,28 @@ try
                 ? $"gamepads {session.GamepadCount}"
                 : "gamepads off";
 
+            bool clientStatsFresh = session.LastClientStatsAgeMs < 3000;
+            int clientInterval = Math.Max(1, session.LastClientStatsIntervalMs);
+            long clientDecodedFps = clientStatsFresh
+                ? RatePerSecond(session.LastClientFramesOk, clientInterval)
+                : -1;
+            long clientAssembledFps = clientStatsFresh && session.LastClientFramesAssembled >= 0
+                ? RatePerSecond(session.LastClientFramesAssembled, clientInterval)
+                : -1;
+            long clientPacketRate = clientStatsFresh && session.LastClientVideoPackets >= 0
+                ? RatePerSecond(session.LastClientVideoPackets, clientInterval)
+                : -1;
+            long clientFecPacketRate = clientStatsFresh && session.LastClientFecPackets >= 0
+                ? RatePerSecond(session.LastClientFecPackets, clientInterval)
+                : -1;
+            string bottleneck = DiagnoseBottleneck(
+                session.Fps, presentsPerSec, submittedFps, fps, sentFps,
+                clientStatsFresh, clientAssembledFps, clientDecodedFps,
+                session.LastClientAssemblyDrops, session.LastClientDecoderDrops,
+                session.LastClientFecRecovered, session.LastServerPipelineP95Ms,
+                session.LastCaptureToReceiveP95Ms, session.LastDecodeToSurfaceP95Ms,
+                session.MediaEndpointReady);
+
             if (!headless)
             {
                 Console.WriteLine(
@@ -233,12 +273,24 @@ try
                     $"client dropped {session.LastClientFramesDropped,3} | IDR req/s {idrDelta} | " +
                     $"cap {realDelta}re/{pointerDelta}po/{timeoutDelta}to ~{presentsPerSec}pres | " +
                     $"{audioStatus} | {gamepadStatus}");
+                Console.WriteLine(
+                    $"[diag] likely={bottleneck} | host {presentsPerSec} present -> " +
+                    $"{submittedFps} submit -> {fps} encode -> {sentFps} send | " +
+                    $"android {Metric(clientAssembledFps)} assemble -> {Metric(clientDecodedFps)} render | " +
+                    $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
+                    $"fec-fix {Metric(session.LastClientFecRecovered)} | " +
+                    $"udp pkts tx {sentPackets}/s rx {Metric(clientPacketRate)}/s fec {Metric(clientFecPacketRate)}/s " +
+                    $"err {sendFailures} pace {pacingMs}ms | " +
+                    $"p95 pipe/net/dec {Metric(session.LastServerPipelineP95Ms)}/" +
+                    $"{Metric(session.LastCaptureToReceiveP95Ms)}/{Metric(session.LastDecodeToSurfaceP95Ms)}ms");
             }
             else
             {
                 // Accumulate a bounded 10 s summary for the headless app log.
                 win10Ticks++;
+                win10SubmitFps += submittedFps;
                 win10EncFps += fps;
+                win10SentFps += sentFps;
                 win10SentKbps += mediaKbps;
                 win10Idr += idrDelta;
                 win10Re += realDelta;
@@ -249,10 +301,19 @@ try
                 if (win10Ticks >= 10)
                 {
                     AsyncLogger.Info(
-                        $"[stats10s] enc ~{win10EncFps / win10Ticks} fps | " +
+                        $"[stats10s] host ~{win10SubmitFps / win10Ticks} submit -> " +
+                        $"{win10EncFps / win10Ticks} encode -> {win10SentFps / win10Ticks} send fps | " +
+                        $"android {Metric(clientAssembledFps)} assemble -> {Metric(clientDecodedFps)} render fps | " +
                         $"sent ~{win10SentKbps / win10Ticks} kbps @ {session.CurrentBitrateKbps} kbps | " +
-                        $"client dropped max {win10MaxDropped} | IDR req {win10Idr} | " +
-                        $"cap {win10Re}re/{win10Po}po/{win10To}to ~{win10Pres}pres");
+                        $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
+                        $"fec-fix {Metric(session.LastClientFecRecovered)} total-max {win10MaxDropped} | " +
+                        $"udp last tx {sentPackets}/s rx {Metric(clientPacketRate)}/s err {sendFailures} " +
+                        $"pace {pacingMs}ms | IDR req {win10Idr} | " +
+                        $"cap {win10Re}re/{win10Po}po/{win10To}to ~{win10Pres}pres | " +
+                        $"likely {bottleneck} p95 pipe/net/dec " +
+                        $"{Metric(session.LastServerPipelineP95Ms)}/" +
+                        $"{Metric(session.LastCaptureToReceiveP95Ms)}/" +
+                        $"{Metric(session.LastDecodeToSurfaceP95Ms)}ms");
                     ResetWindow10();
                 }
             }
@@ -265,6 +326,10 @@ try
             prevAudioBytes = 0;
             prevMediaFrames = 0;
             prevMediaBytes = 0;
+            prevMediaPackets = 0;
+            prevMediaFailures = 0;
+            prevPacingWaitUs = 0;
+            prevSubmitted = 0;
             prevCapReal = 0;
             prevCapPointer = 0;
             prevCapTimeouts = 0;
@@ -284,6 +349,53 @@ if (OperatingSystem.IsWindows())
     try { NativeMethods.TimeEndPeriod(1); } catch { }
 }
 return 0;
+
+static long RatePerSecond(int count, int intervalMs) =>
+    intervalMs > 0 ? Math.Max(0, count) * 1000L / intervalMs : -1;
+
+static string Metric(long value) => value < 0 ? "-" : value.ToString();
+
+static string DiagnoseBottleneck(
+    int targetFps,
+    long presents,
+    long submitted,
+    long encoded,
+    long sent,
+    bool clientFresh,
+    long assembled,
+    long decoded,
+    int assemblyDrops,
+    int decoderDrops,
+    int fecRecovered,
+    int pipelineP95Ms,
+    int networkP95Ms,
+    int decoderP95Ms,
+    bool endpointReady)
+{
+    if (!endpointReady) return "media-endpoint";
+    long low = Math.Max(1, targetFps * 85L / 100L);
+
+    // Follow the pipeline in order. The first stage that falls materially below target is the
+    // most useful place to investigate; later stages cannot exceed its input rate.
+    if (presents < low) return "host-present-rate";
+    if (submitted < low) return "server-capture/convert";
+    if (encoded < Math.Min(low, submitted - 2)) return "server-encoder";
+    if (sent < Math.Min(low, encoded - 2)) return "server-udp-send";
+    if (!clientFresh) return "client-stats-missing";
+
+    if (assemblyDrops > 0 || fecRecovered > 2 ||
+        (assembled >= 0 && sent >= low && assembled + 3 < sent))
+        return "wifi/udp-loss";
+    if (decoderDrops > 0 ||
+        (assembled >= 0 && decoded >= 0 && decoded + 3 < assembled) ||
+        decoderP95Ms > 50)
+        return "android-decoder";
+    if (networkP95Ms > 80 &&
+        (pipelineP95Ms < 0 || networkP95Ms - pipelineP95Ms > 50))
+        return "wifi-jitter";
+    if (decoded >= low) return "healthy";
+    return "client/network-underrun";
+}
 
 static IEnumerable<string> LocalIPv4Addresses()
 {

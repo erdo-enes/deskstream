@@ -82,6 +82,10 @@ class MediaReceiver(
     private val framesAssembled = AtomicInteger(0)
     private val framesDecoded = AtomicInteger(0)
     private val framesDropped = AtomicInteger(0)
+    private val assemblyFramesDropped = AtomicInteger(0)
+    private val decoderFramesDropped = AtomicInteger(0)
+    private val videoPacketsReceived = AtomicInteger(0)
+    private val fecPacketsReceived = AtomicInteger(0)
     private val bytesReceived = AtomicLong(0)
 
     private val frameAssembler = FrameAssembler(
@@ -96,6 +100,10 @@ class MediaReceiver(
         },
         onFrameDropped = { requestIdr, droppedFrames ->
             framesDropped.addAndGet(droppedFrames)
+            assemblyFramesDropped.addAndGet(droppedFrames)
+            // One missing H.264 reference invalidates every following predictive frame. Ask for
+            // the replacement IDR immediately; ControlClient coalesces duplicate requests, while
+            // waiting for a second drop can deadlock because the assembler now discards P-frames.
             if (requestIdr) ControlClient.requestIdr()
         }
     )
@@ -221,6 +229,7 @@ class MediaReceiver(
      * keyframe so we never decode across a reference gap. */
     fun notifyExternalDrop() {
         framesDropped.incrementAndGet()
+        decoderFramesDropped.incrementAndGet()
         ControlClient.requestIdr()
         frameAssembler.requestDiscardUntilKeyframe()
     }
@@ -323,6 +332,8 @@ class MediaReceiver(
                 continue
             }
             if (mediaHeader.version != 1) continue
+            videoPacketsReceived.incrementAndGet()
+            if (mediaHeader.fec) fecPacketsReceived.incrementAndGet()
             // Completion, not mere packet arrival, advances the recovery watchdog. This catches
             // a lost startup IDR even while unusable P-frame packets continue arriving.
             frameAssembler.onPacket(mediaHeader, buf, MediaPacketHeader.HEADER_SIZE, receivedAt)
@@ -348,11 +359,30 @@ class MediaReceiver(
             val assembled = framesAssembled.getAndSet(0)
             val ok = framesDecoded.getAndSet(0)
             val dropped = framesDropped.getAndSet(0)
+            val assemblyDropped = assemblyFramesDropped.getAndSet(0)
+            val decoderDropped = decoderFramesDropped.getAndSet(0)
+            val packets = videoPacketsReceived.getAndSet(0)
+            val fecPackets = fecPacketsReceived.getAndSet(0)
+            val fecRecovered = frameAssembler.consumeFecRecoveredPackets()
             val bytes = bytesReceived.getAndSet(0)
             val captureP95 = captureLatency.drainP95()
             val decoderP95 = decoderLatency.drainP95()
             val encoderP95 = encoderLatency.drainP95()
-            ControlClient.sendStats(ok, dropped, bytes, intervalMs, captureP95, decoderP95)
+            ControlClient.sendStats(
+                framesOk = ok,
+                framesAssembled = assembled,
+                framesDropped = dropped,
+                assemblyFramesDropped = assemblyDropped,
+                decoderFramesDropped = decoderDropped,
+                fecPacketsRecovered = fecRecovered,
+                videoPacketsReceived = packets,
+                fecPacketsReceived = fecPackets,
+                bytes = bytes,
+                intervalMs = intervalMs,
+                serverPipelineP95Ms = encoderP95,
+                captureToReceiveP95Ms = captureP95,
+                decodeToSurfaceP95Ms = decoderP95
+            )
 
             val total = ok + dropped
             val lossPercent = if (total > 0) dropped * 100f / total else 0f
@@ -435,19 +465,19 @@ class MediaReceiver(
 }
 
 private class LatencyWindow {
-    private val values = ArrayList<Int>(256)
+    private val values = ArrayDeque<Int>()
     private val lock = Any()
 
     fun add(value: Int) = synchronized(lock) {
-        if (values.size >= 256) values.removeAt(0)
-        values.add(value)
+        if (values.size >= 256) values.removeFirst()
+        values.addLast(value)
     }
 
     fun drainP95(): Int = synchronized(lock) {
         if (values.isEmpty()) return@synchronized -1
-        values.sort()
-        val index = ((values.size - 1) * 0.95).toInt()
-        val result = values[index]
+        val sorted = values.sorted()
+        val index = ((sorted.size - 1) * 0.95).toInt()
+        val result = sorted[index]
         values.clear()
         result
     }
@@ -464,6 +494,8 @@ private const val MAX_INFLIGHT_FRAMES = 4
 private const val REORDER_GRACE_MS = 20L
 /** Sanity ceiling on packetCount to refuse to allocate absurd buffers for a corrupt header. */
 private const val MAX_REASONABLE_PACKET_COUNT = 4096
+/** Number of interleaved FEC groups. Must match the server's FecInterleave constant. */
+private const val FEC_INTERLEAVE = 4
 
 /**
  * Reassembles the media stream by frameId, recovers isolated packet loss via XOR parity, and
@@ -487,6 +519,7 @@ internal class FrameAssembler(
     ) -> Unit,
     private val onFrameDropped: (requestIdr: Boolean, droppedFrames: Int) -> Unit
 ) {
+    private val fecRecoveredPackets = AtomicInteger(0)
     private val inFlight = LinkedHashMap<Long, InFlightFrame>()
     private val ready = TreeMap<Long, InFlightFrame>()
     private var dropWatermark = -1L
@@ -501,6 +534,8 @@ internal class FrameAssembler(
         // applies the reset before processing the next media packet/tick.
         externalDiscardRequested.set(true)
     }
+
+    fun consumeFecRecoveredPackets(): Int = fecRecoveredPackets.getAndSet(0)
 
     fun reset() {
         clearBufferedFrames()
@@ -527,7 +562,8 @@ internal class FrameAssembler(
         // fecCount is attacker/corruption-controlled independent of packetCount; bound it too
         // so a bogus header can't force a huge array allocation.
         if (header.fecCount < 0 || header.fecCount > MAX_REASONABLE_PACKET_COUNT) return
-        if (header.fecCount != (header.packetCount + 7) / 8) return
+        // Interleaved FEC: fecCount = min(FEC_INTERLEAVE, packetCount)
+        if (header.fecCount != minOf(FEC_INTERLEAVE, header.packetCount)) return
         if (header.fec && header.packetIndex >= header.fecCount) return
         if (!header.fec && header.packetIndex >= header.packetCount) return
         // Every media datagram's payload is <=1200 bytes per §3; a larger declared payloadLen
@@ -538,11 +574,14 @@ internal class FrameAssembler(
             header.payloadLen != PACKET_PAYLOAD_MAX
         ) return
         if (header.fec) {
-            val groupStart = header.packetIndex * 8
-            val groupMembers = minOf(groupStart + 8, header.packetCount) - groupStart
-            if (groupStart >= header.packetCount ||
-                (groupMembers > 1 && header.payloadLen != PACKET_PAYLOAD_MAX)
-            ) return
+            // Interleaved: group g contains packets at g, g+FEC_INTERLEAVE, g+2*FEC_INTERLEAVE, ...
+            val g = header.packetIndex
+            if (g >= header.packetCount) return
+            val memberCount = (header.packetCount - g + FEC_INTERLEAVE - 1) / FEC_INTERLEAVE
+            // Parity is as long as the group's largest member. A multi-member group always has
+            // at least one non-final 1200-byte packet, even when it also contains the short final
+            // packet. Rejecting truncated parity prevents silently fabricating a corrupted AU.
+            if (memberCount > 1 && header.payloadLen != PACKET_PAYLOAD_MAX) return
         }
         val frameId = extendFrameId(header.frameId)
         if (frameId <= dropWatermark) return // stale/duplicate/late
@@ -587,7 +626,8 @@ internal class FrameAssembler(
                 header.pipelineDelayMs,
                 assemblyBuf,
                 bufferPool,
-                nowMs
+                nowMs,
+                onFecRecovered = { fecRecoveredPackets.incrementAndGet() }
             )
             inFlight[frameId] = frame
             if (nextFrameId < 0L || (dropWatermark < 0L && frameId < nextFrameId)) {
@@ -771,7 +811,8 @@ private class InFlightFrame(
     val pipelineDelayMs: Int,
     val assemblyBuf: ByteArray,
     private val pool: BufferPool,
-    val firstPacketAtMs: Long
+    val firstPacketAtMs: Long,
+    private val onFecRecovered: () -> Unit
 ) {
     private val dataPresent = BooleanArray(packetCount)
     private var dataPresentCount = 0
@@ -820,25 +861,27 @@ private class InFlightFrame(
         }
     }
 
-    private fun groupOf(dataIndex: Int) = dataIndex / 8
+    /** Interleaved group mapping: group g contains packets g, g+FEC_INTERLEAVE, g+2*FEC_INTERLEAVE, ... */
+    private fun groupOf(dataIndex: Int) = dataIndex % FEC_INTERLEAVE
 
     /** XOR recovery per §3.2: if exactly one data packet in group [g] is missing and its
-     * parity packet is present, reconstruct it. If two or more are missing, this group simply
-     * can't be recovered (frame stays incomplete -> eventually dropped upstream). */
+     *  parity packet is present, reconstruct it. With interleaved groups, a burst of up to
+     *  FEC_INTERLEAVE consecutive packets hits different groups → all recoverable. */
     private fun tryRecoverGroup(g: Int) {
         if (g < 0 || g >= fecCount) return
         val parityLen = fecLen[g]
         if (parityLen < 0) return // no parity for this group yet
 
-        val groupStart = g * 8
-        val groupEnd = minOf(groupStart + 8, packetCount)
+        // Interleaved: group g contains packets at g, g+FEC_INTERLEAVE, g+2*FEC_INTERLEAVE, ...
         var missingIdx = -1
         var missingCount = 0
-        for (i in groupStart until groupEnd) {
+        var i = g
+        while (i < packetCount) {
             if (!dataPresent[i]) {
                 missingCount++
                 missingIdx = i
             }
+            i += FEC_INTERLEAVE
         }
 
         if (missingCount == 0) {
@@ -852,18 +895,21 @@ private class InFlightFrame(
         val destOffset = missingIdx * PACKET_PAYLOAD_MAX
         for (k in 0 until parityLen) {
             var v = parityBuf[k]
-            for (i in groupStart until groupEnd) {
-                if (i == missingIdx || !dataPresent[i]) continue
-                val iLen = if (i == packetCount - 1) lastPacketLen else PACKET_PAYLOAD_MAX
-                val iOffset = i * PACKET_PAYLOAD_MAX
-                val b: Byte = if (k < iLen) assemblyBuf[iOffset + k] else 0
-                v = (v.toInt() xor b.toInt()).toByte()
+            var j = g
+            while (j < packetCount) {
+                if (j != missingIdx && dataPresent[j]) {
+                    val jLen = if (j == packetCount - 1) lastPacketLen else PACKET_PAYLOAD_MAX
+                    val jOffset = j * PACKET_PAYLOAD_MAX
+                    if (k < jLen) v = (v.toInt() xor assemblyBuf[jOffset + k].toInt()).toByte()
+                }
+                j += FEC_INTERLEAVE
             }
             assemblyBuf[destOffset + k] = v
         }
 
         dataPresent[missingIdx] = true
         dataPresentCount++
+        onFecRecovered()
         if (missingIdx == packetCount - 1) {
             // Per §3.2: the recovered last packet's true length is the full parity length;
             // the extra bytes beyond the real NAL data are harmless trailing zeros.

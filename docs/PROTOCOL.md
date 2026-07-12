@@ -105,7 +105,7 @@ Client → server:
 {"type":"INPUT_STOP"}
 {"type":"STOP_STREAM"}
 {"type":"REQUEST_IDR"}
-{"type":"STATS","framesOk":58,"framesDropped":2,"bytes":2411000,"intervalMs":1000,"captureToReceiveP95Ms":12,"decodeToSurfaceP95Ms":8}
+{"type":"STATS","framesOk":58,"framesAssembled":59,"framesDropped":2,"assemblyFramesDropped":1,"decoderFramesDropped":1,"fecPacketsRecovered":3,"videoPacketsReceived":1340,"fecPacketsReceived":240,"bytes":2411000,"intervalMs":1000,"serverPipelineP95Ms":7,"captureToReceiveP95Ms":12,"decodeToSurfaceP95Ms":8}
 ```
 
 Server → client:
@@ -175,6 +175,8 @@ client should stop vibration when both values are zero.
 
 `STATS` is sent every 1 s during streaming. `REQUEST_IDR` is sent whenever a frame is
 dropped as unrecoverable; server rate-limits IDR generation to at most one per 300 ms.
+The extended assembly, decoder, FEC, packet, and latency members are optional and additive;
+servers treat a missing member as unavailable so older clients remain compatible.
 
 Remote input is opt-in and backward-compatible. After `STREAM_STARTED`, the client sends
 `INPUT_START` with the devices it wants. Missing `mouse` or `keyboard` members mean `false`,
@@ -246,7 +248,7 @@ chunks; chunk `i` goes in the packet with `packetIndex = i`.
 
 - Reassemble by `frameId`. A frame is complete when all `packetCount` chunks are
   present (after FEC recovery). Feed complete frames to the decoder **immediately**.
-- Keep at most 2 frames in assembly. If a **newer** frame completes while an older one
+- Keep at most 4 frames in assembly. If a **newer** frame completes while an older one
   is incomplete, or assembly is full: drop the older frame. If the dropped frame might
   be referenced (i.e. any drop), send `REQUEST_IDR` and **discard everything** until the
   next `KEYFRAME` frame arrives (decoding a stream with a missing reference produces
@@ -254,13 +256,14 @@ chunks; chunk `i` goes in the packet with `packetIndex = i`.
 - Never delay rendering by PTS. Release decoder output to the surface as soon as it is
   produced.
 
-### 3.2 FEC — XOR parity groups of 8
+### 3.2 FEC — four interleaved XOR parity groups
 
-Data packets of a frame are split into consecutive groups of up to 8
-(group `g` = data packets `8g .. 8g+7`). For each group the server sends one parity
-packet: flags bit1 set, `packetIndex = g`, payload = byte-wise XOR of that group's
-payloads, each zero-padded to the length of the group's longest payload;
-`payloadLen` = that max length. `fecCount = ceil(packetCount / 8)`.
+Data packets are distributed across up to four groups. Group `g` contains packet indices
+`g, g+4, g+8, ...`; `fecCount = min(4, packetCount)`. For each group the server sends one
+parity packet: flags bit1 set, `packetIndex = g`, payload = byte-wise XOR of that group's
+payloads, each zero-padded to the length of the group's longest payload; `payloadLen` is
+that maximum length. Consequently, a burst of up to four consecutive lost data packets
+places at most one loss in each group and is recoverable.
 
 Chunking rule (server, normative): every data packet's payload is exactly **1200 bytes
 except the frame's last packet** (`packetIndex == packetCount-1`), which carries the
@@ -277,7 +280,8 @@ If two or more packets of a group are missing, the frame is unrecoverable → dr
 
 ### 3.3 Server send rules
 
-- Encode → packetize → send immediately; do not pace across the frame interval.
+- Encode → packetize → send immediately. Use bounded token-bucket micro-pacing inside large
+  bursts; preserve sub-millisecond pacing debt so an IDR is not dumped into Wi-Fi at once.
 - If encoding of frame N has not finished when frame N+1 is captured, drop N+1
   (capture side already coalesces).
 - Socket send buffer small (≤256 KB). Set DSCP AF41 / TOS 0x88 on the media socket
@@ -394,13 +398,13 @@ for its cursor overlay; clients that do not recognize it ignore it.
 Inputs: `STATS` messages and IDR request rate.
 - The effective session ceiling is the smaller of `START_STREAM.maxBitrateKbps` and the
   operator-configured server ceiling (20,000 kbps by default, never below 2,000 kbps).
-- **Down:** if `framesDropped / (framesOk+framesDropped) > 1%` in a stats interval, latency
-  grows materially above the session's best observed baseline, or
-  ≥2 `REQUEST_IDR` in 1 s → new bitrate = max(2000, current × 0.7), apply to encoder,
-  send `BITRATE`.
-- **Up:** after 5 consecutive clean intervals (0 drops, 0 IDR requests) → new bitrate =
-  min(maxBitrateKbps, current × 1.1).
-- Start at min(8000, maxBitrateKbps).
+- **Down:** if a stats interval has more than 5 dropped frames or more than 5% loss, latency
+  grows materially for 3 consecutive intervals above the learned baseline, or at least 3
+  `REQUEST_IDR` messages arrive within 2 s → new bitrate = max(2000, current × 0.8), apply
+  to the encoder, and send `BITRATE`. Down changes are debounced for 3 s.
+- **Up:** after 2 consecutive clean intervals (0 drops, 0 IDR requests) probe upward by 15%,
+  switching to +1000 kbps close to the learned ceiling.
+- Start at min(12000, maxBitrateKbps).
 - Optional latency fields do not break older peers. Sustained capture-to-receive or
   decode-to-surface growth should be treated as congestion before a queue can form.
 

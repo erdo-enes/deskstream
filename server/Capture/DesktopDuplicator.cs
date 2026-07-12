@@ -79,16 +79,33 @@ public sealed class DesktopDuplicator : IDisposable
         Device = device;
         Context = context;
 
-        // Request high GPU thread priority to avoid capture/encode starvation under 100% GPU game load.
+        // Request maximum GPU thread priority to avoid capture/encode starvation under 100% GPU
+        // game load. Sunshine uses priority 7 (the maximum); the old value of 5 was insufficient
+        // for demanding games where the GPU is fully saturated.
         using (var dxgiDevice = Device.QueryInterface<IDXGIDevice>())
         {
             try
             {
-                dxgiDevice.GPUThreadPriority = 5;
+                dxgiDevice.GPUThreadPriority = 7;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[capture] failed to set DXGI GPU priority: {ex.Message}");
+            }
+        }
+
+        // Set maximum frame latency to 1 so the GPU never queues frames ahead of capture. This
+        // ensures AcquireNextFrame returns the most recent frame, not a stale queued one.
+        // Sunshine uses the same setting. Requires IDXGIDevice1 (available on all D3D11 devices).
+        using (var dxgiDevice1 = Device.QueryInterface<IDXGIDevice1>())
+        {
+            try
+            {
+                dxgiDevice1.SetMaximumFrameLatency(1);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[capture] failed to set maximum frame latency: {ex.Message}");
             }
         }
 
@@ -133,15 +150,19 @@ public sealed class DesktopDuplicator : IDisposable
     /// <summary>
     /// Tries to acquire the next desktop frame. Returns true and yields a stable private BGRA
     /// texture (owned by this class, reused every call) when a NEW frame carrying real screen
-    /// content is available. Returns false only on genuine ~full-timeout idle or after recovering
-    /// from an access-lost event.
+    /// content is available. Returns false on timeout, access-lost, or after the pointer-only cap.
     ///
     /// Pointer-only updates (LastPresentTime == 0 — the mouse moved but no pixels changed) are
-    /// absorbed inside this call's own timeout budget rather than returned as "no frame". Returning
-    /// on every mouse move made the caller's idle heuristic (a 50 ms sleep on a quick false) fire
-    /// constantly while the mouse moved, capping capture at ~20-31 fps in games. The loop below
-    /// keeps waiting — without sleeping — until either real content arrives or the budget expires.
+    /// absorbed within the timeout budget, but capped at MaxPointerOnlyPerAcquire to prevent GPU
+    /// sync point storms during rapid mouse movement in games (observed: 169-454/s). After the cap,
+    /// returns false immediately so the caller can retry on the next pacing tick.
+    ///
+    /// The caller should sleep ~10ms after a full-timeout false return to avoid D3D11 device lock
+    /// starvation (Sunshine documented this: AcquireNextFrame holds an unfair D3D11 lock for the
+    /// entire timeout duration, starving the encoder's VideoProcessor operations).
     /// </summary>
+    private const int MaxPointerOnlyPerAcquire = 4;
+
     public bool TryAcquire(int timeoutMs, out ID3D11Texture2D bgra)
     {
         bgra = _bgraCopy!;
@@ -154,6 +175,7 @@ public sealed class DesktopDuplicator : IDisposable
 
         long start = Stopwatch.GetTimestamp();
         long deadline = start + (long)Math.Max(0, timeoutMs) * Stopwatch.Frequency / 1000;
+        int pointerOnlyCount = 0;
 
         while (true)
         {
@@ -198,7 +220,9 @@ public sealed class DesktopDuplicator : IDisposable
                     Interlocked.Increment(ref _timeouts);
                     return false;
                 }
-                continue; // NO sleep — the outer idle sleep must stay unreachable during motion
+                if (++pointerOnlyCount >= 4)
+                    return false;
+                continue;
             }
 
             try

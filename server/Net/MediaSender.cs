@@ -8,7 +8,7 @@ namespace DeskStreamer.Server.Net;
 
 /// <summary>
 /// Media transport (PROTOCOL.md §3). Splits each encoded H.264 access unit into
-/// &lt;=1200-byte chunks, generates XOR FEC parity (groups of 8), and unicasts each
+/// &lt;=1200-byte chunks, generates interleaved XOR FEC parity, and unicasts each
 /// datagram to the client address learned from "DSMH" hole-punch packets.
 ///
 /// Hot path is allocation-free: a single reusable send buffer and one reusable FEC
@@ -16,7 +16,11 @@ namespace DeskStreamer.Server.Net;
 /// </summary>
 public sealed class MediaSender : IDisposable
 {
-    private const int FecGroup = 8;
+    // Interleaved XOR FEC: data packets are spread across FecInterleave groups so that a burst
+    // loss of up to FecInterleave consecutive packets hits different groups (1 loss each → all
+    // recoverable). With the old consecutive groups of 8, a 2-packet burst in one group killed
+    // the frame. This remains simple XOR protection, not a substitute for general erasure coding.
+    private const int FecInterleave = 4;
     private static readonly byte[] Dsmh = Encoding.ASCII.GetBytes("DSMH");
     private static readonly byte[] Dshb = Encoding.ASCII.GetBytes("DSHB");
 
@@ -32,6 +36,8 @@ public sealed class MediaSender : IDisposable
     private long _framesSent;
     private long _packetsSent;
     private long _bytesSent;
+    private long _sendFailures;
+    private long _pacingWaitUs;
 
     // Token-bucket micro-pacing (PROTOCOL.md §3.3). Only oversized IDR bursts get shaped: the
     // bucket comfortably covers a normal P-frame, so those pass untouched. Shaping a ~150-300 KB
@@ -86,22 +92,26 @@ public sealed class MediaSender : IDisposable
         _lastRefillTs = now;
         _tokens = Math.Min(capacity, _tokens + elapsedSec * rate);
 
-        if (_tokens >= len)
-        {
-            _tokens -= len;
+        _tokens -= len;
+        if (_tokens >= 0)
             return;
-        }
 
-        // Not enough tokens for this datagram: wait until the bucket would cover it.
-        double waitSec = (len - _tokens) / rate;
-        long targetTs = now + (long)(waitSec * Stopwatch.Frequency);
-        long waitMs = (long)(waitSec * 1000);
-        if (waitMs > 1)
-            Thread.Sleep((int)(waitMs - 1));
-        while (Stopwatch.GetTimestamp() < targetTs)
-            Thread.SpinWait(5);
-        _tokens = 0;
-        _lastRefillTs = Stopwatch.GetTimestamp();
+        // Preserve sub-millisecond debt across datagrams. Resetting the bucket to zero here made
+        // every ~0.1 ms wait disappear, so a large IDR still left as one unpaced Wi-Fi burst.
+        // Sleeping only after debt reaches 1 ms keeps CPU use low without imposing 1 ms/packet.
+        long waitUs = (long)Math.Ceiling(-_tokens * 1_000_000.0 / rate);
+        if (waitUs < 1000)
+            return;
+
+        long beforeSleep = Stopwatch.GetTimestamp();
+        Thread.Sleep((int)Math.Ceiling(waitUs / 1000.0));
+        long afterSleep = Stopwatch.GetTimestamp();
+        long actualWaitUs = (afterSleep - beforeSleep) * 1_000_000 / Stopwatch.Frequency;
+        Interlocked.Add(ref _pacingWaitUs, actualWaitUs);
+
+        // Account for the actual sleep now so the next datagram does not double-count it.
+        _tokens = Math.Min(capacity, _tokens + actualWaitUs * rate / 1_000_000.0);
+        _lastRefillTs = afterSleep;
     }
 
     /// <summary>Validated gamepad snapshots from the currently learned media endpoint.</summary>
@@ -115,6 +125,8 @@ public sealed class MediaSender : IDisposable
     public long FramesSent => Interlocked.Read(ref _framesSent);
     public long PacketsSent => Interlocked.Read(ref _packetsSent);
     public long BytesSent => Interlocked.Read(ref _bytesSent);
+    public long SendFailures => Interlocked.Read(ref _sendFailures);
+    public long PacingWaitUs => Interlocked.Read(ref _pacingWaitUs);
 
     public MediaSender(int preferredPort, IPAddress? expectedClientAddress = null)
     {
@@ -249,7 +261,7 @@ public sealed class MediaSender : IDisposable
         if (packetCount > ushort.MaxValue)
             return; // absurdly large frame; skip rather than corrupt indices
 
-        int fecCount = (packetCount + FecGroup - 1) / FecGroup;
+        int fecCount = Math.Min(FecInterleave, packetCount);
         byte dataFlags = keyframe ? MediaPacket.FlagKeyframe : (byte)0;
         bool allDataSent = true;
 
@@ -268,25 +280,31 @@ public sealed class MediaSender : IDisposable
                 allDataSent = false;
         }
 
-        // ---- FEC packets: one XOR parity per group of up to 8 data packets ----
+        // ---- FEC packets: interleaved XOR parity ----
+        // Group g contains data packets at indices g, g+FecInterleave, g+2*FecInterleave, ...
+        // A burst loss of up to FecInterleave consecutive packets hits each group at most once.
         for (int g = 0; g < fecCount; g++)
         {
-            int first = g * FecGroup;
-            int last = Math.Min(first + FecGroup, packetCount) - 1;
-
-            // Group's longest payload: 1200 unless this group is only the final (remainder) packet.
-            int maxLen = (last == packetCount - 1 && first == last)
-                ? (length - first * MediaPacket.MaxPayload)
-                : MediaPacket.MaxPayload;
+            // Parity must be as long as the largest group member. The old code started at 1200
+            // and then shortened the group when it encountered the final partial packet, even if
+            // that group also contained full packets. Such parity silently corrupted recovery.
+            int maxLen = 0;
+            for (int i = g; i < packetCount; i += FecInterleave)
+            {
+                int offset = i * MediaPacket.MaxPayload;
+                int payloadLen = i == packetCount - 1
+                    ? length - offset
+                    : MediaPacket.MaxPayload;
+                maxLen = Math.Max(maxLen, payloadLen);
+            }
 
             Array.Clear(_fecBuffer, 0, maxLen);
-            for (int i = first; i <= last; i++)
+            for (int i = g; i < packetCount; i += FecInterleave)
             {
                 int offset = i * MediaPacket.MaxPayload;
                 int payloadLen = (i == packetCount - 1) ? (length - offset) : MediaPacket.MaxPayload;
                 for (int b = 0; b < payloadLen; b++)
                     _fecBuffer[b] ^= au[offset + b];
-                // bytes [payloadLen, maxLen) contribute zero (zero-padding) — nothing to XOR.
             }
 
             byte fecFlags = (byte)(dataFlags | MediaPacket.FlagFec);
@@ -323,8 +341,16 @@ public sealed class MediaSender : IDisposable
             Interlocked.Add(ref _bytesSent, sent);
             return sent == totalLen;
         }
-        catch (SocketException) { return false; }
-        catch (ObjectDisposedException) { return false; }
+        catch (SocketException)
+        {
+            Interlocked.Increment(ref _sendFailures);
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            Interlocked.Increment(ref _sendFailures);
+            return false;
+        }
     }
 
     public void Dispose()
