@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DeskStreamer.Server.Protocol;
 using Lennox.NvEncSharp;
 using Vortice.Direct3D11;
 using static Lennox.NvEncSharp.LibNvEnc;
@@ -43,7 +44,9 @@ public sealed class NvencH264Encoder : IVideoEncoder
     private bool _initialized;
     private bool _disposed;
 
-    public Action<byte[], int, bool, uint>? OnEncodedFrame { get; set; }
+    public Action<byte[], int, bool, uint, long, long>? OnEncodedFrame { get; set; }
+    public Action<long, long>? OnEncodeSubmitted { get; set; }
+    public Action<long>? OnFrameDropped { get; set; }
     public string BackendName => "nvenc-ultra-low-latency";
 
     public NvencH264Encoder(
@@ -150,8 +153,12 @@ public sealed class NvencH264Encoder : IVideoEncoder
         TuningInfo = NvEncTuningInfo.UltraLowLatency,
     };
 
-    public void Submit(ID3D11Texture2D nv12, uint ptsMs)
+    public void Submit(ID3D11Texture2D nv12, uint ptsMs, long traceId)
     {
+        int outputLength = 0;
+        bool outputKeyframe = false;
+        long encodeFinishUs = 0;
+
         lock (_gate)
         {
             ThrowIfDisposed();
@@ -187,15 +194,18 @@ public sealed class NvencH264Encoder : IVideoEncoder
                         : 0,
                 };
 
+                OnEncodeSubmitted?.Invoke(traceId, MonotonicClock.NowUs);
                 _encoder.EncodePicture(ref picture);
                 var locked = _encoder.LockBitstream(ref _bitstream);
                 try
                 {
-                    int length = checked((int)locked.BitstreamSizeInBytes);
-                    EnsureCapacity(length);
-                    Marshal.Copy(locked.BitstreamBufferPtr, _output, 0, length);
-                    bool keyframe = locked.PictureType == NvEncPicType.Idr;
-                    OnEncodedFrame?.Invoke(_output, length, keyframe, ptsMs);
+                    // LockBitstream returning means the encoded access unit is ready. Record that
+                    // point before the unavoidable device-to-managed bitstream copy.
+                    encodeFinishUs = MonotonicClock.NowUs;
+                    outputLength = checked((int)locked.BitstreamSizeInBytes);
+                    EnsureCapacity(outputLength);
+                    Marshal.Copy(locked.BitstreamBufferPtr, _output, 0, outputLength);
+                    outputKeyframe = locked.PictureType == NvEncPicType.Idr;
                 }
                 finally
                 {
@@ -208,6 +218,11 @@ public sealed class NvencH264Encoder : IVideoEncoder
                     _encoder.UnmapInputResource(mapped.MappedResource);
             }
         }
+
+        // Networking consumes the reused output synchronously, but must never run while the
+        // NVENC bitstream is locked, the input texture is mapped, or the encoder gate is held.
+        OnEncodedFrame?.Invoke(
+            _output, outputLength, outputKeyframe, ptsMs, traceId, encodeFinishUs);
     }
 
     private RegisteredTexture GetOrRegister(ID3D11Texture2D texture)

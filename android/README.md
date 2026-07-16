@@ -47,7 +47,7 @@ and video latency still needs validation against a Windows host.
    A single surface tap only positions/moves; double-tap = left-click, double-tap + move = drag,
    two-finger move = scroll, and a short stationary two-finger tap = right-click. Mouse buttons
    are reset whenever the stream stops or the app backgrounds.
-6. The toolbar selects Native (20 Mbps ceiling) / 720p (10 Mbps ceiling) quality, saves a
+6. The toolbar defaults to 720p60 (8 Mbps ceiling), can explicitly select Native, saves a
    local screenshot, and offers **Hide** for a video-only clean screen. Hold three fingers for
    600 ms, press Back, or press F11 on a hardware keyboard to restore every control without
    sending an accidental mouse click to the PC.
@@ -98,6 +98,12 @@ app/src/main/java/com/deskstream/client/
 - The client re-punches a silent media path, coalesces IDR recovery across stream epochs, and
   resets a decoder that stops producing output. Packet parsing is allocation-free; frame/FEC
   pools, reorder state, codec input, and AudioTrack tuning remain bounded.
+- A completed static frame plus healthy media heartbeats does not request periodic IDRs. A new
+  IDR is requested only during startup, proven reference loss, or video packets that stop
+  forming complete access units.
+- Per-frame `DSTR` timing is correlated through first/last receive, actual FEC assembly,
+  MediaCodec output, and the Surface render callback. Completed rows are formatted off the codec
+  thread and emitted in bounded batches under the `DeskStreamFrameTrace` Logcat tag.
 - Pairing tokens are stored per server IP in SharedPreferences; a `PAIR_REQUIRED` in response
   to a non-empty token clears it and re-pairs automatically.
 - Audio is optional and backward-compatible. If an older server ignores `AUDIO_START`, the

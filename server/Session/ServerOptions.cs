@@ -8,13 +8,15 @@ namespace DeskStreamer.Server.Session;
 public sealed class ServerOptions
 {
     public const int MinimumBitrateKbps = 3000;
-    public const int DefaultMaxBitrateKbps = 20000;
+    public const int DefaultMaxBitrateKbps = 10000;
+    public const int Stable720pStartBitrateKbps = 8000;
+    public const int NativeStartBitrateKbps = 12000;
 
     // Codec APIs express bits/second as uint. Keeping the configured kbps below this boundary
     // prevents multiplication overflow even when an unreasonable CLI value is supplied.
     private const int MaximumEncoderBitrateKbps = 4_294_967;
 
-    private volatile string _defaultQuality = "native";
+    private volatile string _defaultQuality = "720p";
     private int _maxBitrateKbps = DefaultMaxBitrateKbps;
 
     /// <summary>Server default stream quality applied when a client sends no "quality" field.</summary>

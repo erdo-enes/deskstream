@@ -72,8 +72,16 @@ public sealed class StreamSession : IDisposable
     private Stopwatch? _clock;
     private long _clockBaseUs;
     private uint _frameId;
+    private long _nextTraceId;
+    private readonly ConcurrentDictionary<long, CaptureFrameTiming> _pendingFrameTimings = new();
     private volatile bool _streaming;
     private volatile bool _audioStreaming;
+
+    private readonly record struct CaptureFrameTiming(
+        long CaptureStartUs,
+        long CaptureEndUs,
+        long ConvertEndUs,
+        long EncodeSubmitUs);
 
     // Quality / authoritative streamed dimensions (PROTOCOL.md §2.3).
     private string _quality = "native";
@@ -175,6 +183,9 @@ public sealed class StreamSession : IDisposable
     public long MediaPacketsSent => _sender?.PacketsSent ?? 0;
     public long MediaSendFailures => _sender?.SendFailures ?? 0;
     public long MediaPacingWaitUs => _sender?.PacingWaitUs ?? 0;
+    public long MediaPacingBytesPerSec => _sender?.PacingBytesPerSec ?? 0;
+    public long MediaKeyframePacingBytesPerSec => _sender?.KeyframePacingBytesPerSec ?? 0;
+    public long MediaPacingBucketBytes => _sender?.PacingBucketBytes ?? 0;
 
     // Capture-pipeline diagnostics (Program composes the 1 Hz stats line from per-second deltas).
     public long CaptureRealFrames => _duplicator?.RealFrames ?? 0;
@@ -662,7 +673,10 @@ public sealed class StreamSession : IDisposable
             _streamHeight,
             Fps);
 
-        _currentBitrateKbps = Math.Min(12000, _maxBitrateKbps); // start bitrate (PROTOCOL.md §4)
+        int profileStartBitrate = _quality == "720p"
+            ? ServerOptions.Stable720pStartBitrateKbps
+            : ServerOptions.NativeStartBitrateKbps;
+        _currentBitrateKbps = Math.Min(profileStartBitrate, _maxBitrateKbps);
         _encoder = EncoderFactory.Create(
             _duplicator.Device,
             _streamWidth,
@@ -670,11 +684,16 @@ public sealed class StreamSession : IDisposable
             Fps,
             _currentBitrateKbps);
         _encoder.OnEncodedFrame = OnEncoded;
+        _encoder.OnEncodeSubmitted = OnEncodeSubmitted;
+        _encoder.OnFrameDropped = OnEncoderFrameDropped;
 
-        // Shape only oversized IDR bursts (token-bucket); normal frames pass untouched.
+        // Bound every frame's Wi-Fi burst; IDRs use a faster drain rate so recovery still fits
+        // within a small number of frame periods.
         _sender!.SetPacingRate(_currentBitrateKbps, Fps);
 
         _frameId = 0;
+        Interlocked.Exchange(ref _nextTraceId, 0);
+        _pendingFrameTimings.Clear();
         Interlocked.Exchange(ref _encodedFrames, 0);
         Interlocked.Exchange(ref _captureSubmittedFrames, 0);
         Interlocked.Exchange(ref _pipelineFaultHandling, 0);
@@ -743,8 +762,10 @@ public sealed class StreamSession : IDisposable
             long nextFrameTicks = Stopwatch.GetTimestamp();
             while (!ct.IsCancellationRequested)
             {
+                long captureStartUs = NowUs();
                 if (_duplicator!.TryAcquire(100, out var bgra))
                 {
+                    long captureEndUs = NowUs();
                     long nowTicks = Stopwatch.GetTimestamp();
                     if (nowTicks < nextFrameTicks)
                         continue; // Desktop may present at 120/144/240 Hz; honor requested FPS.
@@ -753,14 +774,23 @@ public sealed class StreamSession : IDisposable
                     if (Interlocked.Increment(ref _capturedSinceEncode) > Fps * 3)
                         throw new InvalidOperationException("The hardware encoder stopped producing frames");
                     var nv12 = _converter!.Convert(bgra);
+                    long convertEndUs = NowUs();
                     Volatile.Write(ref _lastNv12, nv12);
-                    SubmitCapture(nv12);
+                    SubmitCapture(nv12, captureStartUs, captureEndUs, convertEndUs);
                 }
                 else if (Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
                 {
                     var latest = Volatile.Read(ref _lastNv12);
                     if (latest != null)
-                        SubmitCapture(latest, forceIdr: true);
+                    {
+                        long repeatedAtUs = NowUs();
+                        SubmitCapture(
+                            latest,
+                            repeatedAtUs,
+                            repeatedAtUs,
+                            repeatedAtUs,
+                            forceIdr: true);
+                    }
                     else
                         Interlocked.Exchange(ref _endpointIdrPending, 1);
                 }
@@ -782,13 +812,33 @@ public sealed class StreamSession : IDisposable
         }
     }
 
-    private void SubmitCapture(ID3D11Texture2D nv12, bool forceIdr = false)
+    private void SubmitCapture(
+        ID3D11Texture2D nv12,
+        long captureStartUs,
+        long captureEndUs,
+        long convertEndUs,
+        bool forceIdr = false)
     {
         if (forceIdr || Interlocked.Exchange(ref _endpointIdrPending, 0) != 0)
             _encoder!.RequestIdr();
         uint pts = (uint)(_clock!.ElapsedMilliseconds & 0xFFFFFFFF);
+        long traceId = Interlocked.Increment(ref _nextTraceId);
+        long encodeSubmitUs = NowUs();
+        _pendingFrameTimings[traceId] = new CaptureFrameTiming(
+            captureStartUs,
+            captureEndUs,
+            convertEndUs,
+            encodeSubmitUs);
         Interlocked.Increment(ref _captureSubmittedFrames);
-        _encoder!.Submit(nv12, pts);
+        try
+        {
+            _encoder!.Submit(nv12, pts, traceId);
+        }
+        catch
+        {
+            _pendingFrameTimings.TryRemove(traceId, out _);
+            throw;
+        }
     }
 
     private void StopFaultedPipeline(Exception ex)
@@ -806,14 +856,42 @@ public sealed class StreamSession : IDisposable
         AsyncLogger.Error($"[session] Stream stopped after capture/encoder fault: {ex.Message}");
     }
 
-    private void OnEncoded(byte[] data, int length, bool keyframe, uint ptsMs)
+    private void OnEncoded(
+        byte[] data,
+        int length,
+        bool keyframe,
+        uint ptsMs,
+        long traceId,
+        long encodeFinishUs)
     {
         uint id = _frameId++;
+        if (traceId == 0 || !_pendingFrameTimings.TryRemove(traceId, out var timing))
+            timing = new CaptureFrameTiming(encodeFinishUs, encodeFinishUs, encodeFinishUs, encodeFinishUs);
         Interlocked.Exchange(ref _capturedSinceEncode, 0);
         Interlocked.Increment(ref _encodedFrames);
         ushort pipelineDelayMs = (ushort)Math.Min(ushort.MaxValue, CurrentStreamPtsMs() - ptsMs);
-        _sender?.SendFrame(data, length, id, keyframe, ptsMs, pipelineDelayMs);
+        _sender?.SendFrame(
+            data,
+            length,
+            id,
+            keyframe,
+            ptsMs,
+            pipelineDelayMs,
+            timing.CaptureStartUs,
+            timing.CaptureEndUs,
+            timing.ConvertEndUs,
+            timing.EncodeSubmitUs,
+            encodeFinishUs);
     }
+
+    private void OnEncodeSubmitted(long traceId, long submittedUs)
+    {
+        if (_pendingFrameTimings.TryGetValue(traceId, out var timing))
+            _pendingFrameTimings[traceId] = timing with { EncodeSubmitUs = submittedUs };
+    }
+
+    private void OnEncoderFrameDropped(long traceId) =>
+        _pendingFrameTimings.TryRemove(traceId, out _);
 
     private uint CurrentStreamPtsMs() =>
         _clock == null ? 0 : (uint)(_clock.ElapsedMilliseconds & 0xFFFFFFFF);
@@ -903,6 +981,7 @@ public sealed class StreamSession : IDisposable
         try { _sender?.Dispose(); } catch { }
         _encoder = null; _converter = null; _duplicator = null; _sender = null;
         _lastNv12 = null;
+        _pendingFrameTimings.Clear();
         Interlocked.Exchange(ref _endpointIdrPending, 0);
         _captureCts?.Dispose(); _captureCts = null;
         _clock = null;

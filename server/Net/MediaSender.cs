@@ -21,6 +21,11 @@ public sealed class MediaSender : IDisposable
     // recoverable). With the old consecutive groups of 8, a 2-packet burst in one group killed
     // the frame. This remains simple XOR protection, not a substitute for general erasure coding.
     private const int FecInterleave = 4;
+    private const int BurstDatagrams = 8;
+    private const long MinimumPacingBytesPerSec = 3_000_000; // 24 Mbps wire rate
+    private const long MaximumPacingBytesPerSec = 9_000_000; // 72 Mbps wire rate
+    private const long MinimumKeyframePacingBytesPerSec = 6_000_000; // 48 Mbps
+    private const long MaximumKeyframePacingBytesPerSec = 12_000_000; // 96 Mbps
     private static readonly byte[] Dsmh = Encoding.ASCII.GetBytes("DSMH");
     private static readonly byte[] Dshb = Encoding.ASCII.GetBytes("DSHB");
 
@@ -39,47 +44,63 @@ public sealed class MediaSender : IDisposable
     private long _sendFailures;
     private long _pacingWaitUs;
 
-    // Token-bucket micro-pacing (PROTOCOL.md §3.3). Only oversized IDR bursts get shaped: the
-    // bucket comfortably covers a normal P-frame, so those pass untouched. Shaping a ~150-300 KB
-    // IDR at the 96 Mbps ceiling adds a one-frame ~12-25 ms spike instead of a 2x/s burst that
-    // makes a Wi-Fi client drop 3-8 packets and slash bitrate. _pacingBytesPerSec and
+    // Token-bucket micro-pacing (PROTOCOL.md §3.3). The bucket permits eight datagrams at once,
+    // then spreads the remainder of every access unit. This bounds both large P-frame and IDR
+    // bursts before they reach the Wi-Fi driver while retaining a few milliseconds of latency.
+    // _pacingBytesPerSec and
     // _bucketCapacity are set from the control thread (SetPacingRate) and read on the encoder
     // send thread; the token count + refill timestamp are touched on the send thread only.
     // (C# forbids `volatile long`, so cross-thread access uses Volatile.Read/Write.)
     private long _pacingBytesPerSec;   // 0 = pacing disabled
+    private long _keyframePacingBytesPerSec;
     private long _bucketCapacity;
     private double _tokens;
     private long _lastRefillTs;
 
     /// <summary>
-    /// Configures the pacing rate from the live encoder target. avg = the CBR byte rate; the pacing
-    /// rate is 8x that, clamped to [32 Mbps, 96 Mbps] (floor keeps P-frames instant; ceiling stays
-    /// under a single 5 GHz client's drain rate). Bucket capacity is two frames' worth of average
-    /// bytes (min 64 KiB) so a normal frame never trips the bucket. Call at pipeline start and on
-    /// every bitrate change; 0 fps or kbps disables pacing.
+    /// Configures the pacing rate from the live encoder target plus the fixed four-parity-packet
+    /// FEC cost. Normal frames drain at four times estimated average wire rate (24..72 Mbps);
+    /// IDRs use eight times wire rate (48..96 Mbps) so recovery does not occupy several frame
+    /// periods. An eight-datagram bucket absorbs scheduler jitter but prevents a whole 720p frame
+    /// from being dumped as one Wi-Fi microburst. Call at pipeline start and every bitrate change;
+    /// 0 fps or kbps disables pacing.
     /// </summary>
     public void SetPacingRate(int currentBitrateKbps, int fps)
     {
         if (currentBitrateKbps <= 0 || fps <= 0)
         {
             Volatile.Write(ref _pacingBytesPerSec, 0);
+            Volatile.Write(ref _keyframePacingBytesPerSec, 0);
             return;
         }
-        long avg = (long)currentBitrateKbps * 1000 / 8;          // bytes/sec at the CBR target
-        long rate = Math.Clamp(avg * 8, 4_000_000, 12_000_000);   // 32..96 Mbps in bytes/sec
-        long capacity = Math.Max(64 * 1024, avg / fps * 2);
+        long videoBytesPerSec = (long)currentBitrateKbps * 1000 / 8;
+        long fecBytesPerSec = (long)FecInterleave * MediaPacket.MaxDatagram * fps;
+        long estimatedWireBytesPerSec = videoBytesPerSec + fecBytesPerSec;
+        long rate = Math.Clamp(
+            estimatedWireBytesPerSec * 4,
+            MinimumPacingBytesPerSec,
+            MaximumPacingBytesPerSec);
+        long keyframeRate = Math.Clamp(
+            estimatedWireBytesPerSec * 8,
+            MinimumKeyframePacingBytesPerSec,
+            MaximumKeyframePacingBytesPerSec);
+        long capacity = BurstDatagrams * MediaPacket.MaxDatagram;
         Volatile.Write(ref _bucketCapacity, capacity);
         Volatile.Write(ref _pacingBytesPerSec, rate);
+        Volatile.Write(ref _keyframePacingBytesPerSec, keyframeRate);
     }
 
     /// <summary>
     /// Token-bucket gate run on the send thread at the top of the datagram-send routine. Refills by
     /// elapsed*rate (capped at capacity); if the datagram fits, subtract and return immediately;
-    /// otherwise coarse-sleep then spin to the exact target tick and drain the bucket to zero.
+    /// otherwise sleep once debt reaches 1 ms. Sub-millisecond debt is retained and combined
+    /// with following datagrams instead of paying a scheduler sleep per packet.
     /// </summary>
-    private void PaceBeforeSend(int len)
+    private void PaceBeforeSend(int len, bool keyframe)
     {
-        long rate = Volatile.Read(ref _pacingBytesPerSec);
+        long rate = keyframe
+            ? Volatile.Read(ref _keyframePacingBytesPerSec)
+            : Volatile.Read(ref _pacingBytesPerSec);
         if (rate <= 0)
             return; // pacing disabled: never touch the hot path
 
@@ -127,6 +148,9 @@ public sealed class MediaSender : IDisposable
     public long BytesSent => Interlocked.Read(ref _bytesSent);
     public long SendFailures => Interlocked.Read(ref _sendFailures);
     public long PacingWaitUs => Interlocked.Read(ref _pacingWaitUs);
+    public long PacingBytesPerSec => Volatile.Read(ref _pacingBytesPerSec);
+    public long KeyframePacingBytesPerSec => Volatile.Read(ref _keyframePacingBytesPerSec);
+    public long PacingBucketBytes => Volatile.Read(ref _bucketCapacity);
 
     public MediaSender(int preferredPort, IPAddress? expectedClientAddress = null)
     {
@@ -251,11 +275,23 @@ public sealed class MediaSender : IDisposable
     /// <param name="keyframe">True if this AU is an IDR (carries SPS/PPS).</param>
     /// <param name="ptsMs">Server steady-clock ms (stats only).</param>
     public void SendFrame(
-        byte[] au, int length, uint frameId, bool keyframe, uint ptsMs, ushort pipelineDelayMs)
+        byte[] au,
+        int length,
+        uint frameId,
+        bool keyframe,
+        uint ptsMs,
+        ushort pipelineDelayMs,
+        long captureStartUs,
+        long captureEndUs,
+        long convertEndUs,
+        long encodeSubmitUs,
+        long encodeFinishUs)
     {
         var client = _clientEndpoint;
         if (client == null || length <= 0)
             return;
+
+        long packetStartUs = MonotonicClock.NowUs;
 
         int packetCount = (length + MediaPacket.MaxPayload - 1) / MediaPacket.MaxPayload;
         if (packetCount > ushort.MaxValue)
@@ -276,7 +312,7 @@ public sealed class MediaSender : IDisposable
                 (ushort)i, (ushort)packetCount, (ushort)fecCount, ptsMs, pipelineDelayMs);
 
             Buffer.BlockCopy(au, offset, _sendBuffer, MediaPacket.HeaderSize, payloadLen);
-            if (!SendDatagram(client, MediaPacket.HeaderSize + payloadLen))
+            if (!SendDatagram(client, MediaPacket.HeaderSize + payloadLen, keyframe))
                 allDataSent = false;
         }
 
@@ -313,11 +349,24 @@ public sealed class MediaSender : IDisposable
                 (ushort)g, (ushort)packetCount, (ushort)fecCount, ptsMs, pipelineDelayMs);
 
             Buffer.BlockCopy(_fecBuffer, 0, _sendBuffer, MediaPacket.HeaderSize, maxLen);
-            SendDatagram(client, MediaPacket.HeaderSize + maxLen);
+            SendDatagram(client, MediaPacket.HeaderSize + maxLen, keyframe);
         }
 
         if (allDataSent)
             Interlocked.Increment(ref _framesSent);
+
+        long packetEndUs = MonotonicClock.NowUs;
+        var trace = new ServerFrameTrace(
+            frameId,
+            captureStartUs,
+            captureEndUs,
+            convertEndUs,
+            encodeSubmitUs,
+            encodeFinishUs,
+            packetStartUs,
+            packetEndUs);
+        FrameTracePacket.Write(_sendBuffer, trace);
+        SendTraceDatagram(client);
     }
 
     public void SendCursorPosition(uint sequence, CursorPosition position)
@@ -331,9 +380,9 @@ public sealed class MediaSender : IDisposable
         catch (ObjectDisposedException) { }
     }
 
-    private bool SendDatagram(EndPoint client, int totalLen)
+    private bool SendDatagram(EndPoint client, int totalLen, bool keyframe)
     {
-        PaceBeforeSend(totalLen);
+        PaceBeforeSend(totalLen, keyframe);
         try
         {
             int sent = _socket.SendTo(_sendBuffer, 0, totalLen, SocketFlags.None, client);
@@ -350,6 +399,24 @@ public sealed class MediaSender : IDisposable
         {
             Interlocked.Increment(ref _sendFailures);
             return false;
+        }
+    }
+
+    private void SendTraceDatagram(EndPoint client)
+    {
+        try
+        {
+            int sent = _socket.SendTo(_sendBuffer, 0, FrameTracePacket.Size, SocketFlags.None, client);
+            Interlocked.Increment(ref _packetsSent);
+            Interlocked.Add(ref _bytesSent, sent);
+        }
+        catch (SocketException)
+        {
+            Interlocked.Increment(ref _sendFailures);
+        }
+        catch (ObjectDisposedException)
+        {
+            Interlocked.Increment(ref _sendFailures);
         }
     }
 

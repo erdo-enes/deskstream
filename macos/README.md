@@ -21,10 +21,14 @@ local ad-hoc-signed app.
   layout and game scan-code behavior.
 - Up to four GameController devices forwarded as virtual Xbox 360 controllers through the
   existing server/ViGEm path, including best-effort controller haptics.
-- Native (20 Mbps ceiling) / 720p (10 Mbps ceiling) quality selection, local PNG screenshots,
+- 720p60 (8 Mbps ceiling) stability-first default with explicit Native selection, local PNG screenshots,
   live stats, and full-screen controls.
   macOS 14.4+ copies the displayed pixel directly; older supported systems use a one-frame
   fallback decode that tears down immediately after the screenshot.
+- Every traced frame is correlated in `~/Library/Logs/DeskStream/frame-trace.jsonl` without
+  logging on the media/render queues. AVSampleBufferDisplayLayer exposes submission/enqueue,
+  not true decode/scanout completion, so those fields are named `decodeSubmitUs` and
+  `presentEnqueueUs` in the file.
 
 ## Build and test
 

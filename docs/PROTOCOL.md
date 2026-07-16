@@ -125,8 +125,8 @@ Server → client:
 
 `START_STREAM.quality` is an OPTIONAL string selecting the streamed resolution. Allowed values
 are `"native"` and `"720p"`; an unrecognized value becomes `"native"`. When the field is absent,
-the server uses its configured default (`"native"` unless the operator selected otherwise).
-`"720p"` downscales to 720 lines preserving aspect ratio: the streamed height is
+the current server default is used (`"720p"` unless overridden). `"720p"` downscales to 720
+lines preserving aspect ratio: the streamed height is
 `min(720, srcHeight)` and the streamed width is the source width scaled by that height ratio,
 rounded to the nearest even value, clamped to at most the source width (never upscaled) and to a
 minimum of 2; both dimensions are always even (NV12 requires it). When the client omits `quality`,
@@ -280,12 +280,62 @@ If two or more packets of a group are missing, the frame is unrecoverable → dr
 
 ### 3.3 Server send rules
 
-- Encode → packetize → send immediately. Use bounded token-bucket micro-pacing inside large
-  bursts; preserve sub-millisecond pacing debt so an IDR is not dumped into Wi-Fi at once.
+- Encode → packetize → send immediately. Use an eight-datagram token bucket and drain normal
+  frames at four times the estimated average wire rate (encoder bytes plus four FEC packets per
+  frame), clamped to 24–72 Mbps. IDRs use eight times wire rate, clamped to 48–96 Mbps, so they
+  remain bounded without blocking the encoder callback for several frame periods. Preserve
+  sub-millisecond debt so frames are not dumped into Wi-Fi.
 - If encoding of frame N has not finished when frame N+1 is captured, drop N+1
   (capture side already coalesces).
 - Socket send buffer small (≤256 KB). Set DSCP AF41 / TOS 0x88 on the media socket
   (best effort; ignore failures).
+
+### 3.4 Optional per-frame trace sidecar
+
+After the final data/FEC datagram for an encoded frame, a trace-capable server sends one
+optional 68-byte datagram to the same media endpoint. Loss of this datagram never affects video;
+clients that do not recognize it reject it as a non-media packet. All timestamp fields use the
+server's monotonic microsecond clock and correlate by `frameId`:
+
+```
+offset  size  field
+0       4     ASCII magic = "DSTR"
+4       1     version = 1
+5       3     reserved = 0
+8       4     uint32 frameId
+12      8     uint64 captureStartUs
+20      8     uint64 captureEndUs
+28      8     uint64 gpuConvertSubmitUs
+36      8     uint64 encodeSubmitUs
+44      8     uint64 encodeFinishUs
+52      8     uint64 packetStartUs
+60      8     uint64 packetEndUs
+```
+
+`captureStartUs` is immediately before the DXGI acquire call, so its interval includes waiting
+for the next source presentation. `captureEndUs` is after submission of the private-texture copy,
+and `gpuConvertSubmitUs` is after `VideoProcessorBlt` returns. D3D11 executes those commands
+asynchronously; these two fields are CPU submission boundaries, not GPU-fence completion.
+`encodeSubmitUs` is immediately before the actual Media Foundation `ProcessInput` or NVENC
+`EncodePicture`; `encodeFinishUs` is when the compressed access unit becomes available.
+`packetStartUs` precedes the first video datagram and `packetEndUs` follows the final FEC send
+attempt (before the trace datagram itself).
+
+A client records the first receive timestamp and the final data/FEC receive needed to assemble the
+access unit, actual frame-completion time after FEC, decoder output, and actual display callback
+when its platform exposes one.
+Packet pacing overlaps transmission and reception, so the meaningful transport values are:
+
+- head transit: `receiveFirst - packetStart` after clock-offset conversion;
+- tail transit: `receiveLast - packetEnd` after clock-offset conversion;
+- wire spread: `receiveLast - receiveFirst`.
+
+Do not calculate network time from first receive minus packet end and do not sum overlapping
+packet/transit stages. Per-frame formatting and file/console writes MUST run off capture, socket,
+decoder, and display callback threads. Android uses MediaCodec's frame-render callback. The
+current macOS AVSampleBufferDisplayLayer path exposes submission/enqueue only, so its trace file
+uses the explicit names `decodeSubmitUs` and `presentEnqueueUs` rather than claiming hardware
+completion; exact macOS completion requires an explicit VideoToolbox + Metal renderer.
 
 ## 3A. Audio channel (UDP, server → client)
 
@@ -397,11 +447,11 @@ for its cursor overlay; clients that do not recognize it ignore it.
 
 Inputs: `STATS` messages and IDR request rate.
 - The effective session ceiling is the smaller of `START_STREAM.maxBitrateKbps` and the
-  operator-configured server ceiling (20,000 kbps by default, never below 2,000 kbps).
+  operator-configured server ceiling (10,000 kbps by default, never below 3,000 kbps).
 - **Down:** if a stats interval has at least 3 dropped frames or more than 3% loss,
   capture-to-receive p95 reaches 150 ms, latency grows materially for 3 consecutive intervals
   above the stream's preserved healthy baseline, or at least 3 `REQUEST_IDR` messages arrive
-  within 2 s → new bitrate = max(2000, current × 0.8), apply to the encoder, and send
+  within 2 s → new bitrate = max(3000, current × 0.8), apply to the encoder, and send
   `BITRATE`. Allow 15 s for queued media to drain before another reconfiguration.
 - **Up:** require 10 consecutive clean intervals, capture-to-receive p95 ≤80 ms,
   decode-to-surface p95 ≤40 ms, at least 15 s since the previous bitrate change, and at least
@@ -409,7 +459,7 @@ Inputs: `STATS` messages and IDR request rate.
   only a full 60 s without congestion permits the ceiling to rise by 500 kbps, at most once
   every 30 s. If the hardware driver's live reconfiguration takes at least 50 ms or is rejected,
   disable further upward probes for that stream; emergency downward changes remain available.
-- Start at min(12000, maxBitrateKbps).
+- Start at min(8000, maxBitrateKbps) for 720p or min(12000, maxBitrateKbps) for native.
 - Optional latency fields do not break older peers. The healthy latency floor is retained for
   the stream epoch; bitrate changes must not reset it while old UDP data may still be queued.
   When `serverPipelineP95Ms` is available, subtract it from capture-to-receive latency before

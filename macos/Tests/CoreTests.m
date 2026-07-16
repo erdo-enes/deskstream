@@ -28,7 +28,7 @@ static NSData *DSMediaDatagram(uint32_t frameID,
                                BOOL fec,
                                BOOL keyframe,
                                NSData *payload) {
-    uint16_t fecCount = (uint16_t)((packetCount + 7) / 8);
+    uint16_t fecCount = MIN((uint16_t)4, packetCount);
     NSMutableData *datagram = [NSMutableData dataWithLength:DSMediaHeaderSize + payload.length];
     uint8_t *bytes = datagram.mutableBytes;
     bytes[0] = DSProtocolVersion;
@@ -74,6 +74,22 @@ static void TestEndianAndInputPackets(void) {
     DSAssert(DSReadUInt32BigEndian(bytes + 2) == 0xC3D4E5F6, @"UInt32 round trip");
     DSAssert(DSUInt32IsNewer(0, UINT32_MAX), @"UInt32 wrap comparison");
     DSAssert(!DSUInt32IsNewer(UINT32_MAX, 0), @"UInt32 stale wrap comparison");
+
+    NSMutableData *traceDatagram = [NSMutableData dataWithLength:DSFrameTracePacketSize];
+    uint8_t *traceBytes = traceDatagram.mutableBytes;
+    memcpy(traceBytes, "DSTR", 4);
+    traceBytes[4] = 1;
+    DSWriteUInt32BigEndian(traceBytes + 8, 77);
+    for (NSUInteger index = 0; index < 7; index++) {
+        DSWriteUInt64BigEndian(traceBytes + 12 + index * 8, 1000 + index * 10);
+    }
+    DSFrameTrace trace;
+    DSAssert(DSParseFrameTraceDatagram(traceBytes, traceDatagram.length, &trace) &&
+             trace.frameID == 77 && trace.captureStartMicroseconds == 1000 &&
+             trace.packetEndMicroseconds == 1060, @"Parse DSTR frame trace");
+    traceBytes[5] = 1;
+    DSAssert(!DSParseFrameTraceDatagram(traceBytes, traceDatagram.length, NULL),
+             @"Reject DSTR reserved fields");
 
     NSError *error = nil;
     NSData *mouse = DSMakeMousePacket(0x01020304,
@@ -167,7 +183,7 @@ static void TestMediaHeaderAndAssembly(void) {
     assembled = nil;
     outputCount = 0;
     [assembler reset];
-    NSData *parity = DSParity(@[first, last]);
+    NSData *parity = DSParity(@[first]);
     [assembler consumeDatagram:DSMediaDatagram(8, 1, 2, NO, YES, last)];
     [assembler consumeDatagram:DSMediaDatagram(8, 0, 2, YES, YES, parity)];
     DSAssert(outputCount == 1 && outputFrameID == 8 && outputKeyframe &&
@@ -186,8 +202,8 @@ static void TestMediaHeaderAndAssembly(void) {
         [chunks addObject:chunk];
         [largeExpected appendData:chunk];
     }
-    NSData *parity0 = DSParity([chunks subarrayWithRange:NSMakeRange(0, 8)]);
-    NSData *parity1 = DSParity([chunks subarrayWithRange:NSMakeRange(8, 2)]);
+    NSData *parity0 = DSParity(@[chunks[0], chunks[4], chunks[8]]);
+    NSData *parity3 = DSParity(@[chunks[3], chunks[7]]);
     [assembler consumeDatagram:DSMediaDatagram(30, 0, 10, YES, YES, parity0)];
     for (NSInteger index = 9; index >= 0; index--) {
         if (index == 3 || index == 8) continue;
@@ -196,7 +212,7 @@ static void TestMediaHeaderAndAssembly(void) {
         [assembler consumeDatagram:packet];
         if (index == 5) [assembler consumeDatagram:packet];
     }
-    [assembler consumeDatagram:DSMediaDatagram(30, 1, 10, YES, YES, parity1)];
+    [assembler consumeDatagram:DSMediaDatagram(30, 3, 10, YES, YES, parity3)];
     DSAssert(outputCount == 1 && outputFrameID == 30 &&
              [assembled isEqualToData:largeExpected], @"Multi-group reordered FEC recovery");
 
@@ -204,16 +220,24 @@ static void TestMediaHeaderAndAssembly(void) {
     [assembler reset];
     assembled = nil;
     outputCount = 0;
-    NSData *middle = DSFilledData(DSMediaMaximumPayload, 44);
-    NSData *threeParity = DSParity(@[first, middle, last]);
-    [assembler consumeDatagram:DSMediaDatagram(31, 2, 3, NO, YES, last)];
-    [assembler consumeDatagram:DSMediaDatagram(31, 0, 3, YES, YES, threeParity)];
+    NSMutableArray<NSData *> *nineChunks = [NSMutableArray array];
+    NSMutableData *nineExpected = [NSMutableData data];
+    for (NSUInteger index = 0; index < 9; index++) {
+        NSData *chunk = DSFilledData(index == 8 ? 37 : DSMediaMaximumPayload,
+                                    (uint8_t)(44 + index * 7));
+        [nineChunks addObject:chunk];
+        [nineExpected appendData:chunk];
+    }
+    NSData *groupZeroParity = DSParity(@[nineChunks[0], nineChunks[4], nineChunks[8]]);
+    for (NSUInteger index = 1; index < 9; index++) {
+        if (index == 4) continue;
+        [assembler consumeDatagram:DSMediaDatagram(31, (uint16_t)index, 9, NO, YES,
+                                                 nineChunks[index])];
+    }
+    [assembler consumeDatagram:DSMediaDatagram(31, 0, 9, YES, YES, groupZeroParity)];
     DSAssert(outputCount == 0, @"Two losses in one XOR group remain incomplete");
-    [assembler consumeDatagram:DSMediaDatagram(31, 0, 3, NO, YES, first)];
-    NSMutableData *threeExpected = [first mutableCopy];
-    [threeExpected appendData:middle];
-    [threeExpected appendData:last];
-    DSAssert(outputCount == 1 && [assembled isEqualToData:threeExpected],
+    [assembler consumeDatagram:DSMediaDatagram(31, 0, 9, NO, YES, nineChunks[0])];
+    DSAssert(outputCount == 1 && [assembled isEqualToData:nineExpected],
              @"Later real packet enables XOR recovery");
 
     // Four incomplete frames are allowed for Wi-Fi reordering; a fifth non-keyframe drops the

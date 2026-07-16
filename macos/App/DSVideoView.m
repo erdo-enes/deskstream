@@ -1,5 +1,7 @@
 #import "DSVideoView.h"
 
+#import "DSProtocol.h"
+
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreMedia/CoreMedia.h>
@@ -243,7 +245,7 @@ static void DSAppendNALRanges(const uint8_t *bytes, NSUInteger length, NSMutable
     if (startFlush) [self performRendererFlushRemovingImage:NO token:flushToken];
 }
 
-- (void)enqueueAnnexBAccessUnit:(NSData *)accessUnit keyframe:(BOOL)keyframe {
+- (void)enqueueAnnexBAccessUnit:(NSData *)accessUnit keyframe:(BOOL)keyframe frameID:(uint32_t)frameID {
     if (accessUnit.length == 0) return;
     NSUInteger generation = 0;
     BOOL overflow = NO;
@@ -297,10 +299,10 @@ static void DSAppendNALRanges(const uint8_t *bytes, NSUInteger length, NSMutable
             // sampleBufferRenderer explicitly supports background enqueue. Keeping conversion,
             // readiness checks, enqueue and flush initiation on one serial queue removes the main
             // thread from the 60 fps hot path.
-            [self renderSampleBuffer:sample keyframe:keyframe generation:generation];
+            [self renderSampleBuffer:sample keyframe:keyframe frameID:frameID generation:generation];
         } else {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self renderSampleBuffer:sample keyframe:keyframe generation:generation];
+                [self renderSampleBuffer:sample keyframe:keyframe frameID:frameID generation:generation];
             });
         }
     });
@@ -308,6 +310,7 @@ static void DSAppendNALRanges(const uint8_t *bytes, NSUInteger length, NSMutable
 
 - (void)renderSampleBuffer:(CMSampleBufferRef)sample
                   keyframe:(BOOL)keyframe
+                   frameID:(uint32_t)frameID
                 generation:(NSUInteger)generation {
     BOOL stale = NO;
     @synchronized (self) {
@@ -321,6 +324,7 @@ static void DSAppendNALRanges(const uint8_t *bytes, NSUInteger length, NSMutable
 
     BOOL ready = NO;
     BOOL requiresFlush = NO;
+    uint64_t decodeSubmitMicroseconds = DSMonotonicMicroseconds();
     if (@available(macOS 14.0, *)) {
         AVSampleBufferVideoRenderer *renderer = self.displayLayer.sampleBufferRenderer;
         requiresFlush = renderer.requiresFlushToResumeDecoding;
@@ -335,9 +339,13 @@ static void DSAppendNALRanges(const uint8_t *bytes, NSUInteger length, NSMutable
 #pragma clang diagnostic pop
     }
     if (ready) {
+        uint64_t presentEnqueueMicroseconds = DSMonotonicMicroseconds();
         @synchronized (self) {
             self.hasPicture = YES;
             if (keyframe) _waitingForKeyframe = NO;
+        }
+        if (self.frameTraceHandler) {
+            self.frameTraceHandler(frameID, decodeSubmitMicroseconds, presentEnqueueMicroseconds);
         }
     }
     CFRelease(sample);

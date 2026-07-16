@@ -52,9 +52,13 @@ if (FlagValue("--max-bitrate-kbps") is { } bitrateText
     maxBitrateKbps = parsedBitrate;
 }
 
+string defaultQuality = FlagValue("--quality") is { } requestedQuality
+    ? ServerOptions.Normalize(requestedQuality)
+    : "720p";
+
 var options = new ServerOptions
 {
-    DefaultQuality = ServerOptions.Normalize(FlagValue("--quality")),
+    DefaultQuality = defaultQuality,
     MaxBitrateKbps = maxBitrateKbps,
 };
 
@@ -219,9 +223,9 @@ try
             long pointerDelta = Math.Max(0, capPointer - prevCapPointer);
             long timeoutDelta = Math.Max(0, capTimeouts - prevCapTimeouts);
             long accumDelta = Math.Max(0, capAccum - prevCapAccum);
-            // presents/s ~= Δaccumulated + Δreal: distinguishes "content is only N fps" from
-            // "the pipeline is dropping presents" when reading these logs later.
-            long presentsPerSec = accumDelta + realDelta;
+            // DXGI AccumulatedFrames already includes the acquired present. Adding realDelta
+            // double-counted a healthy 60 Hz source as ~120 presents/s and hid undersampling.
+            long presentsPerSec = accumDelta;
 
             prevEncoded = enc;
             prevIdr = idr;
@@ -277,7 +281,10 @@ try
                 $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
                 $"fec-fix {Metric(session.LastClientFecRecovered)} | " +
                 $"udp pkts tx {sentPackets}/s rx {Metric(clientPacketRate)}/s fec {Metric(clientFecPacketRate)}/s " +
-                $"err {sendFailures} pace {pacingMs}ms | " +
+                $"err {sendFailures} pace {pacingMs}ms " +
+                $"@{session.MediaPacingBytesPerSec * 8 / 1_000_000}/" +
+                $"{session.MediaKeyframePacingBytesPerSec * 8 / 1_000_000}Mbps/" +
+                $"{session.MediaPacingBucketBytes / 1024}KiB | " +
                 $"rate {session.CurrentBitrateKbps}/{session.BitrateCeilingKbps} kbps " +
                 $"hold {(session.AdaptationHoldRemainingMs + 999) / 1000}s " +
                 $"probe {(session.UpwardAdaptationEnabled ? "on" : "off")} | " +
@@ -329,7 +336,9 @@ try
                         $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
                         $"fec-fix {Metric(session.LastClientFecRecovered)} total-max {win10MaxDropped} | " +
                         $"udp last tx {sentPackets}/s rx {Metric(clientPacketRate)}/s err {sendFailures} " +
-                        $"pace {pacingMs}ms | IDR req {win10Idr} | " +
+                        $"pace {pacingMs}ms @{session.MediaPacingBytesPerSec * 8 / 1_000_000}/" +
+                        $"{session.MediaKeyframePacingBytesPerSec * 8 / 1_000_000}Mbps/" +
+                        $"{session.MediaPacingBucketBytes / 1024}KiB | IDR req {win10Idr} | " +
                         $"cap {win10Re}re/{win10Po}po/{win10To}to ~{win10Pres}pres | " +
                         $"likely {bottleneck} p95 pipe/cap/net/dec " +
                         $"{Metric(session.LastServerPipelineP95Ms)}/" +

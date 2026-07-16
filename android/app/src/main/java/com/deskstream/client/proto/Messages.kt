@@ -37,12 +37,12 @@ object ClientMessages {
         }.toString()
 
     /**
-     * [quality] is `"native"` (default) or `"720p"`. Servers older than v0.5.0 ignore the
+     * [quality] is `"720p"` (default) or `"native"`. Servers older than v0.5.0 ignore the
      * unknown field and stream native resolution, which keeps this change backward-compatible.
      * The client always sizes its decoder from `STREAM_STARTED.width/height`, never from this
      * request, so a server that ignores or rejects the field cannot desync the client.
      */
-    fun startStream(maxBitrateKbps: Int, fps: Int, quality: String = "native"): String =
+    fun startStream(maxBitrateKbps: Int, fps: Int, quality: String = "720p"): String =
         JSONObject().apply {
             put("type", "START_STREAM")
             put("maxBitrateKbps", maxBitrateKbps)

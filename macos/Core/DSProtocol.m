@@ -1,6 +1,7 @@
 #import "DSProtocol.h"
 
 #import <libkern/OSByteOrder.h>
+#import <time.h>
 
 NSString * const DSProtocolErrorDomain = @"com.deskstream.macos.protocol";
 
@@ -14,6 +15,18 @@ uint32_t DSReadUInt32BigEndian(const uint8_t *bytes) {
     uint32_t value;
     memcpy(&value, bytes, sizeof(value));
     return OSSwapBigToHostInt32(value);
+}
+
+uint64_t DSReadUInt64BigEndian(const uint8_t *bytes) {
+    uint64_t value;
+    memcpy(&value, bytes, sizeof(value));
+    return OSSwapBigToHostInt64(value);
+}
+
+uint64_t DSMonotonicMicroseconds(void) {
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return (uint64_t)time.tv_sec * 1000000ULL + (uint64_t)time.tv_nsec / 1000ULL;
 }
 
 int16_t DSReadInt16BigEndian(const uint8_t *bytes) {
@@ -34,6 +47,11 @@ void DSWriteUInt32BigEndian(uint8_t *bytes, uint32_t value) {
     memcpy(bytes, &value, sizeof(value));
 }
 
+void DSWriteUInt64BigEndian(uint8_t *bytes, uint64_t value) {
+    value = OSSwapHostToBigInt64(value);
+    memcpy(bytes, &value, sizeof(value));
+}
+
 void DSWriteInt16BigEndian(uint8_t *bytes, int16_t value) {
     DSWriteUInt16BigEndian(bytes, (uint16_t)value);
 }
@@ -44,6 +62,25 @@ void DSWriteInt32BigEndian(uint8_t *bytes, int32_t value) {
 
 BOOL DSUInt32IsNewer(uint32_t candidate, uint32_t reference) {
     return (int32_t)(candidate - reference) > 0;
+}
+
+BOOL DSParseFrameTraceDatagram(const void *rawBytes, size_t length, DSFrameTrace *traceOut) {
+    if (rawBytes == NULL || length != DSFrameTracePacketSize) return NO;
+    const uint8_t *bytes = rawBytes;
+    if (memcmp(bytes, "DSTR", 4) != 0 || bytes[4] != 1 ||
+        bytes[5] != 0 || bytes[6] != 0 || bytes[7] != 0) return NO;
+    DSFrameTrace trace = {
+        .frameID = DSReadUInt32BigEndian(bytes + 8),
+        .captureStartMicroseconds = DSReadUInt64BigEndian(bytes + 12),
+        .captureEndMicroseconds = DSReadUInt64BigEndian(bytes + 20),
+        .convertEndMicroseconds = DSReadUInt64BigEndian(bytes + 28),
+        .encodeSubmitMicroseconds = DSReadUInt64BigEndian(bytes + 36),
+        .encodeFinishMicroseconds = DSReadUInt64BigEndian(bytes + 44),
+        .packetStartMicroseconds = DSReadUInt64BigEndian(bytes + 52),
+        .packetEndMicroseconds = DSReadUInt64BigEndian(bytes + 60),
+    };
+    if (traceOut != NULL) *traceOut = trace;
+    return YES;
 }
 
 BOOL DSParseMediaDatagram(const void *rawBytes,

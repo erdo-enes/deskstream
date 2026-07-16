@@ -14,9 +14,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// Called when it is safe to send a replacement IDR. If the renderer itself needed flushing,
 /// this is deliberately delayed until the asynchronous flush has completed.
 @property (nonatomic, copy, nullable) dispatch_block_t requestIDRHandler;
+@property (nonatomic, copy, nullable) void (^frameTraceHandler)(uint32_t frameID,
+                                                               uint64_t decodeSubmitMicroseconds,
+                                                               uint64_t presentEnqueueMicroseconds);
 @property (nonatomic, readonly) BOOL hasPicture;
 
-- (void)enqueueAnnexBAccessUnit:(NSData *)accessUnit keyframe:(BOOL)keyframe;
+- (void)enqueueAnnexBAccessUnit:(NSData *)accessUnit keyframe:(BOOL)keyframe frameID:(uint32_t)frameID;
 - (void)resetRenderer;
 
 /// Runs requestIDRHandler immediately when no renderer flush is active, otherwise coalesces the

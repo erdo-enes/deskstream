@@ -1,7 +1,8 @@
 # DeskStream — Architecture
 
-A Windows → Android/macOS LAN screen streamer engineered for minimal glass-to-glass latency
-(target: <50 ms median at 1080p60 on 5 GHz WiFi), designed around the documented failure
+A Windows → Android/macOS LAN screen streamer engineered for minimal glass-to-glass latency.
+The stability-first target is a native-resolution host downscaled on-GPU to 720p60 for transport
+(<50 ms median on 5 GHz WiFi), designed around the documented failure
 modes of Sunshine/Moonlight, Parsec, spacedesk, Steam Link, Miracast, and Chromecast.
 
 ## Design principles (what we fix)
@@ -23,7 +24,7 @@ DXGI Desktop Duplication (present-driven, GPU texture)     1–3 ms
   → Media Foundation hardware H.264 (or opt-in NVENC ULL)  3–8 ms
     (CBR, no B-frames/lookahead, IDR on demand,
     zero reorder delay, VBV ≈ 1 frame)
-  → Packetize ≤1200 B + XOR FEC → UDP                      <1 ms
+  → Packetize ≤1200 B + XOR FEC + bounded pacing → UDP     1–5 ms
   → WiFi (5 GHz)                                            1–5 ms
   → Kotlin UDP receive + FEC recover + frame assemble      1–2 ms
   → MediaCodec async (KEY_LOW_LATENCY) → SurfaceView       3–8 ms
@@ -36,12 +37,28 @@ WASAPI system-output loopback → shared-mode 48 kHz PCM16
 ```
 
 Rules that keep it low:
-- **Every stage is tightly bounded.** At most one decoder frame is submitted and one is
-  pending; media assembly holds at most two frames so limited UDP reordering can heal.
+- **Every stage is tightly bounded.** Decoder input and assembly use small hard limits; media
+  assembly holds at most four frames solely so limited UDP reordering can heal.
 - **No jitter buffer on the client.** Render as decoded; PTS is for stats only.
 - **Never retransmit video.** FEC recovers isolated loss; unrecoverable frame → drop it
   and send `REQUEST_IDR` on the control channel.
 - **UDP payloads ≤ 1200 bytes** — no IP fragmentation.
+
+## Per-frame performance trace
+
+The optional `DSTR` sidecar correlates every encoded frame without expanding the hot 20-byte
+media header. Server timestamps cover DXGI acquire, GPU-command submission, encoder submission
+and completion, then first/final packet transmission. Each client adds first/last receive,
+assembly completion, decode output, and presentation where the platform exposes it. PING/PONG
+clock offset lets the trace separate server work from Wi-Fi head/tail transit.
+
+Tracing is designed not to become the bottleneck it measures: correlation is capped at 256
+frames, sidecar loss is tolerated, and completed rows are formatted/written on background
+queues in batches. Android reports true MediaCodec output and Surface presentation callbacks.
+The current macOS AVFoundation renderer reports decoder submission and display enqueue with
+those explicit labels; a future VideoToolbox/Metal renderer is required for exact completion.
+Server `captureEnd` and `gpuConvert` are also command-submission boundaries until a non-blocking
+D3D11 timestamp-query ring is added.
 
 ## Components
 
@@ -57,6 +74,9 @@ Rules that keep it low:
   FEC assembler feeds H.264 access units directly to AVSampleBufferDisplayLayer with
   display-immediately semantics; separate bounded PCM output and foreground AppKit/
   GameController capture forward mouse, physical keyboard, and up to four gamepads.
+- `switch/` — libnx/SDL2 client. It uses the same discovery, current four-way interleaved FEC,
+  720p60/8 Mbps request, input snapshots, and per-frame correlation. H.264 decode is currently
+  FFmpeg software decode, so Switch performance is not equivalent to Android hardware decode.
 - `docs/PROTOCOL.md` — the wire contract both sides implement. **Normative.**
 
 ## Networking model
@@ -80,13 +100,14 @@ Rules that keep it low:
   scan codes. Resets on focus loss, capture release, stream stop, or disconnect prevent
   retained keys; unsupported usages are ignored for backward compatibility.
 
-## Adaptation (bitrate → fps → resolution)
+## Adaptation
 
 Client reports stats every second (received/dropped frames, bytes, IDR requests, and
-clock-synchronized capture→receive plus decode→surface p95 latency). Server controller:
-on loss, rising latency, or IDR-request pressure, cut bitrate 30% immediately (floor
-2 Mbps); on 5 s of clean stats, ramp up 10% (slow-start, ceiling = configured max).
-Framerate/resolution steps are v1.1 — the control messages already carry the fields.
+clock-synchronized capture→receive plus decode→surface p95 latency). The 720p profile starts
+at 8 Mbps. Sustained loss/backlog cuts bitrate by 20% (3 Mbps floor); upward probes require
+10 clean intervals and use 500 kbps steps with 15/30/60-second settle and recovery holds.
+Resolution and frame rate stay fixed for a stream epoch; automatic resolution/FPS steps are
+future protocol work.
 
 ## Deliberate non-goals (v1)
 

@@ -6,7 +6,7 @@
 // reordering without adding presentation latency (completed frames still leave immediately).
 static const NSUInteger DSMaximumInflightFrames = 4;
 static const uint16_t DSMaximumPacketCount = 4096;
-static const uint16_t DSFECGroupSize = 8;
+static const uint16_t DSFECInterleave = 4;
 
 @interface DSInflightFrame : NSObject
 
@@ -90,7 +90,7 @@ static const uint16_t DSFECGroupSize = 8;
     if (index == _packetCount - 1) {
         _lastPacketLength = header.payloadLength;
     }
-    [self tryRecoverGroup:(uint16_t)(index / DSFECGroupSize)];
+    [self tryRecoverGroup:(uint16_t)(index % DSFECInterleave)];
 }
 
 - (void)acceptFECHeader:(DSMediaHeader)header payload:(const uint8_t *)payload {
@@ -109,12 +109,10 @@ static const uint16_t DSFECGroupSize = 8;
     uint16_t parityLength = fecLengths[group];
     if (parityLength == UINT16_MAX) return;
 
-    NSUInteger first = (NSUInteger)group * DSFECGroupSize;
-    NSUInteger end = MIN(first + DSFECGroupSize, _packetCount);
     uint8_t *present = _dataPresent.mutableBytes;
     NSInteger missingIndex = -1;
     NSUInteger missingCount = 0;
-    for (NSUInteger index = first; index < end; index++) {
+    for (NSUInteger index = group; index < _packetCount; index += DSFECInterleave) {
         if (present[index] == 0) {
             missingIndex = (NSInteger)index;
             missingCount++;
@@ -136,7 +134,7 @@ static const uint16_t DSFECGroupSize = 8;
 
     for (NSUInteger byteIndex = 0; byteIndex < parityLength; byteIndex++) {
         uint8_t value = parityBytes[byteIndex];
-        for (NSUInteger index = first; index < end; index++) {
+        for (NSUInteger index = group; index < _packetCount; index += DSFECInterleave) {
             if ((NSInteger)index == missingIndex || present[index] == 0) continue;
             NSInteger packetLength = index == _packetCount - 1
                 ? _lastPacketLength
@@ -206,17 +204,18 @@ static const uint16_t DSFECGroupSize = 8;
     if (!DSParseMediaDatagram(bytes, length, &header, &payload) ||
         header.packetCount == 0 ||
         header.packetCount > DSMaximumPacketCount ||
-        header.fecCount != (header.packetCount + DSFECGroupSize - 1) / DSFECGroupSize) {
+        header.fecCount != MIN(DSFECInterleave, header.packetCount)) {
         return;
     }
 
     BOOL fec = (header.flags & DSMediaFlagFEC) != 0;
     if (fec) {
         if (header.packetIndex >= header.fecCount) return;
-        NSUInteger groupStart = (NSUInteger)header.packetIndex * DSFECGroupSize;
-        // Every parity group containing a non-final data packet has a 1200-byte maximum.
-        // Only a group consisting solely of the final remainder may be shorter.
-        if (groupStart != header.packetCount - 1 &&
+        NSUInteger group = header.packetIndex;
+        NSUInteger memberCount = (header.packetCount - group + DSFECInterleave - 1) /
+                                 DSFECInterleave;
+        // A multi-member interleaved group always contains a full non-final packet.
+        if (memberCount > 1 &&
             header.payloadLength != DSMediaMaximumPayload) return;
     } else {
         if (header.packetIndex >= header.packetCount) return;

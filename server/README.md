@@ -36,10 +36,11 @@ subsequent connections auto-authenticate (TOFU). Delete that file to force re-pa
 
 ### Runtime options
 
-- `--quality native|720p` sets the default for clients that do not select quality themselves.
+- `--quality native|720p` sets the default for clients that do not select quality themselves;
+  the process default is `720p`.
 - `--max-bitrate-kbps N` sets a hard encoder-target ceiling for every client. The default is
-  20,000 kbps and the minimum is 2,000. On congested Wi-Fi, `--max-bitrate-kbps 12000` is a
-  useful 1080p60 starting point; this ceiling excludes XOR-FEC, packet headers, and PCM audio.
+  10,000 kbps and the minimum is 3,000. The 720p profile starts at 8,000 kbps; this ceiling
+  excludes XOR-FEC, packet headers, and PCM audio.
 - `--web-port N` changes the dashboard port from 47810, `--no-web` disables it, and `--web-lan`
   binds it to LAN interfaces instead of loopback. LAN mode is unauthenticated and exposes the
   pairing PIN, so use it only on a trusted private network.
@@ -113,6 +114,11 @@ See [`../docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md). Source layout:
 - The hot path (packetize → send) is allocation-free; GC runs in `SustainedLowLatency`.
 - Every pipeline stage holds at most one frame; a stale capture is dropped when the encoder
   is busy (newest-wins), never queued.
+- Video UDP is paced with an eight-datagram token bucket. Normal frames use four times estimated
+  average wire rate; IDRs use eight times so recovery stays bounded without becoming a burst.
+- Each emitted frame carries an optional 68-byte `DSTR` timing sidecar covering capture call,
+  D3D11 copy/convert submission, actual encoder submit/finish, and packet start/end. The sidecar
+  adds about 4 KiB/s at 60 fps and is ignored by older clients.
 - `EnableWindowsTargeting` is set so the project compiles on non-Windows CI, but it only
   **runs** on Windows.
 - Windows UIPI blocks a normal process from injecting into an elevated game. Run the server

@@ -72,7 +72,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var wifiLock: WifiManager.WifiLock? = null
     /** Preferred stream quality ("native" or "720p"), persisted via [Prefs.streamQuality] and
      * sent as START_STREAM.quality. Servers before v0.5.0 ignore the field and stream native. */
-    private var streamQuality: String = Prefs.QUALITY_NATIVE
+    private var streamQuality: String = Prefs.QUALITY_720P
 
     private var surfaceReady = false
     /** True once START_STREAM has been sent for the current READY session; reset whenever we
@@ -448,10 +448,10 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 }
             },
             onBufferRelease = { buffer -> receiver.bufferPool.release(buffer) },
-            onFrameRendered = { latencyMs ->
+            onFrameRendered = { frameId, decodeUs, presentUs, latencyMs ->
                 if (mediaReceiver === receiver && videoDecoder === decoder) {
                     frameRendered = true
-                    receiver.recordDecodedFrame(latencyMs)
+                    receiver.recordDecodedFrame(frameId, decodeUs, presentUs, latencyMs)
                 }
             }
         )
@@ -1131,7 +1131,7 @@ class StreamActivity : AppCompatActivity(), SurfaceHolder.Callback {
         private const val TAG = "StreamActivity"
         private const val STATE_CONTROLS_HIDDEN = "controls_hidden"
         private const val MAX_NATIVE_BITRATE_KBPS = 20000
-        private const val MAX_720P_BITRATE_KBPS = 10000
+        private const val MAX_720P_BITRATE_KBPS = 8000
         private const val TARGET_FPS = 60
         private const val MOUSE_HINT_VISIBLE_MS = 4500L
         private const val MOUSE_HINT_FADE_MS = 250L

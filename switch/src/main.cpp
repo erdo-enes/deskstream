@@ -7,6 +7,11 @@
 #include <algorithm>
 #include <fstream>
 #include <cstring>
+#include <charconv>
+#include <climits>
+#include <deque>
+#include <sstream>
+#include <system_error>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -21,6 +26,70 @@
 #ifdef __SWITCH__
 #include <switch.h>
 #endif
+
+namespace {
+
+uint64_t monotonicUs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+bool getJsonInt64(const std::string& json, const char* key, int64_t& value) {
+    const std::string marker = std::string("\"") + key + "\"";
+    size_t pos = json.find(marker);
+    if (pos == std::string::npos) return false;
+    pos = json.find(':', pos + marker.size());
+    if (pos == std::string::npos) return false;
+    pos = json.find_first_not_of(" \t\r\n", pos + 1);
+    if (pos == std::string::npos) return false;
+    const char* begin = json.data() + pos;
+    const char* end = json.data() + json.size();
+    int64_t parsed = 0;
+    auto result = std::from_chars(begin, end, parsed);
+    if (result.ec != std::errc()) return false;
+    value = parsed;
+    return true;
+}
+
+bool getJsonInt(const std::string& json, const char* key, int& value) {
+    int64_t parsed = 0;
+    if (!getJsonInt64(json, key, parsed) || parsed < INT_MIN || parsed > INT_MAX) return false;
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+bool frameIdAfter(uint32_t value, uint32_t reference) {
+    return static_cast<int32_t>(value - reference) > 0;
+}
+
+struct ClientFrameTrace {
+    uint64_t receiveUs = 0;
+    uint64_t lastReceiveUs = 0;
+    uint64_t assembleUs = 0;
+    uint64_t decodeUs = 0;
+    uint64_t presentUs = 0;
+};
+
+struct CompleteFrameTrace {
+    ServerFrameTrace server;
+    ClientFrameTrace client;
+};
+
+#ifdef __SWITCH__
+class SwitchSocketRuntime {
+public:
+    SwitchSocketRuntime() : _result(socketInitializeDefault()), _ready(R_SUCCEEDED(_result)) {}
+    ~SwitchSocketRuntime() { if (_ready) socketExit(); }
+    bool ready() const { return _ready; }
+    Result result() const { return _result; }
+
+private:
+    Result _result;
+    bool _ready;
+};
+#endif
+
+} // namespace
 
 // Simple, dependency-free config storage
 struct SavedConfig {
@@ -156,7 +225,7 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
 
     // Send START_STREAM
     // Request 720p as it is the native portable resolution for Switch
-    std::string startJson = "{\"type\":\"START_STREAM\",\"maxBitrateKbps\":10000,\"fps\":60,\"quality\":\"720p\"}";
+    std::string startJson = "{\"type\":\"START_STREAM\",\"maxBitrateKbps\":8000,\"fps\":60,\"quality\":\"720p\"}";
     control.sendMessage(startJson);
 
     std::string startResp;
@@ -170,9 +239,13 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
         return;
     }
 
-    int mediaPort = std::stoi(getJsonValue(startResp, "mediaPort"));
-    int width = std::stoi(getJsonValue(startResp, "width"));
-    int height = std::stoi(getJsonValue(startResp, "height"));
+    int mediaPort = 0, width = 0, height = 0;
+    if (!getJsonInt(startResp, "mediaPort", mediaPort) || mediaPort <= 0 || mediaPort > 65535 ||
+        !getJsonInt(startResp, "width", width) || width <= 0 || width > 4096 ||
+        !getJsonInt(startResp, "height", height) || height <= 0 || height > 4096) {
+        std::cerr << "[stream] Invalid STREAM_STARTED parameters." << std::endl;
+        return;
+    }
 
     std::cout << "[stream] Stream started at " << width << "x" << height << ", UDP media port: " << mediaPort << std::endl;
 
@@ -188,12 +261,13 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
     control.sendMessage("{\"type\":\"AUDIO_START\"}");
     UDPReceiver audioSocket;
     bool audioEnabled = false;
+    int audioPort = 0;
 
     std::string audioResp;
     if (control.readMessage(audioResp, 2000)) {
         if (getJsonValue(audioResp, "type") == "AUDIO_STARTED") {
-            int audioPort = std::stoi(getJsonValue(audioResp, "audioPort"));
-            if (audioSocket.bindToAny()) {
+            if (getJsonInt(audioResp, "audioPort", audioPort) &&
+                audioPort > 0 && audioPort <= 65535 && audioSocket.bindToAny()) {
                 control.sendMessage("{\"type\":\"AUDIO_READY\",\"port\":" + std::to_string(audioSocket.getPort()) + "}");
                 audioEnabled = true;
                 std::cout << "[stream] Audio started, UDP audio port: " << audioPort << std::endl;
@@ -234,15 +308,36 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
         return;
     }
 
-    // Assembly queues
+    // Four frames is a reorder/recovery window, never a render queue.
     std::map<uint32_t, FrameAssembly> assemblyQueue;
-    uint32_t latestCompleteFrameId = 0xFFFFFFFF;
-    uint32_t latestReceivedFrameId = 0xFFFFFFFF;
+    bool discardingUntilKeyframe = true;
+    bool hasExpectedFrame = false;
+    bool hasLastOutputFrame = false;
+    uint32_t expectedFrameId = 0;
+    uint32_t lastOutputFrameId = 0;
+    uint64_t lastIdrRequestUs = 0;
+
+    // DSTR timing sidecars arrive after their media datagrams. Correlate by frameId without
+    // logging on the media hot path, then emit one bounded JSON batch per stats interval.
+    std::map<uint32_t, ServerFrameTrace> serverTraces;
+    std::map<uint32_t, ClientFrameTrace> clientTraces;
+    std::map<uint32_t, ClientFrameTrace> decodePending;
+    std::deque<CompleteFrameTrace> completedTraces;
+    int64_t serverClockOffsetUs = 0; // server clock - client clock
+    int64_t bestClockRttUs = LLONG_MAX;
+    bool hasClockSync = false;
+    uint64_t lastClockPingUs = 0;
+    uint64_t clockSampleWindowStartUs = 0;
     
     // Stats tracking
     auto lastStatsTime = std::chrono::steady_clock::now();
     uint32_t statsFramesOk = 0;
     uint32_t statsFramesDropped = 0;
+    uint32_t statsFramesAssembled = 0;
+    uint32_t statsDecoderDropped = 0;
+    uint32_t statsFecRecovered = 0;
+    uint32_t statsVideoPackets = 0;
+    uint32_t statsFecPackets = 0;
     uint32_t statsBytes = 0;
 
     auto lastHolePunchTime = std::chrono::steady_clock::now();
@@ -250,6 +345,111 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
 
     uint8_t packetBuf[1500];
     bool running = true;
+
+    auto correlateTrace = [&](uint32_t frameId) {
+        auto serverIt = serverTraces.find(frameId);
+        auto clientIt = clientTraces.find(frameId);
+        if (serverIt == serverTraces.end() || clientIt == clientTraces.end()) return;
+        if (completedTraces.size() >= 120) completedTraces.pop_front();
+        completedTraces.push_back({serverIt->second, clientIt->second});
+        serverTraces.erase(serverIt);
+        clientTraces.erase(clientIt);
+    };
+
+    auto requestIdr = [&]() {
+        const uint64_t requestUs = monotonicUs();
+        if (lastIdrRequestUs == 0 || requestUs - lastIdrRequestUs >= 300000) {
+            control.sendMessage("{\"type\":\"REQUEST_IDR\"}");
+            lastIdrRequestUs = requestUs;
+        }
+    };
+
+    auto discardForLoss = [&]() {
+        statsFramesDropped += static_cast<uint32_t>(std::max<size_t>(1, assemblyQueue.size()));
+        assemblyQueue.clear();
+        decodePending.clear();
+        decoder.flush();
+        discardingUntilKeyframe = true;
+        hasExpectedFrame = false;
+        requestIdr();
+    };
+
+    auto decodeAndPresent = [&](FrameAssembly& frame) {
+        size_t totalSize = 0;
+        for (uint16_t idx = 0; idx < frame.packetCount; ++idx) {
+            auto chunkIt = frame.dataPackets.find(idx);
+            if (chunkIt == frame.dataPackets.end()) return;
+            totalSize += chunkIt->second.size();
+        }
+
+        std::vector<uint8_t> frameData;
+        frameData.reserve(totalSize);
+        for (uint16_t idx = 0; idx < frame.packetCount; ++idx) {
+            const auto& chunk = frame.dataPackets.find(idx)->second;
+            frameData.insert(frameData.end(), chunk.begin(), chunk.end());
+        }
+
+        ClientFrameTrace assemblyTrace;
+        assemblyTrace.receiveUs = frame.firstReceiveUs;
+        assemblyTrace.lastReceiveUs = frame.lastReceiveUs;
+        assemblyTrace.assembleUs = frame.completedAtUs;
+        decodePending[frame.frameId] = assemblyTrace;
+        while (decodePending.size() > 16) {
+            decodePending.erase(decodePending.begin());
+            ++statsDecoderDropped;
+        }
+
+        uint8_t *yPlane = nullptr, *uPlane = nullptr, *vPlane = nullptr;
+        int yPitch = 0, uPitch = 0, vPitch = 0;
+        uint32_t decodedFrameId = frame.frameId;
+        bool decoded = decoder.decode(frameData.data(), frameData.size(), frame.frameId,
+                                      yPlane, uPlane, vPlane, yPitch, uPitch, vPitch,
+                                      decodedFrameId);
+        const uint64_t decodeUs = monotonicUs();
+        if (!decoded) return;
+
+        auto pendingIt = decodePending.find(decodedFrameId);
+        ClientFrameTrace trace = pendingIt != decodePending.end()
+            ? pendingIt->second
+            : assemblyTrace;
+        if (pendingIt != decodePending.end()) decodePending.erase(pendingIt);
+        trace.decodeUs = decodeUs;
+
+        if (SDL_UpdateYUVTexture(texture, nullptr, yPlane, yPitch, uPlane, uPitch,
+                                 vPlane, vPitch) != 0 ||
+            SDL_RenderClear(renderer) != 0 ||
+            SDL_RenderCopy(renderer, texture, nullptr, nullptr) != 0) {
+            ++statsDecoderDropped;
+            return;
+        }
+        SDL_RenderPresent(renderer);
+        trace.presentUs = monotonicUs();
+        clientTraces[decodedFrameId] = trace;
+        while (clientTraces.size() > 256) clientTraces.erase(clientTraces.begin());
+        correlateTrace(decodedFrameId);
+        ++statsFramesOk;
+    };
+
+    auto drainReadyFrames = [&]() {
+        while (hasExpectedFrame) {
+            auto frameIt = assemblyQueue.find(expectedFrameId);
+            if (frameIt == assemblyQueue.end() || !frameIt->second.isComplete()) break;
+
+            FrameAssembly frame = std::move(frameIt->second);
+            assemblyQueue.erase(frameIt);
+            if (discardingUntilKeyframe && !frame.isKeyframe) {
+                ++statsFramesDropped;
+                expectedFrameId += 1;
+                continue;
+            }
+            if (discardingUntilKeyframe) discardingUntilKeyframe = false;
+
+            decodeAndPresent(frame);
+            hasLastOutputFrame = true;
+            lastOutputFrameId = frame.frameId;
+            expectedFrameId = frame.frameId + 1;
+        }
+    };
 
     std::cout << "[stream] Entering active stream loop." << std::endl;
 
@@ -270,12 +470,19 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
 
         auto now = std::chrono::steady_clock::now();
 
+        const uint64_t loopNowUs = monotonicUs();
+        if (lastClockPingUs == 0 || loopNowUs - lastClockPingUs >= 2000000) {
+            control.sendMessage("{\"type\":\"PING\",\"t0Us\":" +
+                                std::to_string(loopNowUs) + "}");
+            lastClockPingUs = loopNowUs;
+        }
+
         // 2. Periodic hole punch (every 1s)
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastHolePunchTime).count() >= 1) {
             mediaSocket.sendTo((const uint8_t*)"DSMH", 4, destMediaAddr);
             if (audioEnabled) {
                 struct sockaddr_in destAudioAddr = destMediaAddr;
-                destAudioAddr.sin_port = htons(std::stoi(getJsonValue(audioResp, "audioPort")));
+                destAudioAddr.sin_port = htons(static_cast<uint16_t>(audioPort));
                 audioSocket.sendTo((const uint8_t*)"DSAH", 4, destAudioAddr);
             }
             lastHolePunchTime = now;
@@ -291,13 +498,83 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
 
         // 4. Period Stats reports (every 1s)
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStatsTime).count() >= 1) {
+            std::vector<int64_t> serverPipelineMs;
+            std::vector<int64_t> captureToReceiveMs;
+            std::vector<int64_t> decodeToSurfaceMs;
+            std::ostringstream traceLine;
+            traceLine << "[frame-trace-batch] {\"clockOffsetUs\":";
+            if (hasClockSync) traceLine << serverClockOffsetUs;
+            else traceLine << "null";
+            traceLine << ",\"clockRttUs\":";
+            if (hasClockSync) traceLine << bestClockRttUs;
+            else traceLine << "null";
+            traceLine << ",\"frames\":[";
+            bool firstTrace = true;
+            for (const CompleteFrameTrace& trace : completedTraces) {
+                if (!firstTrace) traceLine << ',';
+                firstTrace = false;
+                traceLine << "{\"frameId\":" << trace.server.frameId
+                          << ",\"captureStartUs\":" << trace.server.captureStartUs
+                          << ",\"captureEndUs\":" << trace.server.captureEndUs
+                          << ",\"gpuConvertSubmitUs\":" << trace.server.convertEndUs
+                          << ",\"encodeSubmitUs\":" << trace.server.encodeSubmitUs
+                          << ",\"encodeFinishUs\":" << trace.server.encodeFinishUs
+                          << ",\"packetStartUs\":" << trace.server.packetStartUs
+                          << ",\"packetEndUs\":" << trace.server.packetEndUs
+                          << ",\"receiveUs\":" << trace.client.receiveUs
+                          << ",\"lastReceiveUs\":" << trace.client.lastReceiveUs
+                          << ",\"assembleUs\":" << trace.client.assembleUs
+                          << ",\"decodeUs\":" << trace.client.decodeUs
+                          << ",\"presentUs\":" << trace.client.presentUs << '}';
+
+                const int64_t serverPipelineUs =
+                    trace.server.packetEndUs - trace.server.captureStartUs;
+                if (serverPipelineUs >= 0) serverPipelineMs.push_back((serverPipelineUs + 999) / 1000);
+                if (hasClockSync) {
+                    const int64_t transportUs = static_cast<int64_t>(trace.client.receiveUs) -
+                        trace.server.captureStartUs + serverClockOffsetUs;
+                    if (transportUs >= 0) captureToReceiveMs.push_back((transportUs + 999) / 1000);
+                }
+                const int64_t surfaceUs = static_cast<int64_t>(trace.client.presentUs) -
+                    static_cast<int64_t>(trace.client.decodeUs);
+                if (surfaceUs >= 0) decodeToSurfaceMs.push_back((surfaceUs + 999) / 1000);
+            }
+            traceLine << "]}";
+            if (!completedTraces.empty()) std::cout << traceLine.str() << std::endl;
+
+            auto p95 = [](std::vector<int64_t>& values) -> int {
+                if (values.empty()) return -1;
+                std::sort(values.begin(), values.end());
+                size_t index = (values.size() * 95 + 99) / 100;
+                if (index == 0) index = 1;
+                int64_t value = values[index - 1];
+                return value > INT_MAX ? INT_MAX : static_cast<int>(value);
+            };
+            const int serverPipelineP95 = p95(serverPipelineMs);
+            const int captureToReceiveP95 = p95(captureToReceiveMs);
+            const int decodeToSurfaceP95 = p95(decodeToSurfaceMs);
+
             std::string statsJson = "{\"type\":\"STATS\",\"framesOk\":" + std::to_string(statsFramesOk) + 
+                                    ",\"framesAssembled\":" + std::to_string(statsFramesAssembled) +
                                     ",\"framesDropped\":" + std::to_string(statsFramesDropped) + 
+                                    ",\"assemblyFramesDropped\":" + std::to_string(statsFramesDropped) +
+                                    ",\"decoderFramesDropped\":" + std::to_string(statsDecoderDropped) +
+                                    ",\"fecPacketsRecovered\":" + std::to_string(statsFecRecovered) +
+                                    ",\"videoPacketsReceived\":" + std::to_string(statsVideoPackets) +
+                                    ",\"fecPacketsReceived\":" + std::to_string(statsFecPackets) +
                                     ",\"bytes\":" + std::to_string(statsBytes) + 
-                                    ",\"intervalMs\":1000,\"captureToReceiveP95Ms\":10,\"decodeToSurfaceP95Ms\":5}";
+                                    ",\"intervalMs\":1000,\"serverPipelineP95Ms\":" + std::to_string(serverPipelineP95) +
+                                    ",\"captureToReceiveP95Ms\":" + std::to_string(captureToReceiveP95) +
+                                    ",\"decodeToSurfaceP95Ms\":" + std::to_string(decodeToSurfaceP95) + "}";
             control.sendMessage(statsJson);
+            completedTraces.clear();
             statsFramesOk = 0;
             statsFramesDropped = 0;
+            statsFramesAssembled = 0;
+            statsDecoderDropped = 0;
+            statsFecRecovered = 0;
+            statsVideoPackets = 0;
+            statsFecPackets = 0;
             statsBytes = 0;
             lastStatsTime = now;
         }
@@ -308,11 +585,36 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
             std::string type = getJsonValue(controlMsg, "type");
             if (type == "PING") {
                 control.sendMessage("{\"type\":\"PONG\"}");
+            } else if (type == "PONG") {
+                int64_t t0Us = 0, t1Us = 0, t2Us = 0;
+                const int64_t t3Us = static_cast<int64_t>(monotonicUs());
+                if (getJsonInt64(controlMsg, "t0Us", t0Us) &&
+                    getJsonInt64(controlMsg, "t1Us", t1Us) &&
+                    getJsonInt64(controlMsg, "t2Us", t2Us) &&
+                    t0Us > 0 && t1Us > 0 && t2Us >= t1Us && t3Us >= t0Us) {
+                    const int64_t rttUs = (t3Us - t0Us) - (t2Us - t1Us);
+                    if (rttUs >= 0) {
+                        if (clockSampleWindowStartUs == 0 ||
+                            static_cast<uint64_t>(t3Us) - clockSampleWindowStartUs >= 30000000) {
+                            clockSampleWindowStartUs = static_cast<uint64_t>(t3Us);
+                            bestClockRttUs = LLONG_MAX;
+                            hasClockSync = false;
+                        }
+                        if (rttUs <= bestClockRttUs) {
+                            bestClockRttUs = rttUs;
+                            serverClockOffsetUs = ((t1Us - t0Us) + (t2Us - t3Us)) / 2;
+                            hasClockSync = true;
+                        }
+                    }
+                }
             } else if (type == "GAMEPAD_RUMBLE") {
 #ifdef __SWITCH__
                 // Trigger HD Rumble if compiled on the console
-                int largeMotor = std::stoi(getJsonValue(controlMsg, "largeMotor"));
-                int smallMotor = std::stoi(getJsonValue(controlMsg, "smallMotor"));
+                int largeMotor = 0, smallMotor = 0;
+                (void)getJsonInt(controlMsg, "largeMotor", largeMotor);
+                (void)getJsonInt(controlMsg, "smallMotor", smallMotor);
+                largeMotor = std::max(0, std::min(255, largeMotor));
+                smallMotor = std::max(0, std::min(255, smallMotor));
                 
                 HidVibrationDeviceHandle handles[2];
                 hidInitializeVibrationDevices(handles, 2, HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual);
@@ -342,78 +644,136 @@ static void runStream(SDL_Renderer* renderer, const std::string& ip, uint16_t po
         int readBytes = 0;
         while ((readBytes = mediaSocket.receive(packetBuf, sizeof(packetBuf), fromAddr, 0)) > 0) {
             statsBytes += readBytes;
+            const uint64_t receivedAtUs = monotonicUs();
+
+            // Heartbeats and timing sidecars are standalone datagrams, not v1 media packets.
+            if (readBytes == 4 && std::memcmp(packetBuf, "DSHB", 4) == 0) continue;
+            ServerFrameTrace serverTrace;
+            if (FecProcessor::parseFrameTrace(packetBuf, readBytes, serverTrace)) {
+                serverTraces[serverTrace.frameId] = serverTrace;
+                while (serverTraces.size() > 256) serverTraces.erase(serverTraces.begin());
+                correlateTrace(serverTrace.frameId);
+                continue;
+            }
+
             MediaPacket pkt;
             if (FecProcessor::parsePacket(packetBuf, readBytes, pkt)) {
-                if (pkt.flags & 2) { // Liveness heartbeat DSHB
-                    continue;
+                const bool isFec = (pkt.flags & 0x02u) != 0;
+                ++statsVideoPackets;
+                if (isFec) ++statsFecPackets;
+
+                if (hasLastOutputFrame && !frameIdAfter(pkt.frameId, lastOutputFrameId)) continue;
+                if (discardingUntilKeyframe && (pkt.flags & 0x01u) == 0) {
+                    bool keyframeInFlight = false;
+                    for (const auto& entry : assemblyQueue) {
+                        if (entry.second.isKeyframe) {
+                            keyframeInFlight = true;
+                            break;
+                        }
+                    }
+                    if (!keyframeInFlight) continue;
                 }
 
                 // If this is a new frame, initialize its assembly state
                 if (assemblyQueue.find(pkt.frameId) == assemblyQueue.end()) {
-                    // Check if it's too old
-                    if (latestCompleteFrameId != 0xFFFFFFFF && pkt.frameId <= latestCompleteFrameId) {
-                        continue;
+                    if (assemblyQueue.size() >= 4) {
+                        // A fresh complete keyframe can heal the chain without asking the server
+                        // for another IDR. Otherwise discard bounded state and rate-limit an IDR.
+                        if ((pkt.flags & 0x01u) != 0) {
+                            statsFramesDropped += static_cast<uint32_t>(assemblyQueue.size());
+                            assemblyQueue.clear();
+                            decodePending.clear();
+                            decoder.flush();
+                            discardingUntilKeyframe = true;
+                            expectedFrameId = pkt.frameId;
+                            hasExpectedFrame = true;
+                        } else {
+                            discardForLoss();
+                            continue;
+                        }
                     }
                     FrameAssembly fa;
                     fa.frameId = pkt.frameId;
                     fa.packetCount = pkt.packetCount;
                     fa.fecCount = pkt.fecCount;
                     fa.ptsMs = pkt.ptsMs;
-                    fa.isKeyframe = (pkt.flags & 1) != 0;
-                    assemblyQueue[pkt.frameId] = fa;
-                    latestReceivedFrameId = std::max(latestReceivedFrameId, pkt.frameId);
+                    fa.isKeyframe = (pkt.flags & 0x01u) != 0;
+                    fa.firstReceiveUs = receivedAtUs;
+                    fa.lastReceiveUs = receivedAtUs;
+                    const bool startsDecodeChain = fa.isKeyframe;
+                    assemblyQueue.emplace(pkt.frameId, std::move(fa));
+                    if (!hasExpectedFrame && startsDecodeChain) {
+                        expectedFrameId = pkt.frameId;
+                        hasExpectedFrame = true;
+                    }
                 }
 
                 FrameAssembly& fa = assemblyQueue[pkt.frameId];
-                if (pkt.flags & 2) { // Parity packet
+                if (fa.packetCount != pkt.packetCount || fa.fecCount != pkt.fecCount ||
+                    fa.isKeyframe != ((pkt.flags & 0x01u) != 0)) {
+                    continue;
+                }
+                fa.lastReceiveUs = receivedAtUs;
+                if (isFec) {
                     fa.parityPackets[pkt.packetIndex] = pkt.payload;
-                } else { // Data packet
+                } else {
                     fa.dataPackets[pkt.packetIndex] = pkt.payload;
                 }
 
-                // Run FEC recovery
-                if (fa.runFecRecovery()) {
-                    // Frame completed! Let's decode it immediately
-                    latestCompleteFrameId = pkt.frameId;
-
-                    // Assemble the Annex-B byte stream
-                    std::vector<uint8_t> frameData;
-                    for (uint16_t idx = 0; idx < fa.packetCount; ++idx) {
-                        const auto& chunk = fa.dataPackets[idx];
-                        frameData.insert(frameData.end(), chunk.begin(), chunk.end());
-                    }
-
-                    // Decode
-                    uint8_t *yPlane = nullptr, *uPlane = nullptr, *vPlane = nullptr;
-                    int yPitch = 0, uPitch = 0, vPitch = 0;
-                    if (decoder.decode(frameData.data(), frameData.size(), yPlane, uPlane, vPlane, yPitch, uPitch, vPitch)) {
-                        // Render frame
-                        SDL_UpdateYUVTexture(texture, nullptr, yPlane, yPitch, uPlane, uPitch, vPlane, vPitch);
-                        SDL_RenderClear(renderer);
-                        SDL_RenderCopy(renderer, texture, nullptr, nullptr);
-                        SDL_RenderPresent(renderer);
-                        statsFramesOk++;
-                    }
-                    
-                    // Clean up old frames in the queue
-                    while (!assemblyQueue.empty() && assemblyQueue.begin()->first <= latestCompleteFrameId) {
-                        assemblyQueue.erase(assemblyQueue.begin());
-                    }
+                const uint16_t recoveredBefore = fa.recoveredPacketCount;
+                if (fa.runFecRecovery() && fa.completedAtUs == 0) {
+                    fa.completedAtUs = monotonicUs();
+                    ++statsFramesAssembled;
                 }
+                statsFecRecovered += fa.recoveredPacketCount - recoveredBefore;
+                drainReadyFrames();
             }
         }
 
-        // 7. Check for unrecoverable frame drops (if we have gaps in frame assembly)
-        if (latestReceivedFrameId != 0xFFFFFFFF && latestCompleteFrameId != 0xFFFFFFFF &&
-            latestReceivedFrameId > latestCompleteFrameId + 2) {
-            
-            // Gap detected! Request an IDR frame to recover stream
-            control.sendMessage("{\"type\":\"REQUEST_IDR\"}");
-            statsFramesDropped++;
-            
-            // Purge assembly queues and reset frame track
-            assemblyQueue.clear();
-            latestCompleteFrameId = latestReceivedFrameId;
+        // 7. A later complete AU proves that expectedFrameId is missing. Give UDP/FEC 20 ms
+        // to reorder; then heal at an already-buffered IDR or request one once.
+        if (hasExpectedFrame && !assemblyQueue.empty()) {
+            auto laterComplete = assemblyQueue.end();
+            uint32_t smallestDistance = UINT32_MAX;
+            for (auto it = assemblyQueue.begin(); it != assemblyQueue.end(); ++it) {
+                if (!it->second.isComplete()) continue;
+                const uint32_t distance = it->first - expectedFrameId;
+                if (distance != 0 && distance < 0x80000000u && distance < smallestDistance) {
+                    smallestDistance = distance;
+                    laterComplete = it;
+                }
+            }
+            const bool windowFull = assemblyQueue.size() >= 4;
+            const bool graceExpired = laterComplete != assemblyQueue.end() &&
+                monotonicUs() - laterComplete->second.completedAtUs >= 20000;
+            if (windowFull || graceExpired) {
+                auto healingKeyframe = assemblyQueue.end();
+                uint32_t keyframeDistance = UINT32_MAX;
+                for (auto it = assemblyQueue.begin(); it != assemblyQueue.end(); ++it) {
+                    if (!it->second.isComplete() || !it->second.isKeyframe) continue;
+                    const uint32_t distance = it->first - expectedFrameId;
+                    if (distance < 0x80000000u && distance < keyframeDistance) {
+                        keyframeDistance = distance;
+                        healingKeyframe = it;
+                    }
+                }
+                if (healingKeyframe != assemblyQueue.end()) {
+                    const uint32_t keyframeId = healingKeyframe->first;
+                    FrameAssembly keyframe = std::move(healingKeyframe->second);
+                    statsFramesDropped += static_cast<uint32_t>(
+                        std::max<size_t>(1, assemblyQueue.size() - 1));
+                    assemblyQueue.clear();
+                    assemblyQueue.emplace(keyframeId, std::move(keyframe));
+                    decodePending.clear();
+                    decoder.flush();
+                    discardingUntilKeyframe = true;
+                    expectedFrameId = keyframeId;
+                    hasExpectedFrame = true;
+                    drainReadyFrames();
+                } else {
+                    discardForLoss();
+                }
+            }
         }
 
         // 8. Receive and drain UDP Audio packets
@@ -575,6 +935,15 @@ int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     std::cout << "[main] Initializing DeskStream Switch Homebrew client." << std::endl;
 
+#ifdef __SWITCH__
+    SwitchSocketRuntime socketRuntime;
+    if (!socketRuntime.ready()) {
+        std::cerr << "[network] socketInitializeDefault failed: "
+                  << static_cast<uint32_t>(socketRuntime.result()) << std::endl;
+        return -1;
+    }
+#endif
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK) < 0) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
         return -1;
@@ -602,17 +971,20 @@ int main(int argc, char* argv[]) {
     std::string ip = cfg.serverIp;
 
     DiscoveryClient discovery;
-    discovery.start();
+    bool discoveryReady = discovery.start();
+    if (!discoveryReady) {
+        std::cerr << "[discovery] " << discovery.lastError() << std::endl;
+    }
 
     std::vector<DiscoveredServer> list;
-    uint32_t lastProbeTicks = 0;
+    uint32_t lastProbeTicks = SDL_GetTicks() - 1500;
     int selectIdx = 0;
 
     bool quit = false;
     while (!quit) {
         // 1. Poll LAN Discovery automatically (every 1.5 seconds)
         uint32_t now = SDL_GetTicks();
-        if (now - lastProbeTicks >= 1500) {
+        if (discoveryReady && now - lastProbeTicks >= 1500) {
             auto freshList = discovery.probe();
             if (!freshList.empty() || list.empty()) {
                 list = freshList;
@@ -701,7 +1073,9 @@ int main(int argc, char* argv[]) {
         // 4. Handle Actions
         if (triggerRefresh) {
             list.clear();
-            lastProbeTicks = 0;
+            discovery.clearResults();
+            if (!discoveryReady) discoveryReady = discovery.start();
+            lastProbeTicks = SDL_GetTicks() - 1500;
         }
 
         if (triggerManual) {
@@ -771,7 +1145,10 @@ int main(int argc, char* argv[]) {
         }
 
         // Status message
-        if (list.empty()) {
+        if (!discoveryReady) {
+            drawText(renderer, "LAN discovery unavailable: " + discovery.lastError(), 60,
+                     startY + (int)menuItems.size() * 65 + 20, 2, {239, 68, 68, 255});
+        } else if (list.empty()) {
             drawText(renderer, "Scanning LAN for DeskStream servers...", 60, startY + (int)menuItems.size() * 65 + 20, 2, {154, 164, 176, 255});
         } else {
             drawText(renderer, "Scan active. Discovered " + std::to_string(list.size()) + " server(s).", 60, startY + (int)menuItems.size() * 65 + 20, 2, {34, 197, 94, 255});

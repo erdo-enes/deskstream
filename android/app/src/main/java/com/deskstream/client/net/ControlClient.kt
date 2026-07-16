@@ -30,6 +30,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.ArrayDeque
 
 /**
  * Control channel: TCP 47801, length-prefixed JSON, per docs/PROTOCOL.md §2.
@@ -95,7 +96,7 @@ object ControlClient {
     @Volatile private var explicitlyDisconnected = false
     @Volatile private var lastSentToken = ""
     @Volatile private var backoffMs = INITIAL_BACKOFF_MS
-    @Volatile private var bestClockRttUs = Long.MAX_VALUE
+    private val clockEstimator = RollingClockOffsetEstimator()
     @Volatile var serverClockOffsetUs = 0L
         private set
     @Volatile var clockSynchronized = false
@@ -116,7 +117,7 @@ object ControlClient {
         serverIp = ip
         serverPort = port
         backoffMs = INITIAL_BACKOFF_MS
-        bestClockRttUs = Long.MAX_VALUE
+        clockEstimator.reset()
         serverClockOffsetUs = 0L
         clockSynchronized = false
         resetIdrLimiter()
@@ -146,7 +147,7 @@ object ControlClient {
         scope.launch { writeFrame(ClientMessages.pairCode(pin)) }
     }
 
-    fun startStream(maxBitrateKbps: Int = 20000, fps: Int = 60, quality: String = "native") {
+    fun startStream(maxBitrateKbps: Int = 8000, fps: Int = 60, quality: String = "720p") {
         scope.launch { writeFrame(ClientMessages.startStream(maxBitrateKbps, fps, quality)) }
     }
 
@@ -264,7 +265,7 @@ object ControlClient {
         lastReceivedAt = SystemClock.elapsedRealtime()
         // A reconnect may land on a freshly restarted server whose monotonic-clock origin is
         // different. Never carry an old low-RTT estimate across TCP connections.
-        bestClockRttUs = Long.MAX_VALUE
+        clockEstimator.reset()
         serverClockOffsetUs = 0L
         clockSynchronized = false
         startPingAndWatchdog()
@@ -428,13 +429,11 @@ object ControlClient {
     }
 
     private fun updateClockEstimate(pong: ServerMessage.Pong) {
-        if (pong.t0Us <= 0L || pong.t1Us <= 0L || pong.t2Us < pong.t1Us) return
-        val t3Us = nowUs()
-        val rttUs = (t3Us - pong.t0Us) - (pong.t2Us - pong.t1Us)
-        if (rttUs < 0L || rttUs >= bestClockRttUs) return
-        bestClockRttUs = rttUs
-        // NTP offset: positive means the server monotonic clock is ahead of Android's.
-        serverClockOffsetUs = ((pong.t1Us - pong.t0Us) + (pong.t2Us - t3Us)) / 2L
+        val estimate = clockEstimator.add(pong.t0Us, pong.t1Us, pong.t2Us, nowUs()) ?: return
+        // Positive means the server monotonic clock is ahead of Android's. The estimator chooses
+        // the lowest-RTT sample in only the recent window, so long sessions can follow clock drift
+        // instead of retaining one unusually fast but increasingly stale startup sample forever.
+        serverClockOffsetUs = estimate.offsetUs
         clockSynchronized = true
     }
 
@@ -471,5 +470,45 @@ object ControlClient {
                 }
             }
         }
+    }
+}
+
+internal data class ClockOffsetEstimate(val offsetUs: Long, val rttUs: Long)
+
+/**
+ * NTP-style offset estimator using the lowest-RTT sample in a rolling window. Low RTT minimizes
+ * asymmetric-path error, while expiry lets the estimate follow monotonic-clock drift in sessions
+ * lasting hours or days. The sample count is independently bounded in case a peer floods PONGs.
+ */
+internal class RollingClockOffsetEstimator(
+    private val windowUs: Long = 30_000_000L,
+    private val maxSamples: Int = 32
+) {
+    private data class Sample(val receivedAtUs: Long, val rttUs: Long, val offsetUs: Long)
+
+    private val samples = ArrayDeque<Sample>()
+
+    @Synchronized fun reset() = samples.clear()
+
+    @Synchronized fun add(t0Us: Long, t1Us: Long, t2Us: Long, t3Us: Long): ClockOffsetEstimate? {
+        if (t0Us <= 0L || t1Us <= 0L || t2Us < t1Us || t3Us < t0Us) return null
+        val roundTripUs = t3Us - t0Us
+        val serverWorkUs = t2Us - t1Us
+        if (serverWorkUs > roundTripUs) return null
+        val rttUs = roundTripUs - serverWorkUs
+        val offsetUs = ((t1Us - t0Us) + (t2Us - t3Us)) / 2L
+
+        while (samples.isNotEmpty() && t3Us - samples.first.receivedAtUs > windowUs) {
+            samples.removeFirst()
+        }
+        while (samples.size >= maxSamples.coerceAtLeast(1)) samples.removeFirst()
+        samples.addLast(Sample(t3Us, rttUs, offsetUs))
+
+        // Prefer the newest sample when RTT ties, which avoids keeping an older equally-good
+        // measurement for the full window for no accuracy benefit.
+        val best = samples.minWithOrNull(
+            compareBy<Sample> { it.rttUs }.thenByDescending { it.receivedAtUs }
+        ) ?: return null
+        return ClockOffsetEstimate(best.offsetUs, best.rttUs)
     }
 }

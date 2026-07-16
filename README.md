@@ -2,7 +2,8 @@
 
 Low-latency Windows → Android and Apple-silicon macOS screen streaming over LAN WiFi.
 No cloud, no account, no virtual display drivers — the PC mirrors its screen to your
-phone, tablet, or Mac at 1080p60 with a target glass-to-glass latency under 50 ms.
+phone, tablet, or Mac at 720p60 while the host continues rendering at its native resolution,
+with a target glass-to-glass latency under 50 ms.
 
 Built by studying what breaks in Sunshine/Moonlight, Parsec, spacedesk, Steam Link,
 Miracast, and Chromecast, and designing those failure modes out. See
@@ -41,8 +42,9 @@ Miracast, and Chromecast, and designing those failure modes out. See
    (console output, including the PIN, goes to `deskstream.log`, while application diagnostics go to `deskstream.app.log`; manage it from the web
    dashboard). `--uninstall-autostart` removes it. A true session-0 Windows service cannot
    capture the desktop, so this is deliberately a user-session autostart.
-7. Optional: cap the encoder target with `--max-bitrate-kbps 12000` on congested WiFi
-   (default 20000; minimum 2000). FEC, packet headers, and PCM audio add wire overhead.
+7. The stability-first default is 720p60 with an 8 Mbps starting target and 10 Mbps ceiling.
+   Override the ceiling with `--max-bitrate-kbps`; FEC, packet headers, and PCM audio add
+   roughly 4 Mbps of wire overhead at 60 fps while audio is active.
 
 **Android (8.0+):**
 1. Open `android/` in Android Studio, run on your device.
@@ -87,6 +89,8 @@ Miracast, and Chromecast, and designing those failure modes out. See
   same authenticated mouse/gamepad transports without system-wide input permissions.
 - Clock-synchronized p95 pipeline telemetry, a media heartbeat, UDP re-punching, bounded
   pools/queues, and automatic stream restart keep long sessions from accumulating delay.
+- An optional per-frame trace correlates capture, GPU-command submission, encode, packet pacing,
+  receive, FEC assembly, decode, and presentation without performing log I/O on hot threads.
 - Closed-loop bitrate adaptation so WiFi congestion degrades quality, not latency.
-- Optional 720p60 mode downscales on the server GPU before encoding and uses a 10 Mbps client
-  ceiling — fewer pixels and packets to encode, send, and decode on constrained networks/devices.
+- The default 720p60 profile downscales on the server GPU before encoding, starts at 8 Mbps,
+  and uses bounded eight-datagram packet pacing. Native streaming remains an explicit option.

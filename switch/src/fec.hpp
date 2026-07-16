@@ -4,6 +4,17 @@
 #include <cstdint>
 #include <map>
 
+struct ServerFrameTrace {
+    uint32_t frameId = 0;
+    int64_t captureStartUs = 0;
+    int64_t captureEndUs = 0;
+    int64_t convertEndUs = 0;
+    int64_t encodeSubmitUs = 0;
+    int64_t encodeFinishUs = 0;
+    int64_t packetStartUs = 0;
+    int64_t packetEndUs = 0;
+};
+
 // Struct representing a received media packet
 struct MediaPacket {
     uint8_t version;
@@ -25,6 +36,10 @@ struct FrameAssembly {
     uint16_t fecCount = 0;
     uint32_t ptsMs = 0;
     bool isKeyframe = false;
+    uint64_t firstReceiveUs = 0;
+    uint64_t lastReceiveUs = 0;
+    uint64_t completedAtUs = 0;
+    uint16_t recoveredPacketCount = 0;
     
     // Map from packetIndex to packet payload
     std::map<uint16_t, std::vector<uint8_t>> dataPackets;
@@ -41,4 +56,5 @@ struct FrameAssembly {
 class FecProcessor {
 public:
     static bool parsePacket(const uint8_t* buffer, int len, MediaPacket& packet);
+    static bool parseFrameTrace(const uint8_t* buffer, int len, ServerFrameTrace& trace);
 };

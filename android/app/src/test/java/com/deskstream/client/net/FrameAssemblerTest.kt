@@ -7,6 +7,34 @@ import org.junit.Test
 
 class FrameAssemblerTest {
     @Test
+    fun completionTiming_preservesFirstAndLastReceive_andUsesActualCompletionClock() {
+        var timing: FrameAssemblyTiming? = null
+        var completionClockUs = 9_750L
+        val assembler = FrameAssembler(
+            bufferPool = BufferPool(),
+            nowUs = { completionClockUs },
+            onFrameComplete = { _, _, _, _, _, _, value -> timing = value },
+            onFrameDropped = { _, _ -> }
+        )
+
+        assembler.accept(
+            packet(frameId = 7, packetIndex = 0, packetCount = 2, keyframe = true),
+            nowMs = 5,
+            nowUs = 5_125L
+        )
+        completionClockUs = 9_875L
+        assembler.accept(
+            packet(frameId = 7, packetIndex = 1, packetCount = 2, keyframe = true),
+            nowMs = 9,
+            nowUs = 9_500L
+        )
+
+        assertEquals(5_125L, timing!!.firstReceiveUs)
+        assertEquals(9_500L, timing!!.lastReceiveUs)
+        assertEquals(9_875L, timing!!.completedUs)
+    }
+
+    @Test
     fun delayedOlderFrameCompletesBeforeGrace_withoutFalseDrop() {
         val completed = mutableListOf<Long>()
         var drops = 0
@@ -132,7 +160,7 @@ class FrameAssemblerTest {
         lateinit var assembler: FrameAssembler
         assembler = FrameAssembler(
             bufferPool = BufferPool(),
-            onFrameComplete = { _, _, _, frameId, _, _ ->
+            onFrameComplete = { _, _, _, frameId, _, _, _ ->
                 completed += frameId
                 if (frameId == 61L) assembler.requestDiscardUntilKeyframe()
             },
@@ -176,7 +204,7 @@ class FrameAssemblerTest {
         var completedData: ByteArray? = null
         val assembler = FrameAssembler(
             bufferPool = BufferPool(),
-            onFrameComplete = { buffer, length, _, _, _, _ ->
+            onFrameComplete = { buffer, length, _, _, _, _, _ ->
                 completedLength = length
                 completedData = buffer.copyOf(length)
             },
@@ -222,7 +250,7 @@ class FrameAssemblerTest {
         var completedLength = 0
         val assembler = FrameAssembler(
             bufferPool = BufferPool(),
-            onFrameComplete = { _, length, _, _, _, _ -> completedLength = length },
+            onFrameComplete = { _, length, _, _, _, _, _ -> completedLength = length },
             onFrameDropped = { _, _ -> }
         )
         val payloads = Array(8) { index ->
@@ -291,14 +319,18 @@ class FrameAssemblerTest {
         onDrop: (Boolean) -> Unit
     ): FrameAssembler = FrameAssembler(
         bufferPool = BufferPool(),
-        onFrameComplete = { _, _, _, frameId, _, _ ->
+        onFrameComplete = { _, _, _, frameId, _, _, _ ->
             completed += frameId
         },
         onFrameDropped = { requestIdr, _ -> onDrop(requestIdr) }
     )
 
-    private fun FrameAssembler.accept(value: EncodedPacket, nowMs: Long) {
-        onPacket(value.header, value.bytes, MediaPacketHeader.HEADER_SIZE, nowMs)
+    private fun FrameAssembler.accept(
+        value: EncodedPacket,
+        nowMs: Long,
+        nowUs: Long = nowMs * 1000L
+    ) {
+        onPacket(value.header, value.bytes, MediaPacketHeader.HEADER_SIZE, nowMs, nowUs)
     }
 
     private data class EncodedPacket(val header: MediaPacketHeader, val bytes: ByteArray)

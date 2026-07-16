@@ -30,9 +30,12 @@ class VideoDecoder(
     private val onDropOrError: () -> Unit,
     /** Returns an access-unit buffer to its originating MediaReceiver pool. */
     private val onBufferRelease: (ByteArray) -> Unit,
-    /** Called when a decoded frame is released toward the Surface. */
-    private val onFrameRendered: (latencyMs: Int) -> Unit = {}
+    /** Called from MediaCodec's actual Surface-render callback, not merely output release. */
+    private val onFrameRendered: (frameId: Long, decodeUs: Long, presentUs: Long, latencyMs: Int) -> Unit =
+        { _, _, _, _ -> }
 ) {
+    private data class SubmittedFrame(val frameId: Long, val enqueuedAtUs: Long)
+    private data class DecodedFrame(val frameId: Long, val enqueuedAtUs: Long, val decodeUs: Long)
     private data class PendingFrame(
         val data: ByteArray,
         val length: Int,
@@ -72,7 +75,9 @@ class VideoDecoder(
     private var codec: MediaCodec? = null
     private var codecReleasePending = false
     private val pendingInputIndices = ArrayDeque<Int>()
-    private val submitTimesUs = HashMap<Long, Long>()
+    private val submitTimesUs = HashMap<Long, SubmittedFrame>()
+    private val decodedFrames = LinkedHashMap<Long, DecodedFrame>()
+    private var frameRenderClock = FrameRenderClock(0L)
     private var codecStartedAtUs = 0L
     private var lastInputQueuedAtUs = 0L
     private var lastOutputAtUs = 0L
@@ -90,21 +95,25 @@ class VideoDecoder(
             info: MediaCodec.BufferInfo
         ) {
             if (mc !== codec) return
-            val submittedUs = submitTimesUs.remove(info.presentationTimeUs)
+            val submitted = submitTimesUs.remove(info.presentationTimeUs)
             var sentToSurface = false
+            val decodeUs = nowUs()
             try {
                 mc.releaseOutputBuffer(index, true)
                 sentToSurface = true
             } catch (_: IllegalStateException) {
                 // A queued stale callback can race a normal stream reset.
             }
-            if (sentToSurface && submittedUs != null) {
-                val nowUs = nowUs()
-                lastOutputAtUs = nowUs
-                val latencyMs = ((nowUs - submittedUs) / 1000L)
-                    .coerceIn(0L, 60_000L)
-                    .toInt()
-                onFrameRendered(latencyMs)
+            if (sentToSurface && submitted != null) {
+                lastOutputAtUs = decodeUs
+                while (decodedFrames.size >= MAX_TRACKED_FRAMES) {
+                    decodedFrames.remove(decodedFrames.keys.first())
+                }
+                decodedFrames[info.presentationTimeUs] = DecodedFrame(
+                    submitted.frameId,
+                    submitted.enqueuedAtUs,
+                    decodeUs
+                )
             }
         }
 
@@ -313,6 +322,7 @@ class VideoDecoder(
         codecReleasePending = false
         pendingInputIndices.clear()
         submitTimesUs.clear()
+        decodedFrames.clear()
         workerGeneration = config.generation
         streamConfig = config
         codecStartedAtUs = 0L
@@ -359,7 +369,7 @@ class VideoDecoder(
             var ptsUs = nowUs()
             while (submitTimesUs.containsKey(ptsUs)) ptsUs++
             activeCodec.queueInputBuffer(index, 0, frame.length, ptsUs, 0)
-            submitTimesUs[ptsUs] = frame.enqueuedAtUs
+            submitTimesUs[ptsUs] = SubmittedFrame(frame.frameId, frame.enqueuedAtUs)
             lastInputQueuedAtUs = ptsUs
             if (frame.keyframe) recoverySignaled.set(false)
             queued = true
@@ -400,7 +410,27 @@ class VideoDecoder(
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
 
+            frameRenderClock = FrameRenderClock.sample()
             candidate.setCallback(callback, handler)
+            candidate.setOnFrameRenderedListener(
+                { renderedCodec, presentationTimeUs, nanoTime ->
+                    // A released codec may still have a queued listener callback. Never let it
+                    // consume a presentation timestamp belonging to the replacement codec.
+                    if (renderedCodec !== codec) return@setOnFrameRenderedListener
+                    val decoded = decodedFrames.remove(presentationTimeUs)
+                        ?: return@setOnFrameRenderedListener
+                    val presentUs = if (nanoTime > 0L) {
+                        frameRenderClock.toElapsedRealtimeUs(nanoTime)
+                    } else {
+                        nowUs()
+                    }
+                    val latencyMs = ((presentUs - decoded.enqueuedAtUs) / 1000L)
+                        .coerceIn(0L, 60_000L)
+                        .toInt()
+                    onFrameRendered(decoded.frameId, decoded.decodeUs, presentUs, latencyMs)
+                },
+                handler
+            )
             candidate.configure(format, config.surface, null, 0)
             candidate.start()
             if (released.get() || config.generation != streamGeneration) {
@@ -429,6 +459,7 @@ class VideoDecoder(
         codec = null
         pendingInputIndices.clear()
         submitTimesUs.clear()
+        decodedFrames.clear()
         signalQueueRecovery(notify)
         if (old == null) return
 
@@ -460,6 +491,7 @@ class VideoDecoder(
         codecReleasePending = false
         pendingInputIndices.clear()
         submitTimesUs.clear()
+        decodedFrames.clear()
         streamConfig = null
         workerGeneration = -1L
     }
@@ -594,6 +626,7 @@ class VideoDecoder(
         // absorbs short Android scheduler/vendor-codec stalls without decoding stale video;
         // the previous 3-frame/50 ms limit repeatedly broke healthy reference chains at 60 fps.
         private const val MAX_PENDING_FRAMES = 6
+        private const val MAX_TRACKED_FRAMES = 256
         private const val MAX_PENDING_AGE_US = 120_000L
         private const val CODEC_STARTUP_GRACE_US = 1_000_000L
         private const val CODEC_INPUT_STALL_US = 500_000L
@@ -602,5 +635,26 @@ class VideoDecoder(
         private const val RELEASE_WAIT_MS = 1_500L
         // Matches the Android protocol sanity ceiling: 4096 packets * 1200-byte payload.
         private const val MAX_ACCESS_UNIT_BYTES = 4096 * 1200
+    }
+}
+
+/**
+ * MediaCodec.OnFrameRenderedListener reports timestamps in System.nanoTime's clock, while all
+ * DeskStream client telemetry and NTP synchronization use elapsedRealtimeNanos. The clocks tick
+ * at the same rate while streaming but can have a large suspend-time offset, so sample that offset
+ * once per codec epoch and convert every actual-render timestamp before correlating it.
+ */
+internal class FrameRenderClock(private val elapsedMinusNanoNs: Long) {
+    fun toElapsedRealtimeUs(frameRenderedNanoTime: Long): Long =
+        (frameRenderedNanoTime + elapsedMinusNanoNs) / 1000L
+
+    companion object {
+        fun sample(): FrameRenderClock {
+            val nanoBefore = System.nanoTime()
+            val elapsed = SystemClock.elapsedRealtimeNanos()
+            val nanoAfter = System.nanoTime()
+            val nanoMidpoint = nanoBefore + (nanoAfter - nanoBefore) / 2L
+            return FrameRenderClock(elapsed - nanoMidpoint)
+        }
     }
 }

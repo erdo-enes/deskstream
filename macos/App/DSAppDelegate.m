@@ -5,6 +5,7 @@
 #import "DSCredentialStore.h"
 #import "DSDiscoveryService.h"
 #import "DSFrameAssembler.h"
+#import "DSFrameTraceCollector.h"
 #import "DSGamepadManager.h"
 #import "DSInputController.h"
 #import "DSProtocol.h"
@@ -16,8 +17,9 @@
 
 static const uint16_t DSDefaultControlPort = 47801;
 static const NSInteger DSNativeMaxBitrateKbps = 20000;
-static const NSInteger DS720pMaxBitrateKbps = 10000;
+static const NSInteger DS720pMaxBitrateKbps = 8000;
 static NSString * const DSQualityDefaultsKey = @"DSQuality";
+static NSString * const DSQuality720MigrationDefaultsKey = @"DSQuality720MigrationV1";
 
 @interface DSAppDelegate ()
 @property (nonatomic, strong) NSWindow *window;
@@ -53,6 +55,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
 @property (nonatomic, strong) DSUDPSocket *mediaSocket;
 @property (nonatomic, strong) DSUDPSocket *audioSocket;
 @property (nonatomic, strong) DSFrameAssembler *frameAssembler;
+@property (nonatomic, strong) DSFrameTraceCollector *frameTraceCollector;
 @property (nonatomic, strong) DSAudioPlayer *audioPlayer;
 @property (nonatomic, strong) DSInputController *inputController;
 @property (nonatomic, strong) DSGamepadManager *gamepadManager;
@@ -89,7 +92,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
 @synthesize quality = _quality;
 
 - (NSString *)quality {
-    return _quality ?: @"native";
+    return _quality ?: @"720p";
 }
 
 - (void)setQuality:(NSString *)quality {
@@ -110,8 +113,15 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
     self.mediaQueue = dispatch_queue_create("com.deskstream.macos.media", mediaAttributes);
     self.audioQueue = dispatch_queue_create("com.deskstream.macos.audio-network", audioAttributes);
     self.audioPlayer = [[DSAudioPlayer alloc] init];
-    NSString *storedQuality = [NSUserDefaults.standardUserDefaults stringForKey:DSQualityDefaultsKey];
-    _quality = [storedQuality isEqualToString:@"720p"] ? @"720p" : @"native";
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (![defaults boolForKey:DSQuality720MigrationDefaultsKey]) {
+        _quality = @"720p";
+        [defaults setObject:_quality forKey:DSQualityDefaultsKey];
+        [defaults setBool:YES forKey:DSQuality720MigrationDefaultsKey];
+    } else {
+        NSString *storedQuality = [defaults stringForKey:DSQualityDefaultsKey];
+        _quality = [storedQuality isEqualToString:@"native"] ? @"native" : @"720p";
+    }
     [self buildMainMenu];
     [self buildWindow];
     [self buildStreamingComponents];
@@ -281,7 +291,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
     self.connectionStatus.textColor = NSColor.secondaryLabelColor;
     self.connectionStatus.maximumNumberOfLines = 3;
 
-    NSString *version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.5.3";
+    NSString *version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.8.1";
     NSTextField *versionLabel = [self label:[NSString stringWithFormat:@"Client Version: %@", version] size:11];
     versionLabel.textColor = NSColor.tertiaryLabelColor;
 
@@ -441,6 +451,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
 
 - (void)buildStreamingComponents {
     __weak typeof(self) weakSelf = self;
+    self.frameTraceCollector = [[DSFrameTraceCollector alloc] init];
     self.inputController = [[DSInputController alloc]
         initWithView:self.streamView
         sendDatagram:^(NSData *datagram) { [weakSelf sendMediaDatagram:datagram]; }
@@ -461,13 +472,21 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
         [weakSelf.frameAssembler requestDiscardUntilKeyframe];
     };
     self.videoView.requestIDRHandler = ^{ [weakSelf sendIDRRequestNow]; };
+    self.videoView.frameTraceHandler = ^(uint32_t frameID, uint64_t decodeSubmit,
+                                         uint64_t presentEnqueue) {
+        [weakSelf.frameTraceCollector recordRendererSubmissionForFrameID:frameID
+                                                decodeSubmitMicroseconds:decodeSubmit
+                                               presentEnqueueMicroseconds:presentEnqueue];
+    };
 
     self.frameAssembler = [[DSFrameAssembler alloc]
         initWithOutputHandler:^(NSData *accessUnit, BOOL keyframe, uint32_t frameID,
                                 uint32_t pts, uint16_t pipelineDelay) {
-            (void)frameID; (void)pts; (void)pipelineDelay;
+            (void)pts; (void)pipelineDelay;
+            [weakSelf.frameTraceCollector recordAssembleForFrameID:frameID
+                                                    atMicroseconds:DSMonotonicMicroseconds()];
             @synchronized (weakSelf) { weakSelf.intervalFrames++; }
-            [weakSelf.videoView enqueueAnnexBAccessUnit:accessUnit keyframe:keyframe];
+            [weakSelf.videoView enqueueAnnexBAccessUnit:accessUnit keyframe:keyframe frameID:frameID];
         } dropHandler:^{
             @synchronized (weakSelf) { weakSelf.intervalDrops++; }
             [weakSelf requestIDR];
@@ -659,6 +678,20 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
     } else if ([type isEqualToString:@"BITRATE"]) {
         self.currentBitrate = [message[@"kbps"] integerValue];
         [self updateStreamStatusWithSuffix:nil];
+    } else if ([type isEqualToString:@"PONG"]) {
+        uint64_t t0 = [message[@"t0Us"] unsignedLongLongValue];
+        uint64_t t1 = [message[@"t1Us"] unsignedLongLongValue];
+        uint64_t t2 = [message[@"t2Us"] unsignedLongLongValue];
+        uint64_t t3 = DSMonotonicMicroseconds();
+        uint64_t elapsed = t3 >= t0 ? t3 - t0 : 0;
+        uint64_t serverWork = t2 >= t1 ? t2 - t1 : UINT64_MAX;
+        if (t0 > 0 && t1 >= t0 && t2 >= t1 && elapsed >= serverWork) {
+            uint64_t roundTrip = elapsed - serverWork;
+            int64_t offset = ((int64_t)t1 - (int64_t)t0 +
+                              (int64_t)t2 - (int64_t)t3) / 2;
+            [self.frameTraceCollector updateClockOffsetMicroseconds:offset
+                                              roundTripMicroseconds:roundTrip];
+        }
     } else if ([type isEqualToString:@"STREAM_STOPPED"]) {
         self.streaming = NO;
         self.streamRequested = NO;
@@ -707,6 +740,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
     self.mediaReceived = NO;
     self.lastMediaAt = NSProcessInfo.processInfo.systemUptime;
     self.lastIDRAt = 0;
+    [self.frameTraceCollector reset];
     // stopSessionAndNotifyServer: already reset both the assembler and renderer. Do not enqueue a
     // second asynchronous renderer flush here: it could consume the startup IDR from the server.
     [self showStreamUI];
@@ -719,7 +753,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
         rawHandler:^(const void *bytes, size_t length) {
             [weakSelf consumeMediaBytes:bytes length:length];
         } error:&error];
-    if (!self.mediaSocket || ![self.mediaSocket bindToPort:0 receiveBufferSize:1024 * 1024 error:&error] ||
+    if (!self.mediaSocket || ![self.mediaSocket bindToPort:0 receiveBufferSize:256 * 1024 error:&error] ||
         ![self.mediaSocket start:&error]) {
         [self handleControlError:error];
         return;
@@ -738,6 +772,11 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
 
 - (void)consumeMediaBytes:(const void *)rawBytes length:(size_t)length {
     const uint8_t *bytes = rawBytes;
+    DSFrameTrace trace;
+    if (DSParseFrameTraceDatagram(bytes, length, &trace)) {
+        [self.frameTraceCollector recordServerTrace:trace];
+        return;
+    }
     if (length == 4 && memcmp(bytes, "DSHB", 4) == 0) {
         self.mediaReceived = YES;
         self.lastMediaAt = NSProcessInfo.processInfo.systemUptime;
@@ -758,6 +797,11 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
     self.mediaReceived = YES;
     self.lastMediaAt = NSProcessInfo.processInfo.systemUptime;
     @synchronized (self) { self.intervalBytes += length; }
+    DSMediaHeader mediaHeader;
+    if (DSParseMediaDatagram(bytes, length, &mediaHeader, NULL)) {
+        [self.frameTraceCollector recordReceiveForFrameID:mediaHeader.frameID
+                                           atMicroseconds:DSMonotonicMicroseconds()];
+    }
     // DSUDPSocket's raw callback is synchronous; the assembler copies packet payload into its
     // bounded frame state before returning, eliminating one NSData allocation/copy per packet.
     [self.frameAssembler consumeBytes:bytes length:length];
@@ -932,6 +976,7 @@ static NSString * const DSQualityDefaultsKey = @"DSQuality";
     if (self.audioPunchTimer) { dispatch_source_cancel(self.audioPunchTimer); self.audioPunchTimer = nil; }
     if (self.statsTimer) { dispatch_source_cancel(self.statsTimer); self.statsTimer = nil; }
     [self.frameAssembler reset];
+    [self.frameTraceCollector reset];
     [self.videoView resetRenderer];
     self.remoteCursorView.hidden = YES;
     self.mediaPort = self.audioPort = 0;

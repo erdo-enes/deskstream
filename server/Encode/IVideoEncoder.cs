@@ -6,11 +6,15 @@ namespace DeskStreamer.Server.Encode;
 public interface IVideoEncoder : IDisposable
 {
     /// <summary>Called with a reused buffer. Consumers must finish reading before returning.</summary>
-    Action<byte[], int, bool, uint>? OnEncodedFrame { get; set; }
+    Action<byte[], int, bool, uint, long, long>? OnEncodedFrame { get; set; }
+    /// <summary>Raised at the actual backend submission call (ProcessInput/EncodePicture).</summary>
+    Action<long, long>? OnEncodeSubmitted { get; set; }
+    /// <summary>Raised when a newest-wins backend discards a frame before encoding it.</summary>
+    Action<long>? OnFrameDropped { get; set; }
 
     string BackendName { get; }
 
-    void Submit(ID3D11Texture2D nv12, uint ptsMs);
+    void Submit(ID3D11Texture2D nv12, uint ptsMs, long traceId);
 
     void RequestIdr();
 

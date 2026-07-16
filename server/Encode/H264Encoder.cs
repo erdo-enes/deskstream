@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using DeskStreamer.Server.Protocol;
 using SharpGen.Runtime;
 using Vortice.Direct3D11;
 using Vortice.MediaFoundation;
@@ -39,9 +40,10 @@ public sealed class H264Encoder : IVideoEncoder
     private readonly object _feedGate = new();
     private ID3D11Texture2D? _pendingTexture;
     private uint _pendingPts;
+    private long _pendingTraceId;
     private bool _hasPending;
     private bool _needInput;
-    private readonly Queue<uint> _ptsQueue = new();
+    private readonly Queue<(uint Pts, long TraceId)> _submittedFrames = new();
     private uint _lastPts;
 
     // Output assembly buffers (reused; event-thread only).
@@ -53,7 +55,9 @@ public sealed class H264Encoder : IVideoEncoder
     private bool _loggedUnsupportedOutputFraming;
 
     /// <summary>Called on the encoder event thread with a reused buffer. Consume synchronously.</summary>
-    public Action<byte[], int, bool, uint>? OnEncodedFrame { get; set; }
+    public Action<byte[], int, bool, uint, long, long>? OnEncodedFrame { get; set; }
+    public Action<long, long>? OnEncodeSubmitted { get; set; }
+    public Action<long>? OnFrameDropped { get; set; }
     public string BackendName => "media-foundation";
 
     public H264Encoder(ID3D11Device device, int width, int height, int fps, int initialBitrateKbps)
@@ -287,22 +291,30 @@ public sealed class H264Encoder : IVideoEncoder
     /// Submits the newest NV12 frame. If the encoder already asked for input we feed it now;
     /// otherwise it is stashed and any previously-stashed frame is dropped (newest wins).
     /// </summary>
-    public void Submit(ID3D11Texture2D nv12, uint ptsMs)
+    public void Submit(ID3D11Texture2D nv12, uint ptsMs, long traceId)
     {
+        long droppedTraceId = 0;
         lock (_feedGate)
         {
+            if (_hasPending)
+                droppedTraceId = _pendingTraceId;
             _pendingTexture = nv12;
             _pendingPts = ptsMs;
+            _pendingTraceId = traceId;
             _hasPending = true;
             if (_needInput)
                 FeedLocked();
         }
+
+        if (droppedTraceId != 0)
+            OnFrameDropped?.Invoke(droppedTraceId);
     }
 
     private void FeedLocked()
     {
         var texture = _pendingTexture!;
         uint pts = _pendingPts;
+        long traceId = _pendingTraceId;
         _hasPending = false;
         _needInput = false;
 
@@ -312,8 +324,19 @@ public sealed class H264Encoder : IVideoEncoder
         sample.SampleTime = pts * 10_000L;
         sample.SampleDuration = _frameDurationTicks;
 
-        _ptsQueue.Enqueue(pts);
-        _transform.ProcessInput(0, sample, 0);
+        OnEncodeSubmitted?.Invoke(traceId, MonotonicClock.NowUs);
+        try
+        {
+            _transform.ProcessInput(0, sample, 0);
+            // EmitSample takes the same gate before dequeuing, so an async HaveOutput event cannot
+            // observe the output before this correlation entry has been published.
+            _submittedFrames.Enqueue((pts, traceId));
+        }
+        catch
+        {
+            OnFrameDropped?.Invoke(traceId);
+            throw;
+        }
     }
 
     // ---- Event loop (encoder thread) ------------------------------------------------------
@@ -435,9 +458,22 @@ public sealed class H264Encoder : IVideoEncoder
         catch { keyframe = false; }
 
         uint pts;
+        long traceId;
         lock (_feedGate)
-            pts = _ptsQueue.TryDequeue(out var p) ? p : _lastPts;
+        {
+            if (_submittedFrames.TryDequeue(out var submitted))
+            {
+                pts = submitted.Pts;
+                traceId = submitted.TraceId;
+            }
+            else
+            {
+                pts = _lastPts;
+                traceId = 0;
+            }
+        }
         _lastPts = pts;
+        long encodeFinishUs = MonotonicClock.NowUs;
 
         using var contiguous = sample.ConvertToContiguousBuffer();
         contiguous.Lock(out IntPtr ptr, out _, out int currentLength);
@@ -464,6 +500,8 @@ public sealed class H264Encoder : IVideoEncoder
                     _loggedUnsupportedOutputFraming = true;
                     Console.Error.WriteLine("[encoder] unsupported H.264 output framing; dropping access units.");
                 }
+                if (traceId != 0)
+                    OnFrameDropped?.Invoke(traceId);
                 return;
             }
             accessUnit = _annexBBuf;
@@ -493,7 +531,7 @@ public sealed class H264Encoder : IVideoEncoder
             emitLen = accessUnitLength;
         }
 
-        OnEncodedFrame?.Invoke(emit, emitLen, keyframe, pts);
+        OnEncodedFrame?.Invoke(emit, emitLen, keyframe, pts, traceId, encodeFinishUs);
     }
 
     private static IMFSample AllocateOutputSample()

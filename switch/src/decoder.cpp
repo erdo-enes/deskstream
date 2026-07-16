@@ -63,13 +63,19 @@ void H264Decoder::close() {
     }
 }
 
-bool H264Decoder::decode(const uint8_t* data, size_t size, 
+void H264Decoder::flush() {
+    if (_initialized && _ctx) avcodec_flush_buffers(_ctx);
+}
+
+bool H264Decoder::decode(const uint8_t* data, size_t size, uint32_t frameId,
                         uint8_t*& yPlane, uint8_t*& uPlane, uint8_t*& vPlane,
-                        int& yPitch, int& uPitch, int& vPitch) {
+                        int& yPitch, int& uPitch, int& vPitch, uint32_t& decodedFrameId) {
     if (!_initialized) return false;
 
     _packet->data = const_cast<uint8_t*>(data);
     _packet->size = (int)size;
+    _packet->pts = frameId;
+    _packet->dts = frameId;
 
     int ret = avcodec_send_packet(_ctx, _packet);
     if (ret < 0) return false;
@@ -82,6 +88,11 @@ bool H264Decoder::decode(const uint8_t* data, size_t size,
         yPitch = _frame->linesize[0];
         uPitch = _frame->linesize[1];
         vPitch = _frame->linesize[2];
+        int64_t outputId = _frame->best_effort_timestamp;
+        if (outputId == AV_NOPTS_VALUE) outputId = _frame->pts;
+        decodedFrameId = outputId == AV_NOPTS_VALUE
+            ? frameId
+            : static_cast<uint32_t>(outputId);
         return true;
     }
 

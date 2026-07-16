@@ -64,12 +64,25 @@ class Prefs(context: Context) {
         }
     }
 
-    /** Preferred stream quality: `"native"` (default) or `"720p"`, per docs/PROTOCOL.md
-     * START_STREAM.quality. Persisted so the choice survives app restarts. */
+    /** Preferred stream quality. Profile v1 deliberately migrates every existing install once
+     * to the new stability-first 720p60 baseline; later explicit user choices are preserved. */
     var streamQuality: String
-        get() = sp.getString(KEY_STREAM_QUALITY, QUALITY_NATIVE) ?: QUALITY_NATIVE
+        get() {
+            if (sp.getInt(KEY_STREAM_PROFILE_VERSION, 0) < STREAM_PROFILE_VERSION) {
+                sp.edit()
+                    .putString(KEY_STREAM_QUALITY, QUALITY_720P)
+                    .putInt(KEY_STREAM_PROFILE_VERSION, STREAM_PROFILE_VERSION)
+                    .apply()
+                return QUALITY_720P
+            }
+            return sp.getString(KEY_STREAM_QUALITY, QUALITY_720P) ?: QUALITY_720P
+        }
         set(value) {
-            sp.edit().putString(KEY_STREAM_QUALITY, value).apply()
+            val normalized = if (value == QUALITY_NATIVE) QUALITY_NATIVE else QUALITY_720P
+            sp.edit()
+                .putString(KEY_STREAM_QUALITY, normalized)
+                .putInt(KEY_STREAM_PROFILE_VERSION, STREAM_PROFILE_VERSION)
+                .apply()
         }
 
     companion object {
@@ -79,6 +92,8 @@ class Prefs(context: Context) {
         private const val KEY_SERVER_TOKEN = "server_token"
         private const val KEY_SERVER_NAME = "server_name"
         private const val KEY_STREAM_QUALITY = "stream_quality"
+        private const val KEY_STREAM_PROFILE_VERSION = "stream_profile_version"
+        private const val STREAM_PROFILE_VERSION = 1
         const val QUALITY_NATIVE = "native"
         const val QUALITY_720P = "720p"
     }

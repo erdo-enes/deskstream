@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <cstdint>
 #include <netinet/in.h>
 
@@ -20,11 +21,17 @@ public:
 class DiscoveryClient {
 private:
     int _fd = -1;
+    uint64_t _lastProbeUs = 0;
+    std::vector<uint32_t> _broadcastAddresses;
+    std::map<std::string, DiscoveredServer> _knownServers;
+    std::string _lastError;
 public:
     DiscoveryClient();
     ~DiscoveryClient();
     bool start();
     std::vector<DiscoveredServer> probe();
+    void clearResults();
+    const std::string& lastError() const { return _lastError; }
 };
 
 class TCPClient {
@@ -32,6 +39,8 @@ private:
     int _fd = -1;
     std::string _ip;
     uint16_t _port;
+    std::vector<uint8_t> _readBuffer;
+    bool tryExtractMessage(std::string& json);
 public:
     TCPClient(const std::string& ip, uint16_t port);
     ~TCPClient();

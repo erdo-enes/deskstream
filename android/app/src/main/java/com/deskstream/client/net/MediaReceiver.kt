@@ -4,6 +4,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.deskstream.client.proto.MediaPacketHeader
+import com.deskstream.client.proto.FrameTracePacket
 import com.deskstream.client.proto.GamepadPacket
 import com.deskstream.client.proto.MousePacket
 import com.deskstream.client.proto.CursorPacket
@@ -90,9 +91,13 @@ class MediaReceiver(
 
     private val frameAssembler = FrameAssembler(
         bufferPool = bufferPool,
-        onFrameComplete = { buf, len, keyframe, frameId, ptsMs, pipelineDelayMs ->
+        nowUs = { SystemClock.elapsedRealtimeNanos() / 1000L },
+        onFrameComplete = { buf, len, keyframe, frameId, ptsMs, pipelineDelayMs, timing ->
             framesAssembled.incrementAndGet()
-            lastCompletedFrameAt = SystemClock.elapsedRealtime()
+            lastCompletedFrameAt = timing.completedUs / 1000L
+            hasCompletedFrame = true
+            frameTrace.recordReceive(frameId, timing.firstReceiveUs, timing.lastReceiveUs)
+            frameTrace.recordAssemble(frameId, timing.completedUs)
             val latencyMs = captureToReceiveLatencyMs(ptsMs)
             if (latencyMs >= 0) captureLatency.add(latencyMs)
             encoderLatency.add(pipelineDelayMs)
@@ -129,11 +134,19 @@ class MediaReceiver(
     private var ptsEpochMs = 0L
     /** Any packet, including DSHB, proves the UDP mapping/server socket is still alive. */
     @Volatile private var lastPacketAt = 0L
+    /** Last syntactically valid video/FEC datagram; DSHB heartbeats do not update this. */
+    @Volatile private var lastValidVideoPacketAt = 0L
     /** Complete access units, unlike raw packets, prove reassembly/keyframe recovery is healthy. */
     @Volatile private var lastCompletedFrameAt = 0L
+    @Volatile private var hasCompletedFrame = false
     private val captureLatency = LatencyWindow()
     private val decoderLatency = LatencyWindow()
     private val encoderLatency = LatencyWindow()
+    private val frameTrace = FrameTraceCollector(
+        clockOffsetUs = {
+            if (ControlClient.clockSynchronized) ControlClient.serverClockOffsetUs else null
+        }
+    )
 
     fun start(serverIp: String, mediaPort: Int, streamClockBaseUs: Long): Boolean {
         this.serverIp = serverIp
@@ -144,7 +157,9 @@ class MediaReceiver(
         running = true
         val now = SystemClock.elapsedRealtime()
         lastPacketAt = now
+        lastValidVideoPacketAt = now
         lastCompletedFrameAt = now
+        hasCompletedFrame = false
 
         val sock = try {
             DatagramSocket(null).apply {
@@ -221,6 +236,7 @@ class MediaReceiver(
         }
         thread = null
         frameAssembler.reset()
+        frameTrace.clear()
     }
 
     /** Called by the video decoder when it had to drop a frame from its feed queue (its own
@@ -270,9 +286,11 @@ class MediaReceiver(
         }
     }
 
-    fun recordDecodedFrame(latencyMs: Int) {
+    fun recordDecodedFrame(frameId: Long, decodeUs: Long, presentUs: Long, latencyMs: Int) {
         framesDecoded.incrementAndGet()
         if (latencyMs >= 0) decoderLatency.add(latencyMs)
+        frameTrace.recordDecode(frameId, decodeUs)
+        frameTrace.recordPresent(frameId, presentUs)
     }
 
     private fun receiveLoop(sock: DatagramSocket, serverAddress: InetAddress) {
@@ -316,7 +334,8 @@ class MediaReceiver(
             }
 
             val length = packet.length
-            val receivedAt = SystemClock.elapsedRealtime()
+            val receivedAtUs = SystemClock.elapsedRealtimeNanos() / 1000L
+            val receivedAt = receivedAtUs / 1000L
             lastPacketAt = receivedAt
             bytesReceived.addAndGet(length.toLong())
 
@@ -327,16 +346,32 @@ class MediaReceiver(
                 continue
             }
 
+            val trace = FrameTracePacket.parse(buf, length)
+            if (trace != null) {
+                frameTrace.recordServer(
+                    trace.copy(frameId = frameAssembler.extendWireFrameId(trace.frameId))
+                )
+                frameAssembler.onTick(receivedAt)
+                continue
+            }
+
             if (!mediaHeader.parseFrom(buf, length)) {
                 frameAssembler.onTick(receivedAt)
                 continue
             }
             if (mediaHeader.version != 1) continue
+            lastValidVideoPacketAt = receivedAt
             videoPacketsReceived.incrementAndGet()
             if (mediaHeader.fec) fecPacketsReceived.incrementAndGet()
             // Completion, not mere packet arrival, advances the recovery watchdog. This catches
             // a lost startup IDR even while unusable P-frame packets continue arriving.
-            frameAssembler.onPacket(mediaHeader, buf, MediaPacketHeader.HEADER_SIZE, receivedAt)
+            frameAssembler.onPacket(
+                mediaHeader,
+                buf,
+                MediaPacketHeader.HEADER_SIZE,
+                receivedAt,
+                receivedAtUs
+            )
         }
     }
 
@@ -407,14 +442,25 @@ class MediaReceiver(
             delay(500)
             val now = SystemClock.elapsedRealtime()
             val completedFrameSilenceMs = now - lastCompletedFrameAt
-            // A heartbeat with no video is normally a static desktop. Re-request an IDR only
-            // occasionally so an actually wedged encoder can recover without accidentally
-            // satisfying the server's "two IDRs in one second" congestion trigger forever.
-            if (completedFrameSilenceMs >= VIDEO_REPUNCH_MS &&
+            val validVideoPacketSilenceMs = now - lastValidVideoPacketAt
+            // Before the first complete IDR, retry recovery even if only heartbeats arrive.
+            // After a frame has completed, heartbeat-only silence is a healthy static desktop;
+            // request an IDR only when video datagrams continue arriving without a complete AU.
+            if (MediaRecoveryPolicy.shouldRequestIdr(
+                    hasCompletedFrame,
+                    completedFrameSilenceMs,
+                    validVideoPacketSilenceMs,
+                    VIDEO_REPUNCH_MS
+                ) &&
                 now - lastVideoRecoveryAt >= VIDEO_RECOVERY_INTERVAL_MS
             ) {
                 sendHolePunch(sock, serverAddress)
                 ControlClient.requestIdr()
+                Log.w(
+                    TAG,
+                    "video recovery IDR: completedAge=${completedFrameSilenceMs}ms " +
+                        "videoPacketAge=${validVideoPacketSilenceMs}ms firstFrame=$hasCompletedFrame"
+                )
                 lastVideoRecoveryAt = now
             }
             // DSHB is deliberately sent when the desktop is static. It should keep a still
@@ -454,15 +500,26 @@ class MediaReceiver(
         private const val HOLE_PUNCH_MESSAGE = "DSMH"
         private const val INPUT_SEND_QUEUE_CAPACITY = 16
         private const val RECV_PACKET_BUFFER_BYTES = 1500
-        // Keep enough room for a paced 150-300 KiB IDR, but do not allow the kernel to hide
-        // hundreds of milliseconds of stale video. At ~24 Mbps wire rate a 1 MiB socket queue
-        // alone can hold ~350 ms; combined Wi-Fi/driver buffering produced 600+ ms field stalls.
-        private const val RECV_SOCKET_BUFFER_BYTES = 512 * 1024
+        // Pacing lets the receiver drain a large IDR while it arrives, so 256 KiB is sufficient
+        // without allowing the kernel to hide roughly 200 ms of stale 720p media.
+        private const val RECV_SOCKET_BUFFER_BYTES = 256 * 1024
         private const val SOCKET_TIMEOUT_MS = 1000
         private const val VIDEO_REPUNCH_MS = 1500L
         private const val VIDEO_RECOVERY_INTERVAL_MS = 5000L
         private const val VIDEO_STALL_MS = 4000L
     }
+}
+
+/** Pure watchdog decision kept separate so static-desktop and broken-assembly behavior remain
+ * regression-testable without sockets, clocks, or Android framework objects. */
+internal object MediaRecoveryPolicy {
+    fun shouldRequestIdr(
+        hasCompletedFrame: Boolean,
+        completedFrameSilenceMs: Long,
+        validVideoPacketSilenceMs: Long,
+        recoveryThresholdMs: Long
+    ): Boolean = completedFrameSilenceMs >= recoveryThresholdMs &&
+        (!hasCompletedFrame || validVideoPacketSilenceMs < recoveryThresholdMs)
 }
 
 private class LatencyWindow {
@@ -510,13 +567,15 @@ private const val FEC_INTERLEAVE = 4
  */
 internal class FrameAssembler(
     private val bufferPool: BufferPool,
+    private val nowUs: () -> Long = { System.nanoTime() / 1000L },
     private val onFrameComplete: (
         buf: ByteArray,
         length: Int,
         keyframe: Boolean,
         frameId: Long,
         ptsMs: Long,
-        pipelineDelayMs: Int
+        pipelineDelayMs: Int,
+        timing: FrameAssemblyTiming
     ) -> Unit,
     private val onFrameDropped: (requestIdr: Boolean, droppedFrames: Int) -> Unit
 ) {
@@ -538,6 +597,9 @@ internal class FrameAssembler(
 
     fun consumeFecRecoveredPackets(): Int = fecRecoveredPackets.getAndSet(0)
 
+    /** Correlates a uint32 timing sidecar with the same extended ID space as assembled frames. */
+    fun extendWireFrameId(rawId: Long): Long = extendFrameId(rawId)
+
     fun reset() {
         clearBufferedFrames()
         dropWatermark = -1L
@@ -556,7 +618,8 @@ internal class FrameAssembler(
         header: MediaPacketHeader,
         buf: ByteArray,
         payloadOffset: Int,
-        nowMs: Long
+        nowMs: Long,
+        receivedAtUs: Long = nowMs * 1000L
     ) {
         applyExternalDiscardIfNeeded()
         if (header.packetCount <= 0 || header.packetCount > MAX_REASONABLE_PACKET_COUNT) return
@@ -628,6 +691,7 @@ internal class FrameAssembler(
                 assemblyBuf,
                 bufferPool,
                 nowMs,
+                receivedAtUs,
                 onFecRecovered = { fecRecoveredPackets.incrementAndGet() }
             )
             inFlight[frameId] = frame
@@ -644,9 +708,13 @@ internal class FrameAssembler(
         } else {
             frame.onDataPacket(header, buf, payloadOffset)
         }
+        frame.lastPacketAtUs = receivedAtUs
 
         if (frame.isComplete) {
             inFlight.remove(frame.frameId)
+            frame.completedAtUs = nowUs()
+            // Reorder expiry must stay in the caller-supplied receive-loop clock. Tests and
+            // alternate clients may inject a different high-resolution completion clock.
             frame.completedAtMs = nowMs
             frame.releaseFecBuffers()
             ready[frame.frameId] = frame
@@ -677,7 +745,12 @@ internal class FrameAssembler(
                 frame.keyframe,
                 frame.frameId,
                 frame.ptsMs,
-                frame.pipelineDelayMs
+                frame.pipelineDelayMs,
+                FrameAssemblyTiming(
+                    frame.firstPacketAtUs,
+                    frame.lastPacketAtUs,
+                    frame.completedAtUs
+                )
             )
         }
 
@@ -802,6 +875,12 @@ internal class FrameAssembler(
     }
 }
 
+internal data class FrameAssemblyTiming(
+    val firstReceiveUs: Long,
+    val lastReceiveUs: Long,
+    val completedUs: Long
+)
+
 /** Assembly state for a single frameId. */
 private class InFlightFrame(
     val frameId: Long,
@@ -813,6 +892,7 @@ private class InFlightFrame(
     val assemblyBuf: ByteArray,
     private val pool: BufferPool,
     val firstPacketAtMs: Long,
+    val firstPacketAtUs: Long,
     private val onFecRecovered: () -> Unit
 ) {
     private val dataPresent = BooleanArray(packetCount)
@@ -820,6 +900,8 @@ private class InFlightFrame(
     var lastPacketLen = -1
         private set
     var completedAtMs = 0L
+    var completedAtUs = 0L
+    var lastPacketAtUs = firstPacketAtUs
 
     val totalLength: Int
         get() = (packetCount - 1) * PACKET_PAYLOAD_MAX + lastPacketLen

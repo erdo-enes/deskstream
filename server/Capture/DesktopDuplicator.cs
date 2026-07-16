@@ -28,8 +28,7 @@ public sealed class DesktopDuplicator : IDisposable
     // pointerOnly   : acquisitions that only moved the mouse pointer (LastPresentTime == 0).
     // timeouts      : TryAcquire calls that exhausted their timeout budget with no new content.
     // accumulatedFrames: sum of DXGI OutduplFrameInfo.AccumulatedFrames over real acquisitions.
-    // presents/s (surfaced downstream) ~= Δaccumulated + Δreal tells "the content is only N fps"
-    // apart from "the pipeline is dropping presents".
+    // It already includes each acquired present; its delta is the source-present estimate.
     private long _realFrames;
     private long _pointerOnly;
     private long _timeouts;
