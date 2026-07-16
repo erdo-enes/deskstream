@@ -42,7 +42,11 @@ public sealed class H264Encoder : IVideoEncoder
     private uint _pendingPts;
     private long _pendingTraceId;
     private bool _hasPending;
-    private bool _needInput;
+    // Async MFTs may advertise several outstanding input slots. A Boolean collapses those
+    // credits into one and accidentally serializes the hardware pipeline (one frame cannot be
+    // submitted until the previous output completes). Keep the exact credit count so NVIDIA's
+    // Media Foundation encoder can retain its normal multi-frame throughput.
+    private int _inputCredits;
     private readonly Queue<(uint Pts, long TraceId)> _submittedFrames = new();
     private uint _lastPts;
 
@@ -302,7 +306,7 @@ public sealed class H264Encoder : IVideoEncoder
             _pendingPts = ptsMs;
             _pendingTraceId = traceId;
             _hasPending = true;
-            if (_needInput)
+            if (_inputCredits > 0)
                 FeedLocked();
         }
 
@@ -312,11 +316,14 @@ public sealed class H264Encoder : IVideoEncoder
 
     private void FeedLocked()
     {
+        if (_inputCredits <= 0 || !_hasPending)
+            return;
+
         var texture = _pendingTexture!;
         uint pts = _pendingPts;
         long traceId = _pendingTraceId;
         _hasPending = false;
-        _needInput = false;
+        _inputCredits--;
 
         using var buffer = MediaFactory.MFCreateDXGISurfaceBuffer(Iid_ID3D11Texture2D, texture, 0, false);
         using var sample = MediaFactory.MFCreateSample();
@@ -369,8 +376,10 @@ public sealed class H264Encoder : IVideoEncoder
                     {
                         lock (_feedGate)
                         {
+                            // Every event is one distinct ProcessInput credit. Preserve credits
+                            // that arrive before the capture thread has a frame ready.
+                            _inputCredits++;
                             if (_hasPending) FeedLocked();
-                            else _needInput = true;
                         }
                     }
                     else if (type == MediaEventTypes.TransformHaveOutput)

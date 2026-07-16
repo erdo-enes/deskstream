@@ -161,6 +161,7 @@ long prevMediaPackets = 0;
 long prevMediaFailures = 0;
 long prevPacingWaitUs = 0;
 long prevSubmitted = 0;
+long prevEncoderDropped = 0;
 long prevCapReal = 0;
 long prevCapPointer = 0;
 long prevCapTimeouts = 0;
@@ -194,8 +195,10 @@ try
         {
             long enc = session.EncodedFrames;
             long idr = session.IdrRequestTotal;
-            long fps = enc - prevEncoded;
-            long idrDelta = idr - prevIdr;
+            // Pipeline restart resets its counters while the same control session remains active.
+            // Never emit impossible negative rates during that one-second transition.
+            long fps = enc >= prevEncoded ? enc - prevEncoded : 0;
+            long idrDelta = idr >= prevIdr ? idr - prevIdr : 0;
             long audioBytes = session.AudioBytesSent;
             long audioKbps = Math.Max(0, (audioBytes - prevAudioBytes) * 8 / 1000);
             long mediaFrames = session.MediaFramesSent;
@@ -204,8 +207,12 @@ try
             long mediaFailures = session.MediaSendFailures;
             long pacingWaitUs = session.MediaPacingWaitUs;
             long submitted = session.CaptureSubmittedFrames;
+            long encoderDropped = session.EncoderFramesDropped;
             long sentFps = mediaFrames >= prevMediaFrames ? mediaFrames - prevMediaFrames : 0;
             long submittedFps = submitted >= prevSubmitted ? submitted - prevSubmitted : 0;
+            long encoderDroppedFps = encoderDropped >= prevEncoderDropped
+                ? encoderDropped - prevEncoderDropped
+                : 0;
             long mediaKbps = mediaBytes >= prevMediaBytes
                 ? (mediaBytes - prevMediaBytes) * 8 / 1000
                 : 0;
@@ -236,6 +243,7 @@ try
             prevMediaFailures = mediaFailures;
             prevPacingWaitUs = pacingWaitUs;
             prevSubmitted = submitted;
+            prevEncoderDropped = encoderDropped;
             prevCapReal = capReal;
             prevCapPointer = capPointer;
             prevCapTimeouts = capTimeouts;
@@ -277,6 +285,7 @@ try
             string diagnosticLine =
                 $"[diag] likely={bottleneck} | host {presentsPerSec} present -> " +
                 $"{submittedFps} submit -> {fps} encode -> {sentFps} send | " +
+                $"enc-drop {encoderDroppedFps}/s in-flight {session.EncoderFramesInFlight} | " +
                 $"android {Metric(clientAssembledFps)} assemble -> {Metric(clientDecodedFps)} render | " +
                 $"drops asm {Metric(session.LastClientAssemblyDrops)} dec {Metric(session.LastClientDecoderDrops)} " +
                 $"fec-fix {Metric(session.LastClientFecRecovered)} | " +
@@ -362,6 +371,7 @@ try
             prevMediaFailures = 0;
             prevPacingWaitUs = 0;
             prevSubmitted = 0;
+            prevEncoderDropped = 0;
             prevCapReal = 0;
             prevCapPointer = 0;
             prevCapTimeouts = 0;

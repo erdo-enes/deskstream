@@ -13,7 +13,11 @@ namespace DeskStreamer.Server.Capture;
 /// </summary>
 public sealed class Nv12Converter : IDisposable
 {
-    private const int PoolSize = 3;
+    // Media Foundation commonly exposes 4-6 concurrent NeedInput credits. Each submitted sample
+    // retains its D3D surface until the hardware consumes it, so three rotating textures can be
+    // overwritten while still in flight once proper credit accounting is enabled. Eight surfaces
+    // cost only ~11 MiB at 720p and keep capture/convert from racing the encoder.
+    private const int PoolSize = 8;
 
     private readonly ID3D11VideoDevice _videoDevice;
     private readonly ID3D11VideoContext _videoContext;

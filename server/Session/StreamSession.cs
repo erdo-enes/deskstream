@@ -126,6 +126,7 @@ public sealed class StreamSession : IDisposable
     // Stats surfaced to the console (Program reads these)
     private long _encodedFrames;
     private long _captureSubmittedFrames;
+    private long _encoderFramesDropped;
     private int _capturedSinceEncode;
     private long _idrRequestTotal;
     private int _pipelineFaultHandling;
@@ -174,6 +175,8 @@ public sealed class StreamSession : IDisposable
     public string? PendingPin => _state == SessionState.AwaitingPairCode ? _pin : null;
     public long EncodedFrames => Interlocked.Read(ref _encodedFrames);
     public long CaptureSubmittedFrames => Interlocked.Read(ref _captureSubmittedFrames);
+    public long EncoderFramesDropped => Interlocked.Read(ref _encoderFramesDropped);
+    public int EncoderFramesInFlight => _pendingFrameTimings.Count;
     public long IdrRequestTotal => Interlocked.Read(ref _idrRequestTotal);
     public long AudioPacketsSent => _audioSender?.PacketsSent ?? 0;
     public long AudioBytesSent => _audioSender?.BytesSent ?? 0;
@@ -696,6 +699,7 @@ public sealed class StreamSession : IDisposable
         _pendingFrameTimings.Clear();
         Interlocked.Exchange(ref _encodedFrames, 0);
         Interlocked.Exchange(ref _captureSubmittedFrames, 0);
+        Interlocked.Exchange(ref _encoderFramesDropped, 0);
         Interlocked.Exchange(ref _pipelineFaultHandling, 0);
         Interlocked.Exchange(ref _endpointIdrPending, 1);
         _lastNv12 = null;
@@ -744,8 +748,9 @@ public sealed class StreamSession : IDisposable
     /// This is the v0.4.0 approach that was proven to work for 1080p60 gaming:
     ///   1. TryAcquire(100) blocks until DXGI has a frame (up to 100ms). At 60fps the
     ///      frame arrives in ~16ms, so the call returns naturally — DXGI IS the pacer.
-    ///   2. If the frame arrived before the next interval (120/144Hz display), continue
-    ///      skips encoding and re-acquires. This prevents >60fps without sleeping.
+    ///   2. A fixed-cadence gate skips excess 120/144 Hz presents. Its deadline advances from the
+    ///      previous deadline instead of resetting to now, and accepts normal ~2 ms refresh jitter.
+    ///      Resetting to now caused slightly-early 60 Hz presents to be skipped every other refresh.
     ///   3. No pre-acquire sleep, no post-false sleep — the blocking acquire handles both
     ///      pacing and idle. MMCSS + GPUThreadPriority=7 ensure the thread gets scheduled
     ///      under 100% game load.
@@ -760,6 +765,9 @@ public sealed class StreamSession : IDisposable
         {
             long frameIntervalTicks = Math.Max(1, Stopwatch.Frequency / Math.Max(1, Fps));
             long nextFrameTicks = Stopwatch.GetTimestamp();
+            long earlyToleranceTicks = Math.Max(
+                1,
+                Math.Min(frameIntervalTicks / 4, Stopwatch.Frequency / 500)); // <= 2 ms
             while (!ct.IsCancellationRequested)
             {
                 long captureStartUs = NowUs();
@@ -767,9 +775,21 @@ public sealed class StreamSession : IDisposable
                 {
                     long captureEndUs = NowUs();
                     long nowTicks = Stopwatch.GetTimestamp();
-                    if (nowTicks < nextFrameTicks)
+                    if (nowTicks + earlyToleranceTicks < nextFrameTicks)
                         continue; // Desktop may present at 120/144/240 Hz; honor requested FPS.
-                    nextFrameTicks = nowTicks + frameIntervalTicks;
+
+                    if (nowTicks - nextFrameTicks > frameIntervalTicks * 3)
+                    {
+                        // Re-anchor after a real stall instead of trying to catch up with a burst.
+                        nextFrameTicks = nowTicks + frameIntervalTicks;
+                    }
+                    else
+                    {
+                        // Stay locked to the requested cadence. Advancing from `now` accumulates
+                        // scheduling jitter and turns a 60 Hz source into roughly 30-40 submits/s.
+                        do { nextFrameTicks += frameIntervalTicks; }
+                        while (nextFrameTicks <= nowTicks);
+                    }
 
                     if (Interlocked.Increment(ref _capturedSinceEncode) > Fps * 3)
                         throw new InvalidOperationException("The hardware encoder stopped producing frames");
@@ -890,8 +910,11 @@ public sealed class StreamSession : IDisposable
             _pendingFrameTimings[traceId] = timing with { EncodeSubmitUs = submittedUs };
     }
 
-    private void OnEncoderFrameDropped(long traceId) =>
+    private void OnEncoderFrameDropped(long traceId)
+    {
         _pendingFrameTimings.TryRemove(traceId, out _);
+        Interlocked.Increment(ref _encoderFramesDropped);
+    }
 
     private uint CurrentStreamPtsMs() =>
         _clock == null ? 0 : (uint)(_clock.ElapsedMilliseconds & 0xFFFFFFFF);
@@ -1072,9 +1095,12 @@ public sealed class StreamSession : IDisposable
         LastClientVideoPackets = s.VideoPacketsReceived;
         LastClientFecPackets = s.FecPacketsReceived;
         LastClientStatsIntervalMs = s.IntervalMs;
-        LastServerPipelineP95Ms = s.ServerPipelineP95Ms;
-        LastCaptureToReceiveP95Ms = s.CaptureToReceiveP95Ms;
-        LastDecodeToSurfaceP95Ms = s.DecodeToSurfaceP95Ms;
+        int serverPipelineP95Ms = NormalizeLatencyMs(s.ServerPipelineP95Ms);
+        int captureToReceiveP95Ms = NormalizeLatencyMs(s.CaptureToReceiveP95Ms);
+        int decodeToSurfaceP95Ms = NormalizeLatencyMs(s.DecodeToSurfaceP95Ms);
+        LastServerPipelineP95Ms = serverPipelineP95Ms;
+        LastCaptureToReceiveP95Ms = captureToReceiveP95Ms;
+        LastDecodeToSurfaceP95Ms = decodeToSurfaceP95Ms;
         _lastClientStatsAtMs = NowMs();
 
         int total = s.FramesOk + s.FramesDropped;
@@ -1082,14 +1108,14 @@ public sealed class StreamSession : IDisposable
 
         // capture-to-receive contains host capture/encode time too. Subtract the server pipeline
         // component when available so a loaded host GPU is not misdiagnosed as Wi-Fi congestion.
-        int transportP95Ms = s.CaptureToReceiveP95Ms;
-        if (transportP95Ms >= 0 && s.ServerPipelineP95Ms >= 0)
-            transportP95Ms = Math.Max(0, transportP95Ms - s.ServerPipelineP95Ms);
+        int transportP95Ms = captureToReceiveP95Ms;
+        if (transportP95Ms >= 0 && serverPipelineP95Ms >= 0)
+            transportP95Ms = Math.Max(0, transportP95Ms - serverPipelineP95Ms);
 
         if (transportP95Ms >= 0)
             _bestTransportMs = Math.Min(_bestTransportMs, transportP95Ms);
-        if (s.DecodeToSurfaceP95Ms >= 0)
-            _bestDecodeToSurfaceMs = Math.Min(_bestDecodeToSurfaceMs, s.DecodeToSurfaceP95Ms);
+        if (decodeToSurfaceP95Ms >= 0)
+            _bestDecodeToSurfaceMs = Math.Min(_bestDecodeToSurfaceMs, decodeToSurfaceP95Ms);
 
         // Learn the healthy startup floor, but let startup IDR, clock synchronization, and the
         // hardware codec settle before making a synchronous Media Foundation bitrate change.
@@ -1105,8 +1131,9 @@ public sealed class StreamSession : IDisposable
         bool latencyGrowingNow =
             (_bestTransportMs != int.MaxValue &&
              transportP95Ms > _bestTransportMs + 40) ||
-            (_bestDecodeToSurfaceMs != int.MaxValue &&
-             s.DecodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 25);
+            (decodeToSurfaceP95Ms >= 0 &&
+             _bestDecodeToSurfaceMs != int.MaxValue &&
+             decodeToSurfaceP95Ms > _bestDecodeToSurfaceMs + 25);
 
         // Require the rise to persist across >=3 consecutive intervals before reacting.
         // WiFi produces frequent 1-2 interval spikes that are not real congestion.
@@ -1117,7 +1144,7 @@ public sealed class StreamSession : IDisposable
         bool absoluteNetworkBacklog = transportP95Ms >= NetworkBacklogCutMs;
         bool withinLatencyBudget =
             (transportP95Ms < 0 || transportP95Ms <= NetworkLatencyBudgetMs) &&
-            (s.DecodeToSurfaceP95Ms < 0 || s.DecodeToSurfaceP95Ms <= DecoderLatencyBudgetMs);
+            (decodeToSurfaceP95Ms < 0 || decodeToSurfaceP95Ms <= DecoderLatencyBudgetMs);
         bool clean = s.FramesDropped == 0 && _idrSinceLastStats == 0 &&
             !latencyGrowingNow && withinLatencyBudget;
 
@@ -1127,9 +1154,9 @@ public sealed class StreamSession : IDisposable
                 ? $"drops {s.FramesDropped}/{total} ({dropRate:P1})"
                 : absoluteNetworkBacklog
                     ? $"transport backlog p95 {transportP95Ms} ms " +
-                      $"(cap {s.CaptureToReceiveP95Ms} - pipe {s.ServerPipelineP95Ms}) >= {NetworkBacklogCutMs} ms"
+                      $"(cap {captureToReceiveP95Ms} - pipe {serverPipelineP95Ms}) >= {NetworkBacklogCutMs} ms"
                     : $"latency p95 transport {transportP95Ms}>{BaselineStr(_bestTransportMs)}+40 " +
-                      $"dec {s.DecodeToSurfaceP95Ms}>{BaselineStr(_bestDecodeToSurfaceMs)}+25 x{_latencyGrowingStreak}";
+                      $"dec {decodeToSurfaceP95Ms}>{BaselineStr(_bestDecodeToSurfaceMs)}+25 x{_latencyGrowingStreak}";
             AdaptDown(reason);
             _cleanStreak = 0;
         }
@@ -1153,6 +1180,11 @@ public sealed class StreamSession : IDisposable
     }
 
     private static string BaselineStr(int best) => best == int.MaxValue ? "-" : best.ToString();
+
+    // Client clocks and vendor codec callbacks are not trustworthy enough to let a sentinel such
+    // as 60,000 ms drive bitrate decisions. Multi-second stalls already surface as drops/watchdog
+    // events; latency above this bound is invalid telemetry, not useful congestion evidence.
+    private static int NormalizeLatencyMs(int value) => value is >= 0 and <= 5_000 ? value : -1;
 
     private void AdaptDown(string reason)
     {

@@ -419,14 +419,16 @@ class VideoDecoder(
                     if (renderedCodec !== codec) return@setOnFrameRenderedListener
                     val decoded = decodedFrames.remove(presentationTimeUs)
                         ?: return@setOnFrameRenderedListener
+                    val callbackNowUs = nowUs()
                     val presentUs = if (nanoTime > 0L) {
-                        frameRenderClock.toElapsedRealtimeUs(nanoTime)
+                        frameRenderClock.toElapsedRealtimeUs(nanoTime, callbackNowUs)
                     } else {
-                        nowUs()
+                        callbackNowUs
                     }
-                    val latencyMs = ((presentUs - decoded.enqueuedAtUs) / 1000L)
-                        .coerceIn(0L, 60_000L)
-                        .toInt()
+                    val latencyMs = FrameRenderClock.validLatencyMs(
+                        decoded.enqueuedAtUs,
+                        presentUs
+                    )
                     onFrameRendered(decoded.frameId, decoded.decodeUs, presentUs, latencyMs)
                 },
                 handler
@@ -645,10 +647,37 @@ class VideoDecoder(
  * once per codec epoch and convert every actual-render timestamp before correlating it.
  */
 internal class FrameRenderClock(private val elapsedMinusNanoNs: Long) {
-    fun toElapsedRealtimeUs(frameRenderedNanoTime: Long): Long =
-        (frameRenderedNanoTime + elapsedMinusNanoNs) / 1000L
+    /**
+     * AOSP reports System.nanoTime(), but some vendor codecs report elapsedRealtimeNanos()
+     * directly. Choose whichever interpretation is closest to the callback's current elapsed
+     * clock. The callback itself may be delayed/batched, so do not replace an older-but-valid
+     * render timestamp with callback time. This prevents a device's suspend-time offset from
+     * becoming the old, clamped 60,000 ms decoder metric.
+     */
+    fun toElapsedRealtimeUs(frameRenderedNanoTime: Long, callbackNowUs: Long): Long {
+        val rawUs = frameRenderedNanoTime / 1000L
+        val adjustedUs = (frameRenderedNanoTime + elapsedMinusNanoNs) / 1000L
+        return if (distance(rawUs, callbackNowUs) < distance(adjustedUs, callbackNowUs)) {
+            rawUs
+        } else {
+            adjustedUs
+        }
+    }
 
     companion object {
+        private const val MAX_VALID_RENDER_LATENCY_US = 5_000_000L
+
+        fun validLatencyMs(enqueuedAtUs: Long, presentUs: Long): Int {
+            val latencyUs = presentUs - enqueuedAtUs
+            return if (latencyUs in 0L..MAX_VALID_RENDER_LATENCY_US) {
+                (latencyUs / 1000L).toInt()
+            } else {
+                -1
+            }
+        }
+
+        private fun distance(a: Long, b: Long): Long = if (a >= b) a - b else b - a
+
         fun sample(): FrameRenderClock {
             val nanoBefore = System.nanoTime()
             val elapsed = SystemClock.elapsedRealtimeNanos()
